@@ -124,12 +124,12 @@ foreach (suite IN LISTS FOS_PARAM_TEST_SUITES)
     add_test(NAME ${suite} COMMAND fos_param_${suite}_test)
 endforeach ()
 
-add_executable(golden_capture tests/golden_capture.f08)
-target_link_libraries(golden_capture PRIVATE
+add_executable(fos_param_golden_capture tests/golden_capture.f08)
+target_link_libraries(fos_param_golden_capture PRIVATE
         fos_parameterization fos_param_test_utils fos_parameterization_flags)
-set_target_properties(golden_capture PROPERTIES
+set_target_properties(fos_param_golden_capture PROPERTIES
         Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/capture)
 
-add_executable(c_api_smoke_test tests/c_api_smoke_test.cpp)
-target_link_libraries(c_api_smoke_test PRIVATE fos_parameterization_cxx)
-add_test(NAME c_api_smoke COMMAND c_api_smoke_test)
+add_executable(fos_param_c_api_smoke_test tests/c_api_smoke_test.cpp)
+target_link_libraries(fos_param_c_api_smoke_test PRIVATE fos_parameterization_cxx)
+add_test(NAME c_api_smoke COMMAND fos_param_c_api_smoke_test)
