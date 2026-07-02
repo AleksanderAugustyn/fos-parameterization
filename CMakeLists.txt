@@ -87,3 +87,28 @@ target_include_directories(fos_parameterization_shared
 )
 add_library(FosParameterization::fos_parameterization_shared
         ALIAS fos_parameterization_shared)
+
+# --- Tests ---
+enable_testing()
+
+add_library(fos_param_test_utils STATIC
+        tests/test_utils_mod.f08
+        tests/fos_test_reference_mod.f08
+)
+target_link_libraries(fos_param_test_utils
+        PUBLIC fos_parameterization fortran_foundations
+        PRIVATE fos_parameterization_flags)
+set_target_properties(fos_param_test_utils PROPERTIES
+        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests)
+target_include_directories(fos_param_test_utils PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests>)
+
+set(FOS_PARAM_TEST_SUITES core)
+foreach (suite IN LISTS FOS_PARAM_TEST_SUITES)
+    add_executable(fos_param_${suite}_test tests/fos_param_${suite}_test.f08)
+    target_link_libraries(fos_param_${suite}_test PRIVATE
+            fos_parameterization fos_param_test_utils fos_parameterization_flags)
+    set_target_properties(fos_param_${suite}_test PROPERTIES
+            Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/${suite})
+    add_test(NAME ${suite} COMMAND fos_param_${suite}_test)
+endforeach ()
