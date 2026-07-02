@@ -42,6 +42,7 @@ create_fortran_library_interface(TARGET fos_parameterization_flags)
 # --- Source files ---
 set(FOS_PARAM_SOURCES
         src/fos_parameterization_mod.f08
+        src/fos_parameterization_c_api_mod.f08
 )
 
 # --- Static library target ---
@@ -88,6 +89,16 @@ target_include_directories(fos_parameterization_shared
 add_library(FosParameterization::fos_parameterization_shared
         ALIAS fos_parameterization_shared)
 
+# --- C++ interface target (consumes the shared library via the C header) ---
+add_library(fos_parameterization_cxx INTERFACE)
+target_include_directories(fos_parameterization_cxx INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_link_libraries(fos_parameterization_cxx INTERFACE
+        fos_parameterization_shared)
+target_compile_features(fos_parameterization_cxx INTERFACE cxx_std_20)
+add_library(FosParameterization::fos_parameterization_cxx
+        ALIAS fos_parameterization_cxx)
+
 # --- Tests ---
 enable_testing()
 
@@ -112,3 +123,7 @@ foreach (suite IN LISTS FOS_PARAM_TEST_SUITES)
             Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/${suite})
     add_test(NAME ${suite} COMMAND fos_param_${suite}_test)
 endforeach ()
+
+add_executable(c_api_smoke_test tests/c_api_smoke_test.cpp)
+target_link_libraries(c_api_smoke_test PRIVATE fos_parameterization_cxx)
+add_test(NAME c_api_smoke COMMAND c_api_smoke_test)
