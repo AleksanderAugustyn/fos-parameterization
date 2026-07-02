@@ -1,0 +1,74 @@
+# Build directories
+build/
+cmake-build-*/
+bin/
+lib/
+
+# Fortran compiled files
+*.o
+*.mod
+*.smod
+*.a
+*.so
+*.exe
+
+# Generated documentation
+doc/
+docs/
+**/doc/
+deployment/docs-deploy/
+deployment/docs-fixed/
+netlify-docs/
+
+# But keep the auth configuration template
+!deployment/docs/netlify/
+
+# Output and data files
+*.dat
+*.out
+*.log
+results/
+output/
+*.hdf5
+*.nc
+
+# IDE files
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/shelf/
+.vscode/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# System files
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+
+# Large test files (add specific patterns)
+test_data_large/
+benchmark_results/
+
+# Environment
+.env
+venv/
+env/
+
+# Slurm files (optional - depends on your needs)
+slurm-*.out
+*.sbatch.log
+
+# Backup files
+*.backup
+
+# AI files
+GEMINI.md
