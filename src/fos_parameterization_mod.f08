@@ -67,6 +67,9 @@ module fos_parameterization_mod
     ! Per-shape resolve step (validity + z_shift + analytic pole radii)
     public :: compute_fos_shape_s
 
+    ! Batch R(theta) + dR/dtheta evaluation at caller-supplied thetas
+    public :: compute_fos_radius_and_derivative_at_thetas_s
+
     ! Individual workflow components
     public :: compute_rho_z_grid_s
     public :: validate_rho_grid_s
@@ -287,6 +290,29 @@ contains
         call deallocate_rho_grid(rho_grid)
 
     end subroutine compute_fos_shape_s
+
+    !> Batch-evaluate R(theta) and dR/dtheta at caller-supplied thetas, for a
+    !! shape whose validity and z_shift were already established by
+    !! compute_fos_shape_s. One scalar shape build, one elemental sweep — the
+    !! N Newton solves are independent and free to vectorize.
+    !!
+    !! Caller contract: size(radii) == size(dr_dthetas) == size(thetas).
+    !! Degenerate params (empty, c <= C_MIN) yield the unit-sphere fallback
+    !! r = 1, dr_dtheta = 0 — same library guarantee as the scalar evaluator.
+    pure subroutine compute_fos_radius_and_derivative_at_thetas_s(params, thetas, &
+            z_shift, radii, dr_dthetas)
+        real(kind = rk), intent(in)  :: params(:)
+        real(kind = rk), intent(in)  :: thetas(:)
+        real(kind = rk), intent(in)  :: z_shift
+        real(kind = rk), intent(out) :: radii(:)
+        real(kind = rk), intent(out) :: dr_dthetas(:)
+
+        type(fos_shape_t) :: shape
+
+        shape = make_fos_shape_f(params, z_shift)
+        call compute_fos_radius_and_derivative_s(shape, cos(thetas), radii, dr_dthetas)
+
+    end subroutine compute_fos_radius_and_derivative_at_thetas_s
 
     !===========================================================================
     ! STEP 1: CREATE ρ(z) GRID

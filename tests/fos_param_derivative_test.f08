@@ -6,7 +6,8 @@ program fos_param_derivative_test
     use fos_parameterization_mod, only: fos_shape_t, make_fos_shape_f, &
             compute_fos_radius_and_derivative_s, compute_radius_fos_with_zshift_s, &
             compute_fos_radius_grid_s, compute_rho_at_z_s, FOS_VALID, &
-            compute_fos_shape_s, FOS_ERROR_INVALID_C
+            compute_fos_shape_s, FOS_ERROR_INVALID_C, &
+            compute_fos_radius_and_derivative_at_thetas_s
     use test_utils_mod, only: assert_true, assert_int_eq, assert_close, &
             assert_abs_close, test_summary
 
@@ -17,6 +18,7 @@ program fos_param_derivative_test
     call test_derivative_vs_fd()
     call test_derivative_vs_implicit_formula()
     call test_shape_split()
+    call test_batch_evaluator()
     call test_summary()
 
 contains
@@ -173,5 +175,36 @@ contains
         call assert_close(r_north, 0.0_rk, 1.0e-15_rk, 'split: r_north zero-filled')
         call assert_close(r_south, 0.0_rk, 1.0e-15_rk, 'split: r_south zero-filled')
     end subroutine test_shape_split
+
+    !> End-to-end split flow: shape resolve + batch evaluation at the uniform
+    !! grid's own thetas must reproduce compute_fos_radius_grid_s bit-for-bit
+    !! (identical Newton path underneath).
+    subroutine test_batch_evaluator()
+        real(kind = rk)      :: params(3), radii_grid(91), z_shift_grid
+        real(kind = rk)      :: thetas(91), radii(91), dr(91)
+        real(kind = rk)      :: z_shift, r_north, r_south
+        logical              :: is_valid
+        integer(kind = ik)   :: code, i
+        character(len = 256) :: message
+
+        params = [1.5_rk, 0.08_rk, 0.05_rk]
+        call compute_fos_radius_grid_s(params, 91_ik, radii_grid, z_shift_grid, &
+                is_valid, message, error_code = code)
+        call assert_int_eq(code, FOS_VALID, 'batch: reference valid')
+
+        call compute_fos_shape_s(params, 91_ik, z_shift, r_north, r_south, &
+                is_valid, message, code)
+        do i = 1_ik, 91_ik
+            thetas(i) = real(i - 1_ik, rk) * PI_C / 90.0_rk
+        end do
+        call compute_fos_radius_and_derivative_at_thetas_s(params, thetas, z_shift, radii, dr)
+
+        do i = 1_ik, 91_ik
+            call assert_close(radii(i), radii_grid(i), 1.0e-15_rk, 'batch: R parity with grid API')
+        end do
+        ! Uniform grid includes the poles: derivative must be exactly 0 there
+        call assert_abs_close(dr(1), 0.0_rk, 1.0e-15_rk, 'batch: dR == 0 at theta = 0')
+        call assert_abs_close(dr(91), 0.0_rk, 1.0e-15_rk, 'batch: dR == 0 at theta = pi')
+    end subroutine test_batch_evaluator
 
 end program fos_param_derivative_test
