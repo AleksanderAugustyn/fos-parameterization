@@ -76,6 +76,32 @@ class NeckResult:
         return self.status == Status.VALID
 
 
+@dataclass(frozen=True)
+class ShapeResult:
+    """Shape validity, total z-shift, and analytic pole radii R(0), R(π)."""
+    z_shift: float
+    r_north: float
+    r_south: float
+    status: Status
+    message: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status == Status.VALID
+
+
+@dataclass(frozen=True)
+class RadiusDerivativeResult:
+    """Batch R(θ) and analytic dR/dθ at caller-supplied θ nodes."""
+    radii: npt.NDArray[np.float64]
+    dr_dtheta: npt.NDArray[np.float64]
+    status: Status
+
+    @property
+    def ok(self) -> bool:
+        return self.status == Status.VALID
+
+
 def theta_grid(n_grid: int) -> npt.NDArray[np.float64]:
     """The θ grid the library evaluates on: n_grid uniform points over [0, π]."""
     return np.linspace(0.0, np.pi, n_grid)
@@ -133,6 +159,48 @@ def neck(params: npt.ArrayLike) -> NeckResult:
     return NeckResult(
         z_neck=z_neck.value, rho_neck=rho_neck.value,
         found=bool(found.value), status=Status(status))
+
+
+def shape(params: npt.ArrayLike, n_rho_grid: int) -> ShapeResult:
+    """Resolve shape validity, total z-shift, and analytic pole radii.
+
+    Parameters
+    ----------
+    params : array_like
+        FoS parameters: params[0] = c, params[k-2] = a_k for k >= 3.
+    n_rho_grid : int
+        Internal rho(z) grid size (used verbatim; >= 2).
+    """
+    arr = _as_params(params)
+    z_shift = ctypes.c_double(0.0)
+    r_north = ctypes.c_double(0.0)
+    r_south = ctypes.c_double(0.0)
+    buf = ctypes.create_string_buffer(MESSAGE_BUFFER_SIZE)
+    status = _get_lib().fos_compute_shape(
+        arr.ctypes.data_as(c_dbl_p), arr.size, int(n_rho_grid),
+        ctypes.byref(z_shift), ctypes.byref(r_north), ctypes.byref(r_south),
+        MESSAGE_BUFFER_SIZE, buf)
+    return ShapeResult(
+        z_shift=z_shift.value, r_north=r_north.value, r_south=r_south.value,
+        status=Status(status), message=buf.value.decode(errors="replace"))
+
+
+def radius_and_derivative(params: npt.ArrayLike, thetas: npt.ArrayLike,
+                          z_shift: float) -> RadiusDerivativeResult:
+    """Batch R(theta) and analytic dR/dtheta at caller-supplied thetas.
+
+    z_shift must come from shape(); degenerate params yield the unit-sphere
+    fallback (r = 1, dr_dtheta = 0) — a library guarantee, not an error.
+    """
+    arr = _as_params(params)
+    t = np.ascontiguousarray(thetas, dtype=np.float64)
+    radii = np.zeros(t.size, dtype=np.float64)
+    dr = np.zeros(t.size, dtype=np.float64)
+    status = _get_lib().fos_compute_radius_and_derivative_at_thetas(
+        arr.ctypes.data_as(c_dbl_p), arr.size,
+        t.ctypes.data_as(c_dbl_p), t.size, float(z_shift),
+        radii.ctypes.data_as(c_dbl_p), dr.ctypes.data_as(c_dbl_p))
+    return RadiusDerivativeResult(radii=radii, dr_dtheta=dr, status=Status(status))
 
 
 def z_shift(params: npt.ArrayLike) -> float:
