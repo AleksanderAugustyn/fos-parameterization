@@ -5,7 +5,8 @@ program fos_param_derivative_test
     use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: fos_shape_t, make_fos_shape_f, &
             compute_fos_radius_and_derivative_s, compute_radius_fos_with_zshift_s, &
-            compute_fos_radius_grid_s, compute_rho_at_z_s, FOS_VALID
+            compute_fos_radius_grid_s, compute_rho_at_z_s, FOS_VALID, &
+            compute_fos_shape_s, FOS_ERROR_INVALID_C
     use test_utils_mod, only: assert_true, assert_int_eq, assert_close, &
             assert_abs_close, test_summary
 
@@ -15,6 +16,7 @@ program fos_param_derivative_test
     call test_wrapper_parity()
     call test_derivative_vs_fd()
     call test_derivative_vs_implicit_formula()
+    call test_shape_split()
     call test_summary()
 
 contains
@@ -136,5 +138,40 @@ contains
             call assert_close(dr, expected, 1.0e-13_rk, 'implicit: formula parity at root')
         end do
     end subroutine test_derivative_vs_implicit_formula
+
+    !> compute_fos_shape_s must reproduce compute_fos_radius_grid_s's validity,
+    !! z_shift, and messages exactly (same code, relocated), and its pole radii
+    !! must equal the grid's endpoint values (the grid's theta = 0 and pi entries
+    !! come from the Newton routine's pole branch — the same expressions).
+    subroutine test_shape_split()
+        real(kind = rk)      :: params(3), bad_params(1), radii_grid(91)
+        real(kind = rk)      :: z_shift_grid, z_shift, r_north, r_south
+        logical              :: is_valid
+        integer(kind = ik)   :: code
+        character(len = 256) :: message
+
+        params = [1.5_rk, 0.08_rk, 0.05_rk]
+        call compute_fos_radius_grid_s(params, 91_ik, radii_grid, z_shift_grid, &
+                is_valid, message, error_code = code)
+        call assert_int_eq(code, FOS_VALID, 'split: reference valid')
+
+        ! compute_fos_radius_grid_s with no n_rho_grid override uses n_grid (91)
+        ! as its internal rho-grid size; pass the same for exact parity.
+        call compute_fos_shape_s(params, 91_ik, z_shift, r_north, r_south, &
+                is_valid, message, code)
+        call assert_int_eq(code, FOS_VALID, 'split: shape valid')
+        call assert_true(is_valid, 'split: is_valid set')
+        call assert_close(z_shift, z_shift_grid, 1.0e-15_rk, 'split: z_shift parity')
+        call assert_close(r_north, radii_grid(1), 1.0e-15_rk, 'split: r_north == R(0)')
+        call assert_close(r_south, radii_grid(91), 1.0e-15_rk, 'split: r_south == R(pi)')
+
+        bad_params = [-1.0_rk]
+        call compute_fos_shape_s(bad_params, 91_ik, z_shift, r_north, r_south, &
+                is_valid, message, code)
+        call assert_int_eq(code, FOS_ERROR_INVALID_C, 'split: invalid c rejected')
+        call assert_true(.not. is_valid, 'split: invalid flag')
+        call assert_close(r_north, 0.0_rk, 1.0e-15_rk, 'split: r_north zero-filled')
+        call assert_close(r_south, 0.0_rk, 1.0e-15_rk, 'split: r_south zero-filled')
+    end subroutine test_shape_split
 
 end program fos_param_derivative_test
