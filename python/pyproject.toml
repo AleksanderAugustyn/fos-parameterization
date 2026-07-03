@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fos-parameterization"
-version = "1.0.1"
+version = "1.1.0"
 description = "Python bindings for the Fourier-over-Spheroid (FoS) nuclear-shape parameterization library"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.21"]
