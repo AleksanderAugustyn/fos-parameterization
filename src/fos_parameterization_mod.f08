@@ -79,6 +79,10 @@ module fos_parameterization_mod
     public :: compute_radius_fos_with_zshift_s
     public :: compute_fos_neck_s
 
+    ! Shape/evaluation split: scalar shape bundle + elemental R, dR/dtheta core
+    public :: make_fos_shape_f
+    public :: compute_fos_radius_and_derivative_s
+
     ! Internal rho(z) grid type — public so consumers and tests can drive the
     ! grid-level workflow (compute_rho_z_grid_s / validate_rho_grid_s /
     ! check_star_convexity_s) directly.
@@ -135,6 +139,15 @@ module fos_parameterization_mod
     !! Requiring (z + z_shift)·dρ/dz - ρ ≤ -margin rejects shapes that the
     !! R(θ) representation cannot carry accurately. In reduced units (R0 = 1).
     real(kind = rk), parameter, public :: STAR_CONVEXITY_MARGIN = 1.0e-1_rk
+
+    !> Scalar bundle of FoS parameters plus a resolved z-shift. Exists so the
+    !! radius evaluator can be elemental: Fortran requires every elemental
+    !! dummy to be scalar, which an assumed-shape params(:) can never be.
+    type, public :: fos_shape_t
+        integer(kind = ik) :: n_params = 0_ik
+        real(kind = rk)    :: params(MAX_K) = 0.0_rk
+        real(kind = rk)    :: z_shift = 0.0_rk
+    end type fos_shape_t
 
     ! Internal ρ(z) grid type
     type :: rho_z_grid_t
@@ -877,20 +890,66 @@ contains
 
     end function compute_fos_z_shift_f
 
-    !> Computes R(θ) using bisection-safeguarded Newton-Raphson iteration.
-    !!
-    !! Solves F(r) = r×sin(θ) - ρ(r×cos(θ)) = 0. For a star-convex shape the
-    !! ray crosses the surface exactly once, with F < 0 inside the body and
-    !! F > 0 outside, so a sign-change bracket [r_lo, r_hi] always exists.
-    !! Newton steps that would leave the bracket are replaced by bisection,
-    !! which guarantees convergence even for steep polar lobes where plain
-    !! Newton enters a limit cycle (stepping outside the body collapses the
-    !! derivative to sin(θ) and the resulting jump overshoots).
+    !> Computes R(θ) at x = cos(θ). Thin wrapper over the elemental core
+    !! compute_fos_radius_and_derivative_s — same Newton path, derivative
+    !! discarded. Kept for its established callers.
     pure subroutine compute_radius_fos_with_zshift_s(params, x, z_shift, r)
         real(kind = rk), intent(in) :: params(:)
         real(kind = rk), intent(in), value :: x
         real(kind = rk), intent(in), value :: z_shift
         real(kind = rk), intent(out) :: r
+
+        type(fos_shape_t) :: shape
+        real(kind = rk)   :: dr_unused
+
+        shape = make_fos_shape_f(params, z_shift)
+        call compute_fos_radius_and_derivative_s(shape, x, r, dr_unused)
+
+    end subroutine compute_radius_fos_with_zshift_s
+
+    !> Bundle a params vector and resolved z_shift into the scalar shape type.
+    !!
+    !! Entries beyond MAX_K are dropped: radius evaluation reads coefficients
+    !! only up to k = MAX_K (compute_fos_f_and_derivatives_s caps there, so
+    !! params indices above MAX_K - 1 are never touched), so truncation cannot
+    !! change any evaluated radius. z_shift arrives already resolved — it may
+    !! depend on higher entries, which is why compute_fos_shape_s takes the
+    !! full vector, not this type.
+    pure function make_fos_shape_f(params, z_shift) result(shape)
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(in) :: z_shift
+        type(fos_shape_t) :: shape
+
+        integer(kind = ik) :: n
+
+        n = min(size(params, kind = ik), MAX_K)
+        shape%n_params    = n
+        shape%params(:)   = 0.0_rk
+        shape%params(1:n) = params(1:n)
+        shape%z_shift     = z_shift
+    end function make_fos_shape_f
+
+    !> Elemental core: R(theta) and dR/dtheta at x = cos(theta), theta in [0, pi],
+    !! for a resolved shape.
+    !!
+    !! Solves F(r) = r×sin(θ) - ρ(r×cos(θ)) = 0 with bisection-safeguarded
+    !! Newton-Raphson. For a star-convex shape the ray crosses the surface
+    !! exactly once, with F < 0 inside the body and F > 0 outside, so a
+    !! sign-change bracket [r_lo, r_hi] always exists. Newton steps that would
+    !! leave the bracket are replaced by bisection, which guarantees convergence
+    !! even for steep polar lobes where plain Newton enters a limit cycle
+    !! (stepping outside the body collapses the derivative to sin(θ) and the
+    !! resulting jump overshoots).
+    !!
+    !! The derivative is implicit differentiation at the root:
+    !!   dR/dtheta = -(r cos + drho_dz r sin) / (sin - drho_dz cos)
+    !! Pole branches and the degenerate unit-sphere fallback return dr_dtheta = 0
+    !! (smooth axisymmetric surface has zero slope in R(theta) at the poles).
+    elemental subroutine compute_fos_radius_and_derivative_s(shape, x, r, dr_dtheta)
+        type(fos_shape_t), intent(in)  :: shape
+        real(kind = rk),   intent(in)  :: x
+        real(kind = rk),   intent(out) :: r
+        real(kind = rk),   intent(out) :: dr_dtheta
 
         real(kind = rk) :: c, sin_theta, cos_theta
         real(kind = rk) :: z_max, z_min, r_north, r_south
@@ -898,12 +957,14 @@ contains
         real(kind = rk) :: r_lo, r_hi, r_curr, r_new, delta_r, F_val, dF_dr
         integer(kind = ik) :: iter
 
-        if (size(params) < 1) then
+        dr_dtheta = 0.0_rk
+
+        if (shape%n_params < 1_ik) then
             r = 1.0_rk
             return
         end if
 
-        c = params(1)
+        c = shape%params(1)
         if (c <= C_MIN) then
             r = 1.0_rk
             return
@@ -913,8 +974,8 @@ contains
         sin_theta = sqrt(max(1.0_rk - x**2, 0.0_rk))
 
         ! In shifted frame, shape spans z ∈ [-c + z_shift, c + z_shift]
-        z_max = c + z_shift
-        z_min = -c + z_shift
+        z_max = c + shape%z_shift
+        z_min = -c + shape%z_shift
         r_north = z_max
         r_south = abs(z_min)
 
@@ -936,7 +997,7 @@ contains
         r_hi = 2.0_rk * max(r_north, r_south)
         do iter = 1_ik, 8_ik
             z = r_hi * cos_theta
-            call compute_rho_at_z_s(params, z, z_shift, rho)
+            call compute_rho_at_z_s(shape%params(1:shape%n_params), z, shape%z_shift, rho)
             if (r_hi * sin_theta - rho > 0.0_rk) exit
             r_hi = 2.0_rk * r_hi
         end do
@@ -948,7 +1009,7 @@ contains
         ! Safeguarded Newton: solve F(r) = r×sin(θ) - ρ(r×cos(θ)) = 0
         do iter = 1_ik, NR_MAX_ITER
             z = r_curr * cos_theta
-            call compute_rho_at_z_s(params, z, z_shift, rho, drho_dz)
+            call compute_rho_at_z_s(shape%params(1:shape%n_params), z, shape%z_shift, rho, drho_dz)
 
             F_val = r_curr * sin_theta - rho
             dF_dr = sin_theta - drho_dz * cos_theta
@@ -980,6 +1041,21 @@ contains
 
         r = r_curr
 
-    end subroutine compute_radius_fos_with_zshift_s
+        ! Recompute rho and drho_dz at the final r so the implicit-differentiation
+        ! inputs match the returned radius exactly. This also covers the
+        ! max-iterations exit, where the loop-carried values lag one iterate.
+        z = r * cos_theta
+        call compute_rho_at_z_s(shape%params(1:shape%n_params), z, shape%z_shift, &
+                rho, drho_dz)
+        dF_dr = sin_theta - drho_dz * cos_theta
+        if (abs(dF_dr) > 1.0e-14_rk) then
+            dr_dtheta = -(r * cos_theta + drho_dz * r * sin_theta) / dF_dr
+        else
+            ! Vertical tangent — excluded for star-convex shapes by the
+            ! conversion margin; return 0 rather than a garbage slope.
+            dr_dtheta = 0.0_rk
+        end if
+
+    end subroutine compute_fos_radius_and_derivative_s
 
 end module fos_parameterization_mod
