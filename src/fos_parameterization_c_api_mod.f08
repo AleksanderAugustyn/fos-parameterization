@@ -12,6 +12,7 @@ module fos_parameterization_c_api_mod
     use fos_parameterization_mod, only: &
             compute_fos_radius_grid_s, compute_rho_at_z_s, compute_fos_neck_s, &
             compute_fos_z_shift_f, compute_fos_a2_f, &
+            compute_fos_shape_s, compute_fos_radius_and_derivative_at_thetas_s, &
             FOS_VALID, FOS_ERROR_INVALID_C, C_MIN
 
     implicit none
@@ -23,6 +24,8 @@ module fos_parameterization_c_api_mod
     public :: fos_compute_neck
     public :: fos_z_shift
     public :: fos_a2
+    public :: fos_compute_shape
+    public :: fos_compute_radius_and_derivative_at_thetas
 
     !> C-API-level status for invalid grid/profile sizes (see module docstring).
     integer(kind = ik), parameter :: FOS_ERROR_INVALID_ARGUMENTS = 5_ik
@@ -204,6 +207,90 @@ contains
         if (l_found) found = 1_ik_c
         status = int(FOS_VALID, ik_c)
     end function fos_compute_neck
+
+    !===========================================================================
+    ! SHAPE SPLIT + DERIVATIVE EVALUATION
+    !===========================================================================
+
+    function fos_compute_shape( &
+            params, n_params, n_rho_grid, z_shift, r_north, r_south, &
+            message_buf_len, message_buf) &
+            result(status) bind(c, name='fos_compute_shape')
+
+        integer(kind = ik_c),     intent(in), value :: n_params
+        real(kind = rk_c),        intent(in)        :: params(n_params)
+        integer(kind = ik_c),     intent(in), value :: n_rho_grid
+        real(kind = rk_c),        intent(out)       :: z_shift
+        real(kind = rk_c),        intent(out)       :: r_north
+        real(kind = rk_c),        intent(out)       :: r_south
+        integer(kind = ik_c),     intent(in), value :: message_buf_len
+        character(kind = c_char), intent(out)       :: message_buf(message_buf_len)
+        integer(kind = ik_c) :: status
+
+        real(kind = rk), allocatable :: f_params(:)
+        real(kind = rk)      :: f_z_shift, f_r_north, f_r_south
+        logical              :: is_valid
+        integer(kind = ik)   :: error_code
+        character(len = 256) :: f_message
+
+        z_shift = 0.0_rk_c
+        r_north = 0.0_rk_c
+        r_south = 0.0_rk_c
+
+        if (n_rho_grid < 2_ik_c) then
+            status = int(FOS_ERROR_INVALID_ARGUMENTS, ik_c)
+            call marshal_message_to_c('n_rho_grid must be >= 2', message_buf, message_buf_len)
+            return
+        end if
+
+        allocate(f_params(int(n_params, ik)))
+        f_params(:) = real(params(:), rk)
+
+        call compute_fos_shape_s(f_params, int(n_rho_grid, ik), f_z_shift, &
+                f_r_north, f_r_south, is_valid, f_message, error_code)
+
+        z_shift = real(f_z_shift, rk_c)
+        r_north = real(f_r_north, rk_c)
+        r_south = real(f_r_south, rk_c)
+        status  = int(error_code, ik_c)
+        call marshal_message_to_c(f_message, message_buf, message_buf_len)
+    end function fos_compute_shape
+
+    function fos_compute_radius_and_derivative_at_thetas( &
+            params, n_params, thetas, n_thetas, z_shift, radii, dr_dtheta) &
+            result(status) bind(c, name='fos_compute_radius_and_derivative_at_thetas')
+
+        integer(kind = ik_c), intent(in), value :: n_params
+        real(kind = rk_c),    intent(in)        :: params(n_params)
+        integer(kind = ik_c), intent(in), value :: n_thetas
+        real(kind = rk_c),    intent(in)        :: thetas(n_thetas)
+        real(kind = rk_c),    intent(in), value :: z_shift
+        real(kind = rk_c),    intent(out)       :: radii(n_thetas)
+        real(kind = rk_c),    intent(out)       :: dr_dtheta(n_thetas)
+        integer(kind = ik_c) :: status
+
+        real(kind = rk), allocatable :: f_params(:), f_thetas(:), f_radii(:), f_dr(:)
+
+        if (n_thetas < 1_ik_c) then
+            status = int(FOS_ERROR_INVALID_ARGUMENTS, ik_c)
+            return
+        end if
+
+        radii(:)     = 0.0_rk_c
+        dr_dtheta(:) = 0.0_rk_c
+
+        allocate(f_params(int(n_params, ik)), f_thetas(int(n_thetas, ik)))
+        allocate(f_radii(int(n_thetas, ik)), f_dr(int(n_thetas, ik)))
+        f_params(:) = real(params(:), rk)
+        f_thetas(:) = real(thetas(:), rk)
+
+        call compute_fos_radius_and_derivative_at_thetas_s( &
+                f_params, f_thetas, real(z_shift, rk), f_radii, f_dr)
+
+        radii(:)     = real(f_radii(:), rk_c)
+        dr_dtheta(:) = real(f_dr(:), rk_c)
+        status = int(FOS_VALID, ik_c)
+    end function fos_compute_radius_and_derivative_at_thetas
 
     !===========================================================================
     ! SCALAR HELPERS

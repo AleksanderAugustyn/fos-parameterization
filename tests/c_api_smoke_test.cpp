@@ -96,6 +96,37 @@ int main() {
     check(std::fabs(fos_a2(necked.data(), 7) - 0.5 / 3.0) < 1e-15, "C: a2 = a4/3 for a4-only");
     check(fos_a2(sphere.data(), 7) == 0.0, "C: sphere a2 = 0");
 
+    // --- Shape split + derivative evaluation ---
+    std::vector<double> shp_params{1.5, 0.08, 0.05};
+    double r_north = -1.0, r_south = -1.0;
+    z_shift = -1.0;
+    s = fos_compute_shape(shp_params.data(), 3, 1000, &z_shift, &r_north, &r_south,
+                          nbuf, buf.data());
+    check(s == FOS_VALID, "C: fos_compute_shape FOS_VALID");
+    check(r_north > 0.0 && r_south > 0.0, "C: pole radii positive");
+
+    std::vector<double> thetas{0.4, 1.5707963267948966, 2.7};
+    std::vector<double> sd_radii(3, -1.0), dr_dtheta(3, -1.0);
+    s = fos_compute_radius_and_derivative_at_thetas(
+            shp_params.data(), 3, thetas.data(), 3, z_shift, sd_radii.data(), dr_dtheta.data());
+    check(s == FOS_VALID, "C: derivative eval FOS_VALID");
+    for (double r : sd_radii) check(r > 0.0, "C: derivative eval radii positive");
+
+    std::vector<double> bad_shape{-1.0};
+    s = fos_compute_shape(bad_shape.data(), 1, 1000, &z_shift, &r_north, &r_south,
+                          nbuf, buf.data());
+    check(s == FOS_ERROR_INVALID_C, "C: shape with c = -1 -> FOS_ERROR_INVALID_C");
+    check(z_shift == 0.0 && r_north == 0.0 && r_south == 0.0,
+          "C: failed shape zero-fills outputs");
+
+    s = fos_compute_shape(shp_params.data(), 3, 1, &z_shift, &r_north, &r_south,
+                          nbuf, buf.data());
+    check(s == FOS_ERROR_INVALID_ARGUMENTS, "C: n_rho_grid = 1 -> FOS_ERROR_INVALID_ARGUMENTS");
+    s = fos_compute_radius_and_derivative_at_thetas(
+            shp_params.data(), 3, thetas.data(), 0, z_shift, sd_radii.data(), dr_dtheta.data());
+    check(s == FOS_ERROR_INVALID_ARGUMENTS, "C: n_thetas = 0 -> FOS_ERROR_INVALID_ARGUMENTS");
+    std::printf("shape-split API smoke: OK\n");
+
     std::printf("c_api_smoke_test: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
