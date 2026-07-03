@@ -25,6 +25,17 @@ def configure(lib: ctypes.CDLL) -> ctypes.CDLL:
         c_dbl_p, ctypes.c_int, c_dbl_p, c_dbl_p, c_int_p]
     lib.fos_compute_neck.restype = ctypes.c_int
 
+    lib.fos_compute_shape.argtypes = [
+        c_dbl_p, ctypes.c_int, ctypes.c_int,
+        c_dbl_p, c_dbl_p, c_dbl_p,
+        ctypes.c_int, ctypes.c_char_p]
+    lib.fos_compute_shape.restype = ctypes.c_int
+
+    lib.fos_compute_radius_and_derivative_at_thetas.argtypes = [
+        c_dbl_p, ctypes.c_int, c_dbl_p, ctypes.c_int, ctypes.c_double,
+        c_dbl_p, c_dbl_p]
+    lib.fos_compute_radius_and_derivative_at_thetas.restype = ctypes.c_int
+
     lib.fos_z_shift.argtypes = [c_dbl_p, ctypes.c_int]
     lib.fos_z_shift.restype = ctypes.c_double
 

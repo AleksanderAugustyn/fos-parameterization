@@ -1,6 +1,6 @@
 /**
  * @file fos_parameterization.h
- * @brief C API for the Fortran Fourier-over-Spheroid (FoS) shape library (v1.0.1).
+ * @brief C API for the Fortran Fourier-over-Spheroid (FoS) shape library (v1.1.0).
  *
  * Standalone functions only: FoS has no shape-independent precompute, so
  * there is no cache/handle tier. All lengths are in reduced units (R0 = 1);
@@ -75,6 +75,36 @@ int fos_compute_rho_profile(
 int fos_compute_neck(
         const double* params, int n_params,
         double* z_neck, double* rho_neck, int* found);
+
+/**
+ * Per-shape resolve step: validity, TOTAL z-shift (intrinsic COM +
+ * star-convexity), and analytic pole radii r_north = R(0), r_south = R(pi)
+ * in the shifted frame. Feed the resulting z_shift to
+ * fos_compute_radius_and_derivative_at_thetas for any number of theta sets.
+ * On any failure all numeric outputs are zero-filled.
+ *
+ * @param n_rho_grid  Internal rho(z) grid size, used verbatim (>= 2)
+ */
+int fos_compute_shape(
+        const double* params, int n_params, int n_rho_grid,
+        double* z_shift, double* r_north, double* r_south,
+        int message_buf_len, char* message_buf);
+
+/**
+ * Batch R(theta) and analytic dR/dtheta at caller-supplied thetas in [0, pi].
+ * z_shift must come from fos_compute_shape. Pure evaluation, no message
+ * buffer: degenerate params (empty, c <= C_MIN) yield the unit-sphere
+ * fallback r = 1, dr_dtheta = 0 — a library guarantee, not an error.
+ *
+ * @param thetas     n_thetas angles in [0, pi]
+ * @param radii      Output buffer, n_thetas doubles
+ * @param dr_dtheta  Output buffer, n_thetas doubles
+ * @return           FOS_VALID, or FOS_ERROR_INVALID_ARGUMENTS if n_thetas < 1
+ */
+int fos_compute_radius_and_derivative_at_thetas(
+        const double* params, int n_params,
+        const double* thetas, int n_thetas, double z_shift,
+        double* radii, double* dr_dtheta);
 
 /** Intrinsic COM z-shift (closed form). Returns 0 for invalid params. */
 double fos_z_shift(const double* params, int n_params);

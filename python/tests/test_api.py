@@ -48,6 +48,57 @@ F4_EXPECTED = [
 ]
 F4_Z_SHIFT = 0.0000000000000000E+000
 
+# Shape-split + derivative goldens (same capture program, n_rho_grid = 181).
+# Thetas are pre-rounded literals for pi/8, pi/2, 7pi/8 — bit-identical to the
+# literals in golden_capture.f08, so both sides feed the same doubles.
+DERIV_THETAS = [0.39269908169872414, 1.5707963267948966, 2.748893571891069]
+
+# dR/dtheta is a direct arithmetic expression of (r, theta). Unlike R — a
+# Newton fixed point that self-corrects to the same root — it inherits
+# FMA/contraction differences between the capture binary and the shared
+# library (Release is -ffast-math -flto: two separately optimized codegens),
+# leaving a few-ulp floor (~1.2e-15 observed) between the two.
+DERIV_DR_ATOL = 5e-15
+
+F2_R_NORTH = 1.9675901550757660E+000
+F2_R_SOUTH = 1.6324098449242341E+000
+F2_DERIV_R = [
+    1.5387379214194603E+000,
+    6.2134923161743805E-001,
+    1.4646885007634520E+000,
+]
+F2_DERIV_DR = [
+    -2.0821776359437809E+000,
+    1.5235663870749072E-001,
+    7.3011136010047017E-001,
+]
+
+F3_R_NORTH = 1.5716197243913530E+000
+F3_R_SOUTH = 1.4283802756086470E+000
+F3_DERIV_R = [
+    1.3915669254733638E+000,
+    7.0768449215772455E-001,
+    1.3317901145714259E+000,
+]
+F3_DERIV_DR = [
+    -7.9984191593394949E-001,
+    9.6279565037092382E-002,
+    4.3222840642498583E-001,
+]
+
+F4_R_NORTH = 2.0000000000000000E+000
+F4_R_SOUTH = 2.0000000000000000E+000
+F4_DERIV_R = [
+    1.6553976256663301E+000,
+    4.0824829046386313E-001,
+    1.6553976256663301E+000,
+]
+F4_DERIV_DR = [
+    -1.5307124866118125E+000,
+    -3.9863274022861999E-017,
+    1.5307124866118125E+000,
+]
+
 
 def test_sphere_exact() -> None:
     res = fp.radius_grid([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], n_grid=181)
@@ -121,6 +172,64 @@ def test_theta_grid() -> None:
 def test_params_must_be_1d() -> None:
     with pytest.raises(ValueError):
         fp.radius_grid(np.zeros((2, 3)), n_grid=41)
+
+
+def test_shape_and_derivative_grid_parity() -> None:
+    params = [1.5, 0.08, 0.05]
+    n_grid = 91
+    ref = fp.radius_grid(params, n_grid)
+    assert ref.ok
+
+    shp = fp.shape(params, n_rho_grid=n_grid)
+    assert shp.ok
+    assert shp.z_shift == pytest.approx(ref.z_shift, abs=1e-15)
+    assert shp.r_north > 0.0 and shp.r_south > 0.0
+
+    thetas = fp.theta_grid(n_grid)
+    result = fp.radius_and_derivative(params, thetas, shp.z_shift)
+    assert result.ok
+    np.testing.assert_allclose(result.radii, ref.radii, rtol=0.0, atol=1e-15)
+    assert result.dr_dtheta[0] == 0.0 and result.dr_dtheta[-1] == 0.0
+
+
+def test_derivative_vs_fd() -> None:
+    params = [1.5, 0.08, 0.05]
+    shp = fp.shape(params, n_rho_grid=1000)
+    thetas = np.linspace(0.2, np.pi - 0.2, 50)
+    h = 1e-3
+
+    r = fp.radius_and_derivative(params, thetas, shp.z_shift)
+    fd_stencils = [
+        fp.radius_and_derivative(params, thetas + k * h, shp.z_shift).radii
+        for k in (-2, -1, 1, 2)
+    ]
+    fd = (fd_stencils[0] - 8 * fd_stencils[1] + 8 * fd_stencils[2] - fd_stencils[3]) / (12 * h)
+    np.testing.assert_allclose(r.dr_dtheta, fd, rtol=0.0, atol=1e-9)
+
+
+def test_shape_invalid_c() -> None:
+    shp = fp.shape([-1.0], n_rho_grid=1000)
+    assert not shp.ok
+    assert shp.status == fp.Status.ERROR_INVALID_C
+    assert shp.z_shift == 0.0 and shp.r_north == 0.0 and shp.r_south == 0.0
+
+
+@pytest.mark.parametrize("params,z_shift,r_north,r_south,deriv_r,deriv_dr", [
+    (F2_PARAMS, F2_Z_SHIFT, F2_R_NORTH, F2_R_SOUTH, F2_DERIV_R, F2_DERIV_DR),
+    (F3_PARAMS, F3_Z_SHIFT, F3_R_NORTH, F3_R_SOUTH, F3_DERIV_R, F3_DERIV_DR),
+    (F4_PARAMS, F4_Z_SHIFT, F4_R_NORTH, F4_R_SOUTH, F4_DERIV_R, F4_DERIV_DR),
+])
+def test_derivative_goldens(params, z_shift, r_north, r_south, deriv_r, deriv_dr) -> None:
+    shp = fp.shape(params, n_rho_grid=181)
+    assert shp.ok
+    assert shp.z_shift == pytest.approx(z_shift, rel=1e-15, abs=1e-300)
+    np.testing.assert_allclose([shp.r_north, shp.r_south], [r_north, r_south],
+                               rtol=0.0, atol=1e-15)
+
+    res = fp.radius_and_derivative(params, DERIV_THETAS, shp.z_shift)
+    assert res.ok
+    np.testing.assert_allclose(res.radii, deriv_r, rtol=0.0, atol=1e-15)
+    np.testing.assert_allclose(res.dr_dtheta, deriv_dr, rtol=0.0, atol=DERIV_DR_ATOL)
 
 
 @pytest.mark.parametrize("params", [
