@@ -1,6 +1,6 @@
 /**
  * @file fos_parameterization.h
- * @brief C API for the Fortran Fourier-over-Spheroid (FoS) shape library (v1.0.0).
+ * @brief C API for the Fortran Fourier-over-Spheroid (FoS) shape library (v1.0.1).
  *
  * Standalone functions only: FoS has no shape-independent precompute, so
  * there is no cache/handle tier. All lengths are in reduced units (R0 = 1);

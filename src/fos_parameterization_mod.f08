@@ -91,6 +91,11 @@ module fos_parameterization_mod
     real(kind = rk), parameter :: POLE_THRESH = 1.0_rk - 1.0e-10_rk
     real(kind = rk), parameter, public :: C_MIN = 1.0e-10_rk
     real(kind = rk), parameter :: COEFF_NEGLIGIBLE = 1.0e-30_rk
+    ! Tip detection tolerance: grid construction reaches u = ±1 only up to
+    ! roundoff (~1 ulp), and f(±1) = 0 analytically, so drho/dz = f'/(2c*sqrt(cf))
+    ! amplifies that residue to ~1e7 unless u this close to a tip is treated AS
+    ! the tip (rho = 0, drho/dz = 0). No interior evaluation comes within 1e-15.
+    real(kind = rk), parameter :: U_TIP_TOL = 4.0_rk * epsilon(1.0_rk)
 
     !---------------------------------------------------------------------------
     ! Defense in Depth: Beak Singularity Threshold
@@ -262,7 +267,14 @@ contains
         do i = 1_ik, n_points
             grid%z(i) = -c + real(i - 1_ik, rk) * dz
             u = grid%z(i) * c_inv
-            u = max(-1.0_rk + 1.0e-10_rk, min(1.0_rk - 1.0e-10_rk, u))
+
+            ! Same tip convention as compute_rho_at_z_s: at |u| = 1 (up to
+            ! roundoff) the shape ends, rho = 0 and drho/dz = 0 by convention.
+            if (abs(u) >= 1.0_rk - U_TIP_TOL) then
+                grid%rho(i) = 0.0_rk
+                grid%drho_dz(i) = 0.0_rk
+                cycle
+            end if
 
             call compute_fos_f_and_derivatives_s(params, u, f_val, fp_val)
             rho_sq = f_val * c_inv
@@ -726,7 +738,7 @@ contains
 
         c_inv = 1.0_rk / c
         u = (z - z_shift) * c_inv
-        if (abs(u) >= 1.0_rk) return
+        if (abs(u) >= 1.0_rk - U_TIP_TOL) return
 
         if (present(drho_dz)) then
             call compute_fos_f_and_derivatives_s(params, u, f_val, fp_val)

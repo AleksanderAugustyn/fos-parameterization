@@ -121,3 +121,22 @@ def test_theta_grid() -> None:
 def test_params_must_be_1d() -> None:
     with pytest.raises(ValueError):
         fp.radius_grid(np.zeros((2, 3)), n_grid=41)
+
+
+@pytest.mark.parametrize("params", [
+    [1.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0],  # z_shift != 0: left tip lands 1 ulp inside
+    [1.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],   # dz accumulation: right tip 1 ulp inside
+    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],   # sphere: clean before the fix, must stay clean
+])
+def test_profile_tips_are_exact_zero(params) -> None:
+    """f(±1) = 0 by construction, so tips are rho = 0 with the drho_dz = 0 convention.
+
+    Regression (2026-07-03): the exact abs(u) >= 1 tip guard let ~1-ulp endpoint
+    residue through; f evaluated at roundoff scale and drho_dz = f'/(2c*sqrt(c*f))
+    exploded to ~1e7 on whichever tip the residue landed inside.
+    """
+    prof = fp.rho_profile(params, 721)
+    assert prof.ok
+    for i in (0, -1):
+        assert prof.rho[i] == 0.0
+        assert prof.drho_dz[i] == 0.0
