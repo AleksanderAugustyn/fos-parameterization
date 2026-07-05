@@ -13,6 +13,8 @@ def _candidate_paths() -> Iterator[Path]:
     env = os.environ.get("FOS_PARAM_LIB")
     if env:
         yield Path(env)
+    # Installed-wheel location: the .so is bundled next to this file.
+    yield Path(__file__).resolve().parent / _LIB_NAME
     # Dev fallback: this file is <repo>/python/fos_parameterization/_libloader.py
     repo_root = Path(__file__).resolve().parents[2]
     yield repo_root / "build" / "release" / _LIB_NAME

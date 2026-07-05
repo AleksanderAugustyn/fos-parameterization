@@ -4,6 +4,11 @@ cmake-build-*/
 bin/
 lib/
 
+# Wheel build artifacts
+dist_raw/
+wheelhouse/
+*.whl
+
 # Fortran compiled files
 *.o
 *.mod

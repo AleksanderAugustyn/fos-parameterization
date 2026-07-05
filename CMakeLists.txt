@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(fos-parameterization
-        VERSION 1.2.0
+        VERSION 1.2.1
         LANGUAGES Fortran CXX
         DESCRIPTION "Fourier-over-Spheroid (FoS) nuclear shape parameterization"
 )
@@ -99,8 +99,14 @@ target_compile_features(fos_parameterization_cxx INTERFACE cxx_std_20)
 add_library(FosParameterization::fos_parameterization_cxx
         ALIAS fos_parameterization_cxx)
 
-# --- Tests ---
-enable_testing()
+# --- Install the shared library into the Python package (wheel builds) ---
+install(TARGETS fos_parameterization_shared
+        LIBRARY DESTINATION fos_parameterization)
+
+# --- Tests (skipped for wheel builds via -DFOS_PARAM_BUILD_TESTS=OFF) ---
+option(FOS_PARAM_BUILD_TESTS "Build the Fortran/C++ test suite" ON)
+if (FOS_PARAM_BUILD_TESTS)
+    enable_testing()
 
 add_library(fos_param_test_utils STATIC
         tests/test_utils_mod.f08
@@ -133,3 +139,4 @@ set_target_properties(fos_param_golden_capture PROPERTIES
 add_executable(fos_param_c_api_smoke_test tests/c_api_smoke_test.cpp)
 target_link_libraries(fos_param_c_api_smoke_test PRIVATE fos_parameterization_cxx)
 add_test(NAME c_api_smoke COMMAND fos_param_c_api_smoke_test)
+endif ()
