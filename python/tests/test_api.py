@@ -48,6 +48,21 @@ F4_EXPECTED = [
 ]
 F4_Z_SHIFT = 0.0000000000000000E+000
 
+# F5: marginal star-convex shape recovered by the golden-section shift search
+# (best origin gives max-T = -0.103 R0, just past the -0.1 margin; the old coarse
+# shift search rejected it). z_shift = -0.16905 R0 is the true optimum.
+F5_PARAMS = [2.00, 0.40, 0.66, 0.0, 0.0, 0.0, 0.0]
+F5_EXPECTED = [
+    1.8309533690419022E+000,
+    1.2362050765905319E+000,
+    2.2194559887019227E-001,
+    1.7533696725021786E-001,
+    2.5349878018568273E-001,
+    1.7128255699392803E+000,
+    2.1690466309580976E+000,
+]
+F5_Z_SHIFT = -1.6904663095809774E-001
+
 # Shape-split + derivative goldens (same capture program, n_rho_grid = 181).
 # Thetas are pre-rounded literals for pi/8, pi/2, 7pi/8 — bit-identical to the
 # literals in golden_capture.f08, so both sides feed the same doubles.
@@ -99,6 +114,19 @@ F4_DERIV_DR = [
     1.5307124866118125E+000,
 ]
 
+F5_R_NORTH = 1.8309533690419022E+000
+F5_R_SOUTH = 2.1690466309580976E+000
+F5_DERIV_R = [
+    1.4857936540921055E+000,
+    1.7533696725021786E-001,
+    1.9105555374098624E+000,
+]
+F5_DERIV_DR = [
+    -1.5693450137431226E+000,
+    1.6198246115502524E-002,
+    1.2205515080911753E+000,
+]
+
 
 def test_sphere_exact() -> None:
     res = fp.radius_grid([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], n_grid=181)
@@ -112,6 +140,7 @@ def test_sphere_exact() -> None:
     (F2_PARAMS, F2_EXPECTED, F2_Z_SHIFT),
     (F3_PARAMS, F3_EXPECTED, F3_Z_SHIFT),
     (F4_PARAMS, F4_EXPECTED, F4_Z_SHIFT),
+    (F5_PARAMS, F5_EXPECTED, F5_Z_SHIFT),
 ])
 def test_goldens_match_fortran(params, expected, z_shift) -> None:
     res = fp.radius_grid(params, n_grid=181)
@@ -218,6 +247,7 @@ def test_shape_invalid_c() -> None:
     (F2_PARAMS, F2_Z_SHIFT, F2_R_NORTH, F2_R_SOUTH, F2_DERIV_R, F2_DERIV_DR),
     (F3_PARAMS, F3_Z_SHIFT, F3_R_NORTH, F3_R_SOUTH, F3_DERIV_R, F3_DERIV_DR),
     (F4_PARAMS, F4_Z_SHIFT, F4_R_NORTH, F4_R_SOUTH, F4_DERIV_R, F4_DERIV_DR),
+    (F5_PARAMS, F5_Z_SHIFT, F5_R_NORTH, F5_R_SOUTH, F5_DERIV_R, F5_DERIV_DR),
 ])
 def test_derivative_goldens(params, z_shift, r_north, r_south, deriv_r, deriv_dr) -> None:
     shp = fp.shape(params, n_rho_grid=181)
