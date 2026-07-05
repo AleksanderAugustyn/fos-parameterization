@@ -17,6 +17,9 @@ program golden_capture
     call capture('F2', [1.80_rk, 0.20_rk, 0.30_rk, 0.01_rk, -0.02_rk, 0.0_rk, 0.0_rk])
     call capture('F3', [1.50_rk, 0.10_rk, 0.20_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk])
     call capture('F4', [2.00_rk, 0.00_rk, 0.50_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk])
+    ! F5: marginal star-convex shape recovered by the golden-section shift search
+    ! (best origin gives max-T = -0.103 R0, just past the -0.1 margin).
+    call capture('F5', [2.00_rk, 0.40_rk, 0.66_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk])
     call test_summary()
 
 contains
