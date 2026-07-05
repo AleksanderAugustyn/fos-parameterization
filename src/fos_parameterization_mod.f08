@@ -600,20 +600,35 @@ contains
         real(kind = rk), intent(out) :: z_shift
         logical, intent(out) :: is_convex
 
+        real(kind = rk) :: g_opt
+
+        ! g(s*) <= -margin is identical to is_star_convex_from_grid_f(grid, s*):
+        ! both flag max_i[(z_i+s*) drho_dz_i - rho_i] > -margin.
+        call minimize_star_convexity_s(grid, params(1), z_shift, g_opt)
+        is_convex = (g_opt <= -STAR_CONVEXITY_MARGIN)
+        if (.not. is_convex) z_shift = 0.0_rk
+    end subroutine find_star_convex_shift_from_grid_s
+
+    !> Golden-section minimization of g(s) = max_i[(z_i + s) drho_dz_i - rho_i]
+    !! over the additional shift s. g is convex piecewise-linear in s (pointwise
+    !! max of affine functions), so golden-section returns the exact global
+    !! minimum. The bracket [-2c, 2c] contains any origin that can be star-convex.
+    !! Returns the argmin s_opt and the minimum value g_opt; the caller applies
+    !! the STAR_CONVEXITY_MARGIN gate.
+    pure subroutine minimize_star_convexity_s(grid, c, s_opt, g_opt)
+        type(rho_z_grid_t), intent(in) :: grid
+        real(kind = rk), intent(in) :: c
+        real(kind = rk), intent(out) :: s_opt
+        real(kind = rk), intent(out) :: g_opt
+
         ! (sqrt(5) - 1) / 2; SHIFT_TOL and bracket are in reduced units (R0 = 1).
         real(kind = rk), parameter :: GOLDEN = 0.6180339887498949_rk
         real(kind = rk), parameter :: SHIFT_TOL = 1.0e-6_rk
         integer(kind = ik), parameter :: MAX_ITER = 200_ik
 
-        real(kind = rk) :: c, a, b, x1, x2, f1, f2
+        real(kind = rk) :: a, b, x1, x2, f1, f2
         integer(kind = ik) :: it
 
-        z_shift = 0.0_rk
-        is_convex = .false.
-        c = params(1)
-
-        ! Any origin that can be star-convex lies inside the body, which is
-        ! contained in +/-2c on the COM-shifted grid, so this brackets the minimum.
         a = -2.0_rk * c
         b = 2.0_rk * c
         x1 = b - GOLDEN * (b - a)
@@ -638,10 +653,9 @@ contains
             end if
         end do
 
-        z_shift = 0.5_rk * (a + b)
-        is_convex = is_star_convex_from_grid_f(grid, z_shift)
-        if (.not. is_convex) z_shift = 0.0_rk
-    end subroutine find_star_convex_shift_from_grid_s
+        s_opt = 0.5_rk * (a + b)
+        g_opt = max_star_convexity_value_f(grid, s_opt)
+    end subroutine minimize_star_convexity_s
 
     !> Finds the z-position of the neck (minimum ρ between two maxima).
     subroutine find_neck_from_grid_s(grid, z_neck, found)
