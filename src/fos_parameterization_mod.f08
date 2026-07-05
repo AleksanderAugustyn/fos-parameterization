@@ -74,6 +74,7 @@ module fos_parameterization_mod
     public :: compute_rho_z_grid_s
     public :: validate_rho_grid_s
     public :: check_star_convexity_s
+    public :: compute_fos_star_convexity_optimum_s
     public :: compute_radius_at_theta_s
 
     ! Helper functions
@@ -138,13 +139,38 @@ module fos_parameterization_mod
     !---------------------------------------------------------------------------
     ! Star-convexity safety margin
     !---------------------------------------------------------------------------
-    !! The star-convexity condition (z + z_shift)·dρ/dz - ρ ≤ 0 admits shapes
-    !! whose surface grazes a ray from the origin (condition ≈ 0). Such shapes
-    !! produce a near-vertical wall in R(θ) (|dR/dθ| ~ 1/margin) that no
-    !! practical θ grid can resolve, corrupting surface and Coulomb integrals.
-    !! Requiring (z + z_shift)·dρ/dz - ρ ≤ -margin rejects shapes that the
-    !! R(θ) representation cannot carry accurately. In reduced units (R0 = 1).
-    real(kind = rk), parameter, public :: STAR_CONVEXITY_MARGIN = 1.0e-1_rk
+    !! A shape is accepted iff, at its best origin s* = argmin_s g(s),
+    !! g(s*) = max_i[(z_i+s*)·dρ/dz_i - ρ_i] ≤ -margin. The mathematical
+    !! single-valued (representable) boundary is g(s*) = 0, where R(θ) develops a
+    !! vertical wall (|dR/dθ| → ∞); the margin holds shapes off that singularity.
+    !!
+    !! Value empirically retuned 2026-07-05 (0.1 → 0.01) via the RewriteProject
+    !! representability probe (see compute_fos_star_convexity_optimum_s). At
+    !! spectral GL-4096 density the FoS→R(θ) conversion reproduces V/S to well
+    !! within tolerance for EVERY single-valued shape (round-trip ~3e-12, dS ≤
+    !! 1.2e-6 even in the last bin before g=0), so the intrinsic representability
+    !! limit is g=0 and the margin is only a safety buffer off that singularity.
+    !! At 0.01 the production sweep keeps ~400x (volume) / 1e6x (surface) headroom
+    !! under the tolerances; 0.01 is one bin off the g=0 singularity.
+    !! Lowering it required fixing origin selection (see ORIGIN_CONDITION_MARGIN):
+    !! the former s=0 fast path evaluated marginal-at-COM shapes from a steep
+    !! origin, corrupting the volume integral. The energy model's neck-radius
+    !! cutoff selects physical shapes downstream. In reduced units (R0 = 1).
+    real(kind = rk), parameter, public :: STAR_CONVEXITY_MARGIN = 1.0e-2_rk
+
+    !---------------------------------------------------------------------------
+    ! COM-origin conditioning threshold for star-convexity origin selection
+    !---------------------------------------------------------------------------
+    !! The R(θ) origin is the COM (z_shift = 0) when the shape is already
+    !! well-conditioned there — g(0) = max_i[z_i·dρ/dz_i - ρ_i] ≤ -threshold — and
+    !! otherwise the star-convexity optimum s* = argmin_s g(s), which is always at
+    !! least as well-conditioned (g(s*) ≤ g(0)). 0.1 is the empirically-validated
+    !! COM conditioning bound: at g(0) ≤ -0.1 the GL volume/surface integrals
+    !! converge to ~1e-12 from the COM origin. Held fixed (independent of the
+    !! acceptance margin above) so lowering the margin preserves the origin — and
+    !! thus the z_shift — of every previously-accepted shape, while routing the
+    !! newly-admitted marginal shapes to their best-conditioned origin.
+    real(kind = rk), parameter :: ORIGIN_CONDITION_MARGIN = 1.0e-1_rk
 
     !> Scalar bundle of FoS parameters plus a resolved z-shift. Exists so the
     !! radius evaluator can be elemental: Fortran requires every elemental
@@ -290,6 +316,58 @@ contains
         call deallocate_rho_grid(rho_grid)
 
     end subroutine compute_fos_shape_s
+
+    !> Diagnostic: the raw, UNGATED star-convexity optimum for a shape.
+    !!
+    !! Builds the internal rho(z) grid, validates rho/beak, applies the intrinsic
+    !! COM shift, then returns g(s*) = min_s max_i[(z_i+s) drho_dz_i - rho_i] and
+    !! the total shift z_shift_total = z_shift_intrinsic + s*, WITHOUT applying
+    !! STAR_CONVEXITY_MARGIN. The mathematical single-valued (representable)
+    !! boundary is max_t_opt = 0; the production gate accepts max_t_opt <= -margin.
+    !! Exposes the quantity the margin thresholds, for empirical / representability
+    !! studies. Degenerate shapes (rho<=0, beak, invalid c) return ok=.false. with
+    !! the matching error_code.
+    subroutine compute_fos_star_convexity_optimum_s(params, n_rho_grid, z_shift_total, &
+            max_t_opt, ok, error_code)
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: n_rho_grid
+        real(kind = rk), intent(out) :: z_shift_total
+        real(kind = rk), intent(out) :: max_t_opt
+        logical, intent(out) :: ok
+        integer(kind = ik), intent(out) :: error_code
+
+        type(rho_z_grid_t) :: rho_grid
+        real(kind = rk) :: z_shift_intrinsic, s_opt
+        logical :: rho_valid
+        character(len = 256) :: message
+
+        z_shift_total = 0.0_rk
+        max_t_opt = huge(1.0_rk)
+        ok = .false.
+        error_code = FOS_VALID
+
+        call compute_rho_z_grid_s(params, n_rho_grid, rho_grid, error_code, message)
+        if (error_code /= FOS_VALID) then
+            call deallocate_rho_grid(rho_grid)
+            return
+        end if
+
+        call validate_rho_grid_s(rho_grid, params, rho_valid, error_code, message)
+        if (.not. rho_valid) then
+            call deallocate_rho_grid(rho_grid)
+            return
+        end if
+
+        z_shift_intrinsic = compute_fos_z_shift_f(params)
+        call apply_z_shift_to_grid_s(rho_grid, z_shift_intrinsic)
+
+        call minimize_star_convexity_s(rho_grid, params(1), s_opt, max_t_opt)
+        z_shift_total = z_shift_intrinsic + s_opt
+        ok = .true.
+        error_code = FOS_VALID
+
+        call deallocate_rho_grid(rho_grid)
+    end subroutine compute_fos_star_convexity_optimum_s
 
     !> Batch-evaluate R(theta) and dR/dtheta at caller-supplied thetas, for a
     !! shape whose validity and z_shift were already established by
@@ -501,68 +579,41 @@ contains
         logical, intent(out) :: is_star_convex
         character(len = *), intent(out) :: message
 
+        real(kind = rk) :: g0, s_opt, g_opt
+
         z_shift = 0.0_rk
         is_star_convex = .false.
         message = ''
 
-        ! First try z_shift=0 (grid already shifted to place COM at origin)
-        if (is_star_convex_from_grid_f(rho_grid, 0.0_rk)) then
-            is_star_convex = .true.
+        ! Accept iff the shape is star-convex at its best origin s* — g(s*) is the
+        ! deepest achievable value, so this is the true representability test. Then
+        ! choose the R(θ) origin: keep the COM origin (z_shift = 0) when it is
+        ! already well-conditioned, otherwise use s*, which is always at least as
+        ! well-conditioned (g(s*) ≤ g(0)). Evaluating a marginal-at-COM shape from
+        ! its steep COM origin, rather than s*, is what corrupts the volume integral.
+        g0 = max_star_convexity_value_f(rho_grid, 0.0_rk)
+        call minimize_star_convexity_s(rho_grid, params(1), s_opt, g_opt)
+
+        if (g_opt > -STAR_CONVEXITY_MARGIN) then
+            message = 'Shape is not star-convex and no valid z-shift found'
             z_shift = 0.0_rk
             return
         end if
 
-        ! If not star-convex at z_shift=0, search for an additional shift
-        call find_star_convex_shift_from_grid_s(params, rho_grid, z_shift, is_star_convex)
-
-        if (.not. is_star_convex) then
-            message = 'Shape is not star-convex and no valid z-shift found'
+        is_star_convex = .true.
+        if (g0 <= -ORIGIN_CONDITION_MARGIN) then
             z_shift = 0.0_rk
+        else
+            z_shift = s_opt
         end if
 
     end subroutine check_star_convexity_s
-
-    !> Checks star-convexity for a given z-shift.
-    !!
-    !! The condition for star-convexity from the origin when the shape is
-    !! shifted by z_shift is: (z + z_shift) × dρ/dz - ρ ≤ 0
-    !!
-    !! **IMPORTANT FIX:** The z_shift is ADDED (not subtracted) because positive
-    !! z_shift means the shape is shifted in the +z direction, moving surface
-    !! points from z_old to z_new = z_old + z_shift.
-    pure function is_star_convex_from_grid_f(grid, z_shift) result(is_convex)
-        type(rho_z_grid_t), intent(in) :: grid
-        real(kind = rk), intent(in) :: z_shift
-        logical :: is_convex
-
-        integer(kind = ik) :: i
-        real(kind = rk) :: z_shifted, test_val
-
-        is_convex = .true.
-        if (.not. grid%initialized) then
-            is_convex = .false.
-            return
-        end if
-
-        ! Check star-convexity condition at each interior point
-        ! For a shape shifted by z_shift: check (z + z_shift) × dρ/dz - ρ ≤ -margin
-        ! The margin rejects grazing-ray shapes that R(θ) cannot represent.
-        do i = 2_ik, grid%n_points - 1_ik
-            z_shifted = grid%z(i) + z_shift  ! ADD z_shift, not subtract!
-            test_val = z_shifted * grid%drho_dz(i) - grid%rho(i)
-            if (test_val > -STAR_CONVEXITY_MARGIN) then
-                is_convex = .false.
-                return
-            end if
-        end do
-
-    end function is_star_convex_from_grid_f
 
     !> Maximum star-convexity test value over interior points for a given shift.
     !!
     !! g(s) = max_i [ (z_i + s) * drho_dz_i - rho_i ]. This is a pointwise max of
     !! affine functions of s, hence convex in s. The shape is star-convex at shift
-    !! s iff g(s) <= -STAR_CONVEXITY_MARGIN (see is_star_convex_from_grid_f).
+    !! s iff g(s) <= -STAR_CONVEXITY_MARGIN (gated in check_star_convexity_s).
     pure function max_star_convexity_value_f(grid, z_shift) result(g)
         type(rho_z_grid_t), intent(in) :: grid
         real(kind = rk), intent(in) :: z_shift
@@ -583,37 +634,26 @@ contains
         end do
     end function max_star_convexity_value_f
 
-    !> Searches for a z-shift that makes the shape star-convex.
-    !!
-    !! The grid is assumed to be already shifted by z_shift_intrinsic (COM at origin).
-    !! This function searches for an ADDITIONAL shift beyond that.
-    !! The z_shift=0 case is already tested in check_star_convexity_s.
-    !!
-    !! g(s) = max_i[(z_i + s) drho_dz_i - rho_i] is convex piecewise-linear in s
-    !! (pointwise max of affine functions), so golden-section finds its exact
-    !! global minimum with no local-minimum traps. This resolves the true optimum
-    !! shift, unlike the former neck-centered guesses + 0.1c-step fallback, which
-    !! stepped over narrow acceptance windows near the star-convexity margin.
-    subroutine find_star_convex_shift_from_grid_s(params, grid, z_shift, is_convex)
-        real(kind = rk), intent(in) :: params(:)
+    !> Golden-section minimization of g(s) = max_i[(z_i + s) drho_dz_i - rho_i]
+    !! over the additional shift s. g is convex piecewise-linear in s (pointwise
+    !! max of affine functions), so golden-section returns the exact global
+    !! minimum. The bracket [-2c, 2c] contains any origin that can be star-convex.
+    !! Returns the argmin s_opt and the minimum value g_opt; the caller applies
+    !! the STAR_CONVEXITY_MARGIN gate.
+    pure subroutine minimize_star_convexity_s(grid, c, s_opt, g_opt)
         type(rho_z_grid_t), intent(in) :: grid
-        real(kind = rk), intent(out) :: z_shift
-        logical, intent(out) :: is_convex
+        real(kind = rk), intent(in) :: c
+        real(kind = rk), intent(out) :: s_opt
+        real(kind = rk), intent(out) :: g_opt
 
         ! (sqrt(5) - 1) / 2; SHIFT_TOL and bracket are in reduced units (R0 = 1).
         real(kind = rk), parameter :: GOLDEN = 0.6180339887498949_rk
         real(kind = rk), parameter :: SHIFT_TOL = 1.0e-6_rk
         integer(kind = ik), parameter :: MAX_ITER = 200_ik
 
-        real(kind = rk) :: c, a, b, x1, x2, f1, f2
+        real(kind = rk) :: a, b, x1, x2, f1, f2
         integer(kind = ik) :: it
 
-        z_shift = 0.0_rk
-        is_convex = .false.
-        c = params(1)
-
-        ! Any origin that can be star-convex lies inside the body, which is
-        ! contained in +/-2c on the COM-shifted grid, so this brackets the minimum.
         a = -2.0_rk * c
         b = 2.0_rk * c
         x1 = b - GOLDEN * (b - a)
@@ -638,10 +678,9 @@ contains
             end if
         end do
 
-        z_shift = 0.5_rk * (a + b)
-        is_convex = is_star_convex_from_grid_f(grid, z_shift)
-        if (.not. is_convex) z_shift = 0.0_rk
-    end subroutine find_star_convex_shift_from_grid_s
+        s_opt = 0.5_rk * (a + b)
+        g_opt = max_star_convexity_value_f(grid, s_opt)
+    end subroutine minimize_star_convexity_s
 
     !> Finds the z-position of the neck (minimum ρ between two maxima).
     subroutine find_neck_from_grid_s(grid, z_neck, found)
