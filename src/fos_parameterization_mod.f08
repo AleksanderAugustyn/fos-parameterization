@@ -74,6 +74,7 @@ module fos_parameterization_mod
     public :: compute_rho_z_grid_s
     public :: validate_rho_grid_s
     public :: check_star_convexity_s
+    public :: compute_fos_star_convexity_optimum_s
     public :: compute_radius_at_theta_s
 
     ! Helper functions
@@ -290,6 +291,58 @@ contains
         call deallocate_rho_grid(rho_grid)
 
     end subroutine compute_fos_shape_s
+
+    !> Diagnostic: the raw, UNGATED star-convexity optimum for a shape.
+    !!
+    !! Builds the internal rho(z) grid, validates rho/beak, applies the intrinsic
+    !! COM shift, then returns g(s*) = min_s max_i[(z_i+s) drho_dz_i - rho_i] and
+    !! the total shift z_shift_total = z_shift_intrinsic + s*, WITHOUT applying
+    !! STAR_CONVEXITY_MARGIN. The mathematical single-valued (representable)
+    !! boundary is max_t_opt = 0; the production gate accepts max_t_opt <= -margin.
+    !! Exposes the quantity the margin thresholds, for empirical / representability
+    !! studies. Degenerate shapes (rho<=0, beak, invalid c) return ok=.false. with
+    !! the matching error_code.
+    subroutine compute_fos_star_convexity_optimum_s(params, n_rho_grid, z_shift_total, &
+            max_t_opt, ok, error_code)
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: n_rho_grid
+        real(kind = rk), intent(out) :: z_shift_total
+        real(kind = rk), intent(out) :: max_t_opt
+        logical, intent(out) :: ok
+        integer(kind = ik), intent(out) :: error_code
+
+        type(rho_z_grid_t) :: rho_grid
+        real(kind = rk) :: z_shift_intrinsic, s_opt
+        logical :: rho_valid
+        character(len = 256) :: message
+
+        z_shift_total = 0.0_rk
+        max_t_opt = huge(1.0_rk)
+        ok = .false.
+        error_code = FOS_VALID
+
+        call compute_rho_z_grid_s(params, n_rho_grid, rho_grid, error_code, message)
+        if (error_code /= FOS_VALID) then
+            call deallocate_rho_grid(rho_grid)
+            return
+        end if
+
+        call validate_rho_grid_s(rho_grid, params, rho_valid, error_code, message)
+        if (.not. rho_valid) then
+            call deallocate_rho_grid(rho_grid)
+            return
+        end if
+
+        z_shift_intrinsic = compute_fos_z_shift_f(params)
+        call apply_z_shift_to_grid_s(rho_grid, z_shift_intrinsic)
+
+        call minimize_star_convexity_s(rho_grid, params(1), s_opt, max_t_opt)
+        z_shift_total = z_shift_intrinsic + s_opt
+        ok = .true.
+        error_code = FOS_VALID
+
+        call deallocate_rho_grid(rho_grid)
+    end subroutine compute_fos_star_convexity_optimum_s
 
     !> Batch-evaluate R(theta) and dR/dtheta at caller-supplied thetas, for a
     !! shape whose validity and z_shift were already established by

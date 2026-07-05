@@ -3,7 +3,9 @@ program fos_param_core_test
 
     use precision_utilities_mod, only: ik, rk
     use mathematical_and_physical_constants_mod, only: PI_C
-    use fos_parameterization_mod, only: compute_fos_radius_grid_s, FOS_VALID
+    use fos_parameterization_mod, only: compute_fos_radius_grid_s, FOS_VALID, &
+            compute_fos_star_convexity_optimum_s, &
+            FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY
     use fos_test_reference_mod, only: init_quadrature_s, compute_reference_surface_f, &
             evaluate_shape_quality_s, spheroid_surface_area_f
     use test_utils_mod, only: assert_true, assert_int_eq, assert_abs_close, test_summary
@@ -17,6 +19,7 @@ program fos_param_core_test
     call init_quadrature_s()
     call run_anchor_tests_s()
     call run_marginal_star_convex_test_s()
+    call run_star_convexity_optimum_test_s()
     call test_summary()
 
 contains
@@ -99,5 +102,51 @@ contains
             call assert_true(rt_max < TOL_ROUND_TRIP, 'marginal: R(theta) round-trips')
         end if
     end subroutine run_marginal_star_convex_test_s
+
+    subroutine run_star_convexity_optimum_test_s()
+        real(kind = rk) :: params(7), z_shift_total, max_t_opt
+        logical :: ok
+        integer(kind = ik) :: code
+        integer(kind = ik), parameter :: N = 7201_ik
+
+        write(*, '(A)') '=== Star-convexity optimum diagnostic ==='
+
+        ! Marginal F5: g(s*) = -0.1030 (fixed geometric value, ~just past -0.1),
+        ! total shift equals the F5 golden z_shift (-0.16904663...).
+        params = [2.0_rk, 0.4_rk, 0.66_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+        call compute_fos_star_convexity_optimum_s(params, N, z_shift_total, max_t_opt, ok, code)
+        call assert_true(ok, 'optimum F5: ok')
+        call assert_int_eq(code, FOS_VALID, 'optimum F5: FOS_VALID')
+        call assert_abs_close(max_t_opt, -0.1030_rk, 2.0e-3_rk, 'optimum F5: g(s*) ~ -0.103')
+        call assert_abs_close(z_shift_total, -0.16904663095809774_rk, 1.0e-4_rk, &
+                'optimum F5: total shift matches golden')
+
+        ! a4=0.67: g(s*) = -0.0873 -- single-valued in principle (g < 0) yet
+        ! closer to the grazing-ray limit than F5. Fixed bounds, margin-independent.
+        params = [2.0_rk, 0.4_rk, 0.67_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+        call compute_fos_star_convexity_optimum_s(params, N, z_shift_total, max_t_opt, ok, code)
+        call assert_true(ok, 'optimum a4=0.67: ok')
+        call assert_true(max_t_opt < 0.0_rk, 'optimum a4=0.67: representable (single-valued)')
+        call assert_true(max_t_opt > -0.1_rk, 'optimum a4=0.67: closer to limit than F5')
+
+        ! Sphere: strongly star-convex, optimum at s=0, g(s*) = -1 exactly.
+        params = 0.0_rk
+        params(1) = 1.0_rk
+        call compute_fos_star_convexity_optimum_s(params, N, z_shift_total, max_t_opt, ok, code)
+        call assert_true(ok, 'optimum sphere: ok')
+        call assert_abs_close(max_t_opt, -1.0_rk, 1.0e-3_rk, 'optimum sphere: g(s*) = -1')
+        call assert_abs_close(z_shift_total, 0.0_rk, 1.0e-3_rk, 'optimum sphere: zero shift')
+
+        ! Degenerate: c=0 -> invalid c; beak family -> beak singularity.
+        params = 0.0_rk
+        call compute_fos_star_convexity_optimum_s(params, N, z_shift_total, max_t_opt, ok, code)
+        call assert_true(.not. ok, 'optimum c=0: rejected')
+        call assert_int_eq(code, FOS_ERROR_INVALID_C, 'optimum c=0: FOS_ERROR_INVALID_C')
+
+        params = [2.0_rk, 0.0_rk, 0.7497_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+        call compute_fos_star_convexity_optimum_s(params, N, z_shift_total, max_t_opt, ok, code)
+        call assert_true(.not. ok, 'optimum beak: rejected')
+        call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, 'optimum beak: FOS_ERROR_BEAK_SINGULARITY')
+    end subroutine run_star_convexity_optimum_test_s
 
 end program fos_param_core_test
