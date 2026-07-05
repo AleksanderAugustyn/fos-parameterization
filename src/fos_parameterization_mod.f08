@@ -558,78 +558,89 @@ contains
 
     end function is_star_convex_from_grid_f
 
+    !> Maximum star-convexity test value over interior points for a given shift.
+    !!
+    !! g(s) = max_i [ (z_i + s) * drho_dz_i - rho_i ]. This is a pointwise max of
+    !! affine functions of s, hence convex in s. The shape is star-convex at shift
+    !! s iff g(s) <= -STAR_CONVEXITY_MARGIN (see is_star_convex_from_grid_f).
+    pure function max_star_convexity_value_f(grid, z_shift) result(g)
+        type(rho_z_grid_t), intent(in) :: grid
+        real(kind = rk), intent(in) :: z_shift
+        real(kind = rk) :: g
+
+        integer(kind = ik) :: i
+        real(kind = rk) :: test_val
+
+        if (.not. grid%initialized) then
+            g = huge(1.0_rk)
+            return
+        end if
+
+        g = -huge(1.0_rk)
+        do i = 2_ik, grid%n_points - 1_ik
+            test_val = (grid%z(i) + z_shift) * grid%drho_dz(i) - grid%rho(i)
+            if (test_val > g) g = test_val
+        end do
+    end function max_star_convexity_value_f
+
     !> Searches for a z-shift that makes the shape star-convex.
     !!
     !! The grid is assumed to be already shifted by z_shift_intrinsic (COM at origin).
     !! This function searches for an ADDITIONAL shift beyond that.
     !! The z_shift=0 case is already tested in check_star_convexity_s.
+    !!
+    !! g(s) = max_i[(z_i + s) drho_dz_i - rho_i] is convex piecewise-linear in s
+    !! (pointwise max of affine functions), so golden-section finds its exact
+    !! global minimum with no local-minimum traps. This resolves the true optimum
+    !! shift, unlike the former neck-centered guesses + 0.1c-step fallback, which
+    !! stepped over narrow acceptance windows near the star-convexity margin.
     subroutine find_star_convex_shift_from_grid_s(params, grid, z_shift, is_convex)
         real(kind = rk), intent(in) :: params(:)
         type(rho_z_grid_t), intent(in) :: grid
         real(kind = rk), intent(out) :: z_shift
         logical, intent(out) :: is_convex
 
-        real(kind = rk) :: c, z_neck, test_shift
-        real(kind = rk) :: direction, offset, max_shift, step
-        logical :: neck_found
-        integer(kind = ik) :: i
-        real(kind = rk), parameter :: ADJUSTMENTS(8) = &
-                [0.05_rk, -0.05_rk, 0.1_rk, -0.1_rk, 0.15_rk, -0.15_rk, 0.2_rk, -0.2_rk]
+        ! (sqrt(5) - 1) / 2; SHIFT_TOL and bracket are in reduced units (R0 = 1).
+        real(kind = rk), parameter :: GOLDEN = 0.6180339887498949_rk
+        real(kind = rk), parameter :: SHIFT_TOL = 1.0e-6_rk
+        integer(kind = ik), parameter :: MAX_ITER = 200_ik
+
+        real(kind = rk) :: c, a, b, x1, x2, f1, f2
+        integer(kind = ik) :: it
 
         z_shift = 0.0_rk
         is_convex = .false.
         c = params(1)
 
-        ! Look for neck and try neck-centered shifts
-        ! Grid is already shifted, so z_neck is in shifted coordinates
-        call find_neck_from_grid_s(grid, z_neck, neck_found)
+        ! Any origin that can be star-convex lies inside the body, which is
+        ! contained in +/-2c on the COM-shifted grid, so this brackets the minimum.
+        a = -2.0_rk * c
+        b = 2.0_rk * c
+        x1 = b - GOLDEN * (b - a)
+        x2 = a + GOLDEN * (b - a)
+        f1 = max_star_convexity_value_f(grid, x1)
+        f2 = max_star_convexity_value_f(grid, x2)
 
-        if (neck_found) then
-            ! Try shifting the shape so the neck is at the origin
-            ! Neck is at z_neck in current (shifted) coords, need additional z_shift = -z_neck
-            test_shift = -z_neck
-            if (is_star_convex_from_grid_f(grid, test_shift)) then
-                z_shift = test_shift
-                is_convex = .true.
-                return
-            end if
-
-            ! Try adjustments around the neck-centered position
-            do i = 1_ik, 8_ik
-                test_shift = -z_neck + ADJUSTMENTS(i) * c
-                if (is_star_convex_from_grid_f(grid, test_shift)) then
-                    z_shift = test_shift
-                    is_convex = .true.
-                    return
-                end if
-            end do
-        end if
-
-        ! Fallback: incremental search starting from z_shift=0
-        ! (grid already shifted by z_shift_intrinsic)
-        direction = 1.0_rk
-        max_shift = c
-        step = 0.1_rk * c
-        offset = 0.0_rk
-
-        do while (abs(offset) < max_shift)
-            offset = offset + direction * step
-            test_shift = offset
-            if (is_star_convex_from_grid_f(grid, test_shift)) then
-                z_shift = test_shift
-                is_convex = .true.
-                return
-            end if
-
-            ! Also try the negative direction
-            test_shift = -offset
-            if (is_star_convex_from_grid_f(grid, test_shift)) then
-                z_shift = test_shift
-                is_convex = .true.
-                return
+        do it = 1_ik, MAX_ITER
+            if (b - a <= SHIFT_TOL) exit
+            if (f1 < f2) then
+                b = x2
+                x2 = x1
+                f2 = f1
+                x1 = b - GOLDEN * (b - a)
+                f1 = max_star_convexity_value_f(grid, x1)
+            else
+                a = x1
+                x1 = x2
+                f1 = f2
+                x2 = a + GOLDEN * (b - a)
+                f2 = max_star_convexity_value_f(grid, x2)
             end if
         end do
 
+        z_shift = 0.5_rk * (a + b)
+        is_convex = is_star_convex_from_grid_f(grid, z_shift)
+        if (.not. is_convex) z_shift = 0.0_rk
     end subroutine find_star_convex_shift_from_grid_s
 
     !> Finds the z-position of the neck (minimum ρ between two maxima).

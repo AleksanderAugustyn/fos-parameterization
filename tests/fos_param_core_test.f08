@@ -3,10 +3,10 @@ program fos_param_core_test
 
     use precision_utilities_mod, only: ik, rk
     use mathematical_and_physical_constants_mod, only: PI_C
-    use fos_parameterization_mod, only: compute_fos_radius_grid_s
+    use fos_parameterization_mod, only: compute_fos_radius_grid_s, FOS_VALID
     use fos_test_reference_mod, only: init_quadrature_s, compute_reference_surface_f, &
             evaluate_shape_quality_s, spheroid_surface_area_f
-    use test_utils_mod, only: assert_true, assert_abs_close, test_summary
+    use test_utils_mod, only: assert_true, assert_int_eq, assert_abs_close, test_summary
 
     implicit none
 
@@ -16,6 +16,7 @@ program fos_param_core_test
 
     call init_quadrature_s()
     call run_anchor_tests_s()
+    call run_marginal_star_convex_test_s()
     call test_summary()
 
 contains
@@ -71,5 +72,32 @@ contains
             call assert_abs_close(rt_max, 0.0_rk, TOL_ROUND_TRIP, trim(label) // ': round trip')
         end do
     end subroutine run_anchor_tests_s
+
+    !> The disputed shape (c=2, a3=0.4, a4=0.66) is genuinely star-convex: its
+    !! best origin gives max-T = -0.103 R0, past the -0.1 margin. The old coarse
+    !! shift search missed the ~0.0085 R0-wide acceptance window and rejected it.
+    !! Accepting it must yield an R(theta) that round-trips to quadrature precision.
+    subroutine run_marginal_star_convex_test_s()
+        real(kind = rk) :: params(7), radii(N_GRID_SMALL), z_shift
+        real(kind = rk) :: s_ref, dv_rel, ds_rel, rt_max
+        logical :: is_valid
+        character(len = 256) :: message
+        integer(kind = ik) :: code
+
+        write(*, '(A)') '=== Marginal star-convex shape (c=2, a3=0.4, a4=0.66) ==='
+        params = [2.0_rk, 0.4_rk, 0.66_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+
+        call compute_fos_radius_grid_s(params, N_GRID_SMALL, radii, z_shift, is_valid, &
+                message, error_code = code)
+        call assert_true(is_valid, 'marginal: accepted (was falsely rejected)')
+        call assert_int_eq(code, FOS_VALID, 'marginal: FOS_VALID')
+        call assert_true(abs(z_shift) > 1.0e-6_rk, 'marginal: nonzero star-convex shift')
+
+        if (is_valid) then
+            s_ref = compute_reference_surface_f(params)
+            call evaluate_shape_quality_s(params, z_shift, s_ref, dv_rel, ds_rel, rt_max)
+            call assert_true(rt_max < TOL_ROUND_TRIP, 'marginal: R(theta) round-trips')
+        end if
+    end subroutine run_marginal_star_convex_test_s
 
 end program fos_param_core_test
