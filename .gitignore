@@ -77,3 +77,4 @@ slurm-*.out
 
 # AI files
 GEMINI.md
+CLAUDE.local.md
