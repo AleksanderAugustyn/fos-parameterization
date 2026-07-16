@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(fos-parameterization
-        VERSION 1.3.0
+        VERSION 1.3.1
         LANGUAGES Fortran CXX
         DESCRIPTION "Fourier-over-Spheroid (FoS) nuclear shape parameterization"
 )
@@ -16,7 +16,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 FetchContent_Declare(
         GCC-Compiler-Options
         GIT_REPOSITORY https://github.com/AleksanderAugustyn/GCC-Compiler-Options.git
-        GIT_TAG 1.5.0
+        GIT_TAG 1.6.0
 )
 FetchContent_MakeAvailable(GCC-Compiler-Options)
 

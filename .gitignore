@@ -8,6 +8,8 @@ lib/
 dist_raw/
 wheelhouse/
 *.whl
+dist_sdist/
+dist/
 
 # Fortran compiled files
 *.o
