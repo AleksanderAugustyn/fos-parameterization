@@ -72,6 +72,9 @@ module fos_parameterization_workers_mod
     public :: cache_free_s
     public :: cache_shape_s
     public :: cache_rho_z_grid_s
+    public :: cache_radius_grid_s
+    public :: cache_radius_and_derivative_s
+    public :: cache_radius_and_derivative_at_thetas_s
     public :: cache_recompute_count_f
 
     !---------------------------------------------------------------------------
@@ -163,6 +166,10 @@ module fos_parameterization_workers_mod
     !> Interior node with rho <= 0. Duplicated (see the migration note above).
     integer(kind = ik), parameter, public :: FOS_ERROR_RHO_NEGATIVE = 100_ik
 
+    !> A Newton radius solve that did not meet NR_TOLERANCE at some node.
+    !! Duplicated (see the migration note above).
+    integer(kind = ik), parameter, public :: FOS_ERROR_CONVERGENCE = 104_ik
+
     !> Output array whose size differs from the cache's init-time resolution.
     !! Duplicated (see the migration note above).
     integer(kind = ik), parameter, public :: FOS_ERROR_BUFFER_MISMATCH = 105_ik
@@ -209,6 +216,15 @@ module fos_parameterization_workers_mod
     !! only to serve the R(theta) conversion, which a beak singularity breaks.
     integer(kind = ik), parameter :: NEEDS_SHAPE(6) = &
             [I_A2, I_Z_SHIFT, I_F_GRID, I_BEAK, I_RHO_GRID, I_RESOLVE]
+
+    !> Needs-lists of the two fixed-grid R(theta) outputs: the resolve, plus the
+    !! one radius intermediate each consumes. The at-thetas form shares the
+    !! resolve prefix but stamps neither #7 nor #8 — its nodes are the caller's,
+    !! not the tables', so nothing it computes can be reused.
+    integer(kind = ik), parameter :: NEEDS_RADIUS_GRID(7) = &
+            [I_A2, I_Z_SHIFT, I_F_GRID, I_BEAK, I_RHO_GRID, I_RESOLVE, I_RADIUS_GRID]
+    integer(kind = ik), parameter :: NEEDS_RADIUS_DERIV(7) = &
+            [I_A2, I_Z_SHIFT, I_F_GRID, I_BEAK, I_RHO_GRID, I_RESOLVE, I_RADIUS_DERIV]
 
     !> Parameter-independent trigonometric tables for FoS shape evaluation.
     type, public :: tables_t
@@ -1203,26 +1219,8 @@ contains
         r_north = 0.0_rk
         r_south = 0.0_rk
 
-        call ensure_list_s(cache, params, NEEDS_SHAPE, status)
+        call ensure_resolved_s(cache, params, status)
         if (status /= SHAPE_VALID) return
-
-        if (.not. cache%beak_ok) then
-            status = FOS_ERROR_BEAK_SINGULARITY
-            call shape_engine_invalidate_all_s(cache%engine)
-            return
-        end if
-
-        if (.not. cache%rho_positive) then
-            status = FOS_ERROR_RHO_NEGATIVE
-            call shape_engine_invalidate_all_s(cache%engine)
-            return
-        end if
-
-        if (.not. cache%star_ok) then
-            status = FOS_ERROR_NOT_STAR_CONVEX
-            call shape_engine_invalidate_all_s(cache%engine)
-            return
-        end if
 
         z_shift = cache%z_shift_total
         r_north = cache%r_north
@@ -1295,6 +1293,182 @@ contains
 
     end subroutine cache_rho_z_grid_s
 
+    !> R(theta) at the cache's own theta nodes.
+    !!
+    !! Gate order: the parameter-vector gates of `ensure_resolved_s` (4, 102,
+    !! then 103/100/101), then the buffer size (105), then the Newton solve —
+    !! a node that misses NR_TOLERANCE rejects the whole grid with 104.
+    !!
+    !! The result lives in `cache%radii` (#7), so a repeat call on the same
+    !! vector copies it out without solving again.
+    !!
+    !! Every failure zero-fills the ENTIRE actual extent of `radii` and returns
+    !! the engine to cold.
+    !!
+    !! @param[in,out] cache   Initialized cache
+    !! @param[in]     params  Parameter vector, length == the cache's n_params
+    !! @param[out]    radii   R(theta) at the init thetas, n_theta long
+    !! @param[out]    status  SHAPE_VALID on success, else the rejecting code
+    subroutine cache_radius_grid_s(cache, params, radii, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(out) :: radii(:)
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik) :: i, n
+
+        call ensure_resolved_s(cache, params, status)
+        if (status /= SHAPE_VALID) then
+            radii = 0.0_rk
+            return
+        end if
+
+        n = cache%tables%n_theta
+        if (size(radii, kind = ik) /= n) then
+            status = FOS_ERROR_BUFFER_MISMATCH
+            call shape_engine_invalidate_all_s(cache%engine)
+            radii = 0.0_rk
+            return
+        end if
+
+        call ensure_list_s(cache, params, NEEDS_RADIUS_GRID, status)
+        if (status /= SHAPE_VALID) then
+            radii = 0.0_rk
+            return
+        end if
+
+        do i = 1_ik, n
+            radii(i) = cache%radii(i)
+        end do
+
+    end subroutine cache_radius_grid_s
+
+    !> R(theta) and dR/dtheta at the cache's own theta nodes.
+    !!
+    !! Same gates and the same failure semantics as `cache_radius_grid_s`; the
+    !! result lives in `cache%radii_d` / `cache%dr_dtheta` (#8). #7 and #8 are
+    !! separate intermediates: an output that needs the derivative never reads
+    !! the radius-only grid, so the two never share a solve.
+    !!
+    !! @param[in,out] cache      Initialized cache
+    !! @param[in]     params     Parameter vector, length == the cache's n_params
+    !! @param[out]    radii      R(theta) at the init thetas, n_theta long
+    !! @param[out]    dr_dtheta  dR/dtheta at those thetas, n_theta long
+    !! @param[out]    status     SHAPE_VALID on success, else the rejecting code
+    subroutine cache_radius_and_derivative_s(cache, params, radii, dr_dtheta, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(out) :: radii(:)
+        real(kind = rk), intent(out) :: dr_dtheta(:)
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik) :: i, n
+
+        call ensure_resolved_s(cache, params, status)
+        if (status /= SHAPE_VALID) then
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        n = cache%tables%n_theta
+        if (size(radii, kind = ik) /= n .or. size(dr_dtheta, kind = ik) /= n) then
+            status = FOS_ERROR_BUFFER_MISMATCH
+            call shape_engine_invalidate_all_s(cache%engine)
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        call ensure_list_s(cache, params, NEEDS_RADIUS_DERIV, status)
+        if (status /= SHAPE_VALID) then
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        do i = 1_ik, n
+            radii(i) = cache%radii_d(i)
+            dr_dtheta(i) = cache%dr_dtheta(i)
+        end do
+
+    end subroutine cache_radius_and_derivative_s
+
+    !> R(theta) and dR/dtheta at caller-supplied theta nodes.
+    !!
+    !! Shares the resolve prefix with the fixed-grid forms but stamps NO
+    !! intermediate: the nodes are the caller's, so nothing computed here can be
+    !! reused by a later call. Feeding it the cache's own theta nodes reproduces
+    !! `cache_radius_and_derivative_s` bit for bit — same bundle, same cosines,
+    !! same solver.
+    !!
+    !! Gate order: the gates of `ensure_resolved_s` (4, 102, 103/100/101), then
+    !! the buffer sizes (105), then the theta range (invalid grid), then the
+    !! Newton solve (104). Sizes precede the range check for the same reason
+    !! they precede everything else in the cached tier: a buffer the caller
+    !! cannot fill is a harder error than a node value it can.
+    !!
+    !! Every failure zero-fills the ENTIRE actual extent of both outputs and
+    !! returns the engine to cold.
+    !!
+    !! @param[in,out] cache      Initialized cache
+    !! @param[in]     params     Parameter vector, length == the cache's n_params
+    !! @param[in]     thetas     Polar angles in [0, pi]
+    !! @param[out]    radii      R(theta), size(thetas) long
+    !! @param[out]    dr_dtheta  dR/dtheta, size(thetas) long
+    !! @param[out]    status     SHAPE_VALID on success, else the rejecting code
+    subroutine cache_radius_and_derivative_at_thetas_s(cache, params, thetas, &
+            radii, dr_dtheta, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(in) :: thetas(:)
+        real(kind = rk), intent(out) :: radii(:)
+        real(kind = rk), intent(out) :: dr_dtheta(:)
+        integer(kind = ik), intent(out) :: status
+
+        type(fos_bundle_t) :: bundle
+        integer(kind = ik) :: i, n
+        logical :: converged
+
+        call ensure_resolved_s(cache, params, status)
+        if (status /= SHAPE_VALID) then
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        n = size(thetas, kind = ik)
+        if (size(radii, kind = ik) /= n .or. size(dr_dtheta, kind = ik) /= n) then
+            status = FOS_ERROR_BUFFER_MISMATCH
+            call shape_engine_invalidate_all_s(cache%engine)
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        do i = 1_ik, n
+            if (thetas(i) < 0.0_rk .or. thetas(i) > PI_C) then
+                status = SHAPE_ERROR_INVALID_GRID
+                call shape_engine_invalidate_all_s(cache%engine)
+                call zero_fill_pair_s(radii, dr_dtheta)
+                return
+            end if
+        end do
+
+        bundle = fos_bundle_f(params, cache%z_shift_total, cache%rho_max)
+
+        status = SHAPE_VALID
+        do i = 1_ik, n
+            call newton_radius_s(bundle, cos(thetas(i)), radii(i), dr_dtheta(i), &
+                    converged)
+            if (.not. converged) status = FOS_ERROR_CONVERGENCE
+        end do
+
+        if (status /= SHAPE_VALID) then
+            call shape_engine_invalidate_all_s(cache%engine)
+            call zero_fill_pair_s(radii, dr_dtheta)
+        end if
+
+    end subroutine cache_radius_and_derivative_at_thetas_s
+
     !===========================================================================
     ! ENGINE DRIVER (the module's single engine touchpoint)
     !===========================================================================
@@ -1346,6 +1520,47 @@ contains
 
     end subroutine ensure_list_s
 
+    !> Brings intermediates #1-#6 up to date and applies the three shape gates.
+    !!
+    !! The single entry point of every output that needs a resolved, R(theta)-
+    !! representable shape. Gate order is normative and matches 1.x's: beak
+    !! singularity (103), interior rho <= 0 (100), star-convexity margin (101),
+    !! after the wrong-parameter-count (4) and degenerate-c (102) gates inside
+    !! `ensure_list_s`. Any rejection leaves the engine cold; zero-filling the
+    !! outputs is the caller's half of the contract.
+    !!
+    !! @param[in,out] cache   Cache to resolve
+    !! @param[in]     params  Incoming parameter vector
+    !! @param[out]    status  SHAPE_VALID, or the rejecting code
+    subroutine ensure_resolved_s(cache, params, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(out) :: status
+
+        call ensure_list_s(cache, params, NEEDS_SHAPE, status)
+        if (status /= SHAPE_VALID) return
+
+        if (.not. cache%beak_ok) then
+            status = FOS_ERROR_BEAK_SINGULARITY
+            call shape_engine_invalidate_all_s(cache%engine)
+            return
+        end if
+
+        if (.not. cache%rho_positive) then
+            status = FOS_ERROR_RHO_NEGATIVE
+            call shape_engine_invalidate_all_s(cache%engine)
+            return
+        end if
+
+        if (.not. cache%star_ok) then
+            status = FOS_ERROR_NOT_STAR_CONVEX
+            call shape_engine_invalidate_all_s(cache%engine)
+            return
+        end if
+
+    end subroutine ensure_resolved_s
+
     !> Recomputes one intermediate from its producers.
     !!
     !! Preconditions (`ensure_list_s`'s): the cache is initialized, c > C_MIN,
@@ -1361,6 +1576,11 @@ contains
         real(kind = rk), intent(in) :: params(:)
         integer(kind = ik), intent(in) :: id
         integer(kind = ik), intent(out) :: status
+
+        type(fos_bundle_t) :: bundle
+        real(kind = rk) :: dr_scratch
+        integer(kind = ik) :: i
+        logical :: converged
 
         status = SHAPE_VALID
 
@@ -1383,12 +1603,28 @@ contains
             call resolve_origin_s(cache%z, cache%rho, cache%drho_dz, params(1), &
                     cache%z_shift_intrinsic, cache%g0, cache%s_opt, cache%g_opt, &
                     cache%star_ok, cache%z_shift_total, cache%r_north, cache%r_south)
+        case (I_RADIUS_GRID)
+            ! Precondition (ensure_resolved_s's): the shape passed 103/100/101,
+            ! so #5's rho_max and #6's z_shift_total describe a representable
+            ! surface and the analytic bracket below encloses every root.
+            bundle = fos_bundle_f(params, cache%z_shift_total, cache%rho_max)
+            do i = 1_ik, cache%tables%n_theta
+                call newton_radius_s(bundle, cache%tables%cos_thetas(i), &
+                        cache%radii(i), dr_scratch, converged)
+                if (.not. converged) status = FOS_ERROR_CONVERGENCE
+            end do
+        case (I_RADIUS_DERIV)
+            bundle = fos_bundle_f(params, cache%z_shift_total, cache%rho_max)
+            do i = 1_ik, cache%tables%n_theta
+                call newton_radius_s(bundle, cache%tables%cos_thetas(i), &
+                        cache%radii_d(i), cache%dr_dtheta(i), converged)
+                if (.not. converged) status = FOS_ERROR_CONVERGENCE
+            end do
         case default
-            ! Intermediates 7-8 arrive with the outputs that consume them
-            ! (Tasks 7-8). Unreachable today: every needs-list in this module is
-            ! a named literal, and none of them contains an index without an arm
-            ! above. Failing loudly is deliberate — a silent success here would
-            ! stamp an UNCOMPUTED intermediate valid and hand out stale data.
+            ! Unreachable today: every needs-list in this module is a named
+            ! literal, and none of them contains an index without an arm above.
+            ! Failing loudly is deliberate — a silent success here would stamp
+            ! an UNCOMPUTED intermediate valid and hand out stale data.
             status = SHAPE_ERROR_INVALID_INIT
         end select
 
@@ -1403,20 +1639,79 @@ contains
 
         type(cache_t), intent(inout) :: cache
 
-        integer(kind = ik) :: n_points
+        integer(kind = ik) :: n_points, n_theta
 
         n_points = cache%tables%n_points
+        n_theta = cache%tables%n_theta
 
         allocate(cache%f_grid(n_points), cache%fp_grid(n_points))
         allocate(cache%z(n_points), cache%rho(n_points), cache%drho_dz(n_points))
+
+        ! Zero-length for the theta-less tier-1 forms: the R(theta) outputs then
+        ! accept only a zero-length buffer, which is the correct contract.
+        allocate(cache%radii(n_theta), cache%radii_d(n_theta), cache%dr_dtheta(n_theta))
 
         cache%f_grid = 0.0_rk
         cache%fp_grid = 0.0_rk
         cache%z = 0.0_rk
         cache%rho = 0.0_rk
         cache%drho_dz = 0.0_rk
+        cache%radii = 0.0_rk
+        cache%radii_d = 0.0_rk
+        cache%dr_dtheta = 0.0_rk
 
     end subroutine cache_alloc_buffers_s
+
+    !> The evaluator bundle for a resolved shape.
+    !!
+    !! `r_hi_bound` is the analytic Newton bracket: twice the distance from the
+    !! shifted origin to the corner of the shape's bounding box
+    !! (rho_max by the polar extents), which is outside the surface at every
+    !! theta. It replaces the 1.x doubling loop, whose eight doublings silently
+    !! returned the initial guess for extreme-oblate shapes.
+    !!
+    !! Preconditions (caller's, unchecked): 1 <= size(params) <= FOS_MAX_K,
+    !! params(1) > C_MIN, and `rho_max` / `z_shift_total` from an up-to-date
+    !! resolve. The cached tier satisfies the length bound through the engine,
+    !! which caps n_params at SHAPE_CACHE_MAX_PARAMS.
+    !!
+    !! @param[in] params         Parameter vector the engine accepted
+    !! @param[in] z_shift_total  Intrinsic COM shift plus the chosen origin (#6)
+    !! @param[in] rho_max        Largest rho on the resolved grid (#5)
+    !! @return                   Bundle for `newton_radius_s`
+    pure function fos_bundle_f(params, z_shift_total, rho_max) result(bundle)
+
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(in) :: z_shift_total
+        real(kind = rk), intent(in) :: rho_max
+        type(fos_bundle_t) :: bundle
+
+        real(kind = rk) :: z_max, z_min
+        integer(kind = ik) :: i, n
+
+        n = size(params, kind = ik)
+        bundle%n_params = n
+        do i = 1_ik, n
+            bundle%params(i) = params(i)
+        end do
+        bundle%z_shift = z_shift_total
+
+        z_max = params(1) + z_shift_total
+        z_min = -params(1) + z_shift_total
+        bundle%r_hi_bound = 2.0_rk * sqrt(rho_max**2 + max(z_max, abs(z_min))**2)
+
+    end function fos_bundle_f
+
+    !> Zeroes the full actual extent of a radius/derivative output pair.
+    pure subroutine zero_fill_pair_s(a, b)
+
+        real(kind = rk), intent(out) :: a(:)
+        real(kind = rk), intent(out) :: b(:)
+
+        a = 0.0_rk
+        b = 0.0_rk
+
+    end subroutine zero_fill_pair_s
 
     !> Zeroes the full actual extent of the cylindrical outputs, tail included:
     !! an oversized buffer must not keep stale data after a rejection.

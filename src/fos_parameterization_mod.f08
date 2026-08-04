@@ -63,7 +63,9 @@ module fos_parameterization_mod
     use fos_parameterization_workers_mod, only: tables_t, tables_init_s, tables_free_s, &
             compute_a2_s, compute_z_shift_s, &
             cache_t, cache_init_s, cache_init_shared_s, cache_free_s, &
-            cache_shape_s, cache_rho_z_grid_s, cache_recompute_count_f
+            cache_shape_s, cache_rho_z_grid_s, cache_radius_grid_s, &
+            cache_radius_and_derivative_s, cache_radius_and_derivative_at_thetas_s, &
+            cache_recompute_count_f
 
     implicit none
 
@@ -123,6 +125,9 @@ module fos_parameterization_mod
     public :: cache_free_s
     public :: cache_shape_s
     public :: cache_rho_z_grid_s
+    public :: cache_radius_grid_s
+    public :: cache_radius_and_derivative_s
+    public :: cache_radius_and_derivative_at_thetas_s
     public :: cache_recompute_count_f
 
     ! Module constants
