@@ -17,9 +17,10 @@ def _candidate_paths() -> Iterator[Path]:
     yield Path(__file__).resolve().parent / _LIB_NAME
     # Dev fallback: this file is <repo>/python/fos_parameterization/_libloader.py
     repo_root = Path(__file__).resolve().parents[2]
+    for build_dir in ("build-release", "build-debug", "cmake-build-release",
+                      "cmake-build-debug"):
+        yield repo_root / build_dir / _LIB_NAME
     yield repo_root / "build" / "release" / _LIB_NAME
-    yield repo_root / "cmake-build-release" / _LIB_NAME
-    yield repo_root / "cmake-build-debug" / _LIB_NAME
     # System search path
     yield Path(_LIB_NAME)
 
