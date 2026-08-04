@@ -61,7 +61,9 @@ module fos_parameterization_mod
             SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
             SHAPE_ERROR_TABLES_NOT_INITIALIZED
     use fos_parameterization_workers_mod, only: tables_t, tables_init_s, tables_free_s, &
-            compute_a2_s, compute_z_shift_s
+            compute_a2_s, compute_z_shift_s, &
+            cache_t, cache_init_s, cache_init_shared_s, cache_free_s, &
+            cache_rho_z_grid_s, cache_recompute_count_f
 
     implicit none
 
@@ -111,6 +113,16 @@ module fos_parameterization_mod
     ! module — these two are public 2.0 surface, the other kernels are not)
     public :: compute_a2_s
     public :: compute_z_shift_s
+
+    ! Per-shape cached tier (re-exported from the workers module): the cache
+    ! type, its lifecycle, the cylindrical output, and the recompute counters
+    ! the contract's minimality tests read.
+    public :: cache_t
+    public :: cache_init_s
+    public :: cache_init_shared_s
+    public :: cache_free_s
+    public :: cache_rho_z_grid_s
+    public :: cache_recompute_count_f
 
     ! Module constants
     integer(kind = ik), parameter :: MAX_K = 50_ik

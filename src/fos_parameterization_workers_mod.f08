@@ -8,12 +8,41 @@
 !! `tables_t` caches what depends only on the grid, not on the shape
 !! parameters: the u-grid, the Fourier basis sampled on it, the same basis on
 !! the clamped beak-scan grid, and the caller's theta nodes.
+!!
+!! `cache_t` is the per-shape working level: one owner, one thread. It embeds a
+!! `shape_engine_t` recompute tracker and every per-shape buffer, and it is
+!! mutated by every compute call. See the ownership and lifetime notes on the
+!! type itself.
+!!
+!! ## Cached intermediates (normative dependency map)
+!!
+!! Parameter slots: p1 = c, p2 = a3, p3 = a4, p4 = a5, p5 = a6, p6 = a7,
+!! p7 = a8, p8 = a9.
+!!
+!! | # | intermediate                          | depends on      |
+!! |---|---------------------------------------|-----------------|
+!! | 1 | a2 (volume constraint)                | p3, p5, p7      |
+!! | 2 | z_shift_intrinsic                     | p1, p2, p4, p6, p8 |
+!! | 3 | f_grid: f, f' at the u nodes          | p2-p8 (NOT c)   |
+!! | 4 | beak verdict: f_min over the scan grid| p2-p8 (NOT c)   |
+!! | 5 | rho_grid: z, rho, drho/dz, rho_max    | p1-p8           |
+!! | 6 | resolve: g(0), optimum, z_shift_total | p1-p8           |
+!! | 7 | radius grid at the init thetas        | p1-p8           |
+!! | 8 | radius and derivative at those thetas | p1-p8           |
+!!
+!! Producer order is 1 -> 8. Every cached compute presents its parameters to
+!! the engine once (`ensure_list_s`), then recomputes only the intermediates
+!! its own output needs, in that order.
 module fos_parameterization_workers_mod
 
-    use precision_utilities_mod, only: ik, rk
+    use precision_utilities_mod, only: ik, ikl, rk
     use mathematical_and_physical_constants_mod, only: PI_C
     use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_INVALID_GRID, &
-            SHAPE_ERROR_TOO_MANY_PARAMS
+            SHAPE_ERROR_TOO_MANY_PARAMS, SHAPE_ERROR_INVALID_INIT, &
+            SHAPE_ERROR_TABLES_NOT_INITIALIZED, SHAPE_CACHE_MAX_PARAMS, &
+            shape_engine_t, shape_engine_init_s, shape_engine_begin_s, &
+            shape_engine_needs_f, shape_engine_note_computed_s, &
+            shape_engine_invalidate_all_s, shape_engine_recompute_count_f
 
     implicit none
 
@@ -21,6 +50,7 @@ module fos_parameterization_workers_mod
 
     ! Types
     public :: tables_t
+    public :: cache_t
     public :: fos_bundle_t
 
     ! Procedures
@@ -33,6 +63,14 @@ module fos_parameterization_workers_mod
     public :: beak_scan_f_min_s
     public :: scale_rho_grid_s
     public :: newton_radius_s
+
+    ! Cache lifecycle, cached outputs, and engine introspection
+    public :: fos_masks_f
+    public :: cache_init_s
+    public :: cache_init_shared_s
+    public :: cache_free_s
+    public :: cache_rho_z_grid_s
+    public :: cache_recompute_count_f
 
     !---------------------------------------------------------------------------
     ! Table-construction parameters
@@ -98,6 +136,43 @@ module fos_parameterization_workers_mod
     !! (see the migration note above).
     integer(kind = ik), parameter, public :: FOS_ERROR_INVALID_C = 102_ik
 
+    !> Interior node with rho <= 0. Duplicated (see the migration note above).
+    integer(kind = ik), parameter, public :: FOS_ERROR_RHO_NEGATIVE = 100_ik
+
+    !> Output array whose size differs from the cache's init-time resolution.
+    !! Duplicated (see the migration note above).
+    integer(kind = ik), parameter, public :: FOS_ERROR_BUFFER_MISMATCH = 105_ik
+
+    !---------------------------------------------------------------------------
+    ! Cached intermediates
+    !---------------------------------------------------------------------------
+    !> Number of intermediates the engine tracks (see the dependency map in the
+    !! module header). Must equal the extent of `fos_masks_f`'s result.
+    integer(kind = ik), parameter, public :: FOS_N_INTERMEDIATES = 8_ik
+
+    !> Intermediate indices, in producer order.
+    integer(kind = ik), parameter, public :: I_A2 = 1_ik
+    integer(kind = ik), parameter, public :: I_Z_SHIFT = 2_ik
+    integer(kind = ik), parameter, public :: I_F_GRID = 3_ik
+    integer(kind = ik), parameter, public :: I_BEAK = 4_ik
+    integer(kind = ik), parameter, public :: I_RHO_GRID = 5_ik
+    integer(kind = ik), parameter, public :: I_RESOLVE = 6_ik
+    integer(kind = ik), parameter, public :: I_RADIUS_GRID = 7_ik
+    integer(kind = ik), parameter, public :: I_RADIUS_DERIV = 8_ik
+
+    !> Full-width dependency masks, one per intermediate: bit j-1 set means the
+    !! intermediate depends on parameter j. `fos_masks_f` truncates them to the
+    !! declared parameter count.
+    integer(kind = ik), parameter :: FOS_MASKS_FULL(FOS_N_INTERMEDIATES) = &
+            [84_ik, 171_ik, 254_ik, 254_ik, 255_ik, 255_ik, 255_ik, 255_ik]
+
+    !> Needs-list of the cylindrical output: a2, z_shift, f-grid, rho-grid.
+    !! The beak scan (#4) is deliberately absent — it gates the R(theta)
+    !! conversion, not the cylindrical profile — so it is neither computed nor
+    !! stamped by this path.
+    integer(kind = ik), parameter :: NEEDS_RHO_Z_GRID(4) = &
+            [I_A2, I_Z_SHIFT, I_F_GRID, I_RHO_GRID]
+
     !> Parameter-independent trigonometric tables for FoS shape evaluation.
     type, public :: tables_t
         integer(kind = ik) :: n_points = 0_ik, n_theta = 0_ik, k_max = 0_ik
@@ -127,6 +202,68 @@ module fos_parameterization_workers_mod
         real(kind = rk)    :: z_shift = 0.0_rk
         real(kind = rk)    :: r_hi_bound = 0.0_rk
     end type fos_bundle_t
+
+    !> Per-shape working level: the embedded recompute tracker, the resolved
+    !! scalars, and every per-shape buffer.
+    !!
+    !! ## Ownership
+    !!
+    !! `tables` points at the trig tables. Two modes:
+    !!   - `cache_init_s` (private): the cache heap-allocates its own `tables_t`
+    !!     through `tables` and sets `owns_tables = .true.`; `cache_free_s`
+    !!     frees it.
+    !!   - `cache_init_shared_s`: `tables` points at a caller-owned `tables_t`
+    !!     and `owns_tables = .false.`. **The caller MUST declare that
+    !!     `tables_t` with the `target` attribute**, keep it alive, and not free
+    !!     it for the whole lifetime of the cache.
+    !!
+    !! ## `cache_free_s` is mandatory — there is no finalizer
+    !!
+    !! Both init routines take `intent(out) :: cache`, which default-initializes
+    !! on entry and so nulls the pointer before the previous target can be
+    !! released. A private-mode cache therefore leaks its heap `tables_t` if you
+    !! re-initialize a live cache or let it go out of scope unfreed.
+    !!
+    !! ## Never copy-assign a `cache_t`
+    !!
+    !! Intrinsic assignment copies `tables` and `owns_tables` shallowly,
+    !! producing a dangling pointer or a double free. One cache has one owner
+    !! and one thread; share the `tables_t` instead.
+    type :: cache_t
+        type(shape_engine_t) :: engine                    !! Recompute tracker
+
+        type(tables_t), pointer :: tables => null()       !! Trig tables (see Ownership)
+        logical :: owns_tables = .false.                  !! .true. => cache_free_s frees them
+
+        integer(kind = ik) :: n_params = 0_ik             !! Fixed at init
+
+        real(kind = rk) :: a2 = 0.0_rk                    !! #1
+        real(kind = rk) :: z_shift_intrinsic = 0.0_rk     !! #2
+
+        real(kind = rk), allocatable :: f_grid(:)         !! #3, n_points
+        real(kind = rk), allocatable :: fp_grid(:)        !! #3, n_points
+
+        real(kind = rk) :: f_min = 0.0_rk                 !! #4
+        logical :: beak_ok = .false.                      !! #4 verdict
+
+        real(kind = rk), allocatable :: z(:)              !! #5, n_points
+        real(kind = rk), allocatable :: rho(:)            !! #5, n_points
+        real(kind = rk), allocatable :: drho_dz(:)        !! #5, n_points
+        real(kind = rk) :: rho_max = 0.0_rk               !! #5, Newton bracket input
+        logical :: rho_positive = .false.                 !! #5 verdict
+
+        real(kind = rk) :: g0 = 0.0_rk                    !! #6, g at the COM origin
+        real(kind = rk) :: s_opt = 0.0_rk                 !! #6, best origin
+        real(kind = rk) :: g_opt = 0.0_rk                 !! #6, g at s_opt
+        real(kind = rk) :: z_shift_total = 0.0_rk         !! #6
+        real(kind = rk) :: r_north = 0.0_rk               !! #6
+        real(kind = rk) :: r_south = 0.0_rk               !! #6
+        logical :: star_ok = .false.                      !! #6 verdict
+
+        real(kind = rk), allocatable :: radii(:)          !! #7, n_theta
+        real(kind = rk), allocatable :: radii_d(:)        !! #8, n_theta
+        real(kind = rk), allocatable :: dr_dtheta(:)      !! #8, n_theta
+    end type cache_t
 
 contains
 
@@ -653,8 +790,393 @@ contains
     end subroutine newton_radius_s
 
     !===========================================================================
+    ! CACHE LIFECYCLE
+    !===========================================================================
+
+    !> Dependency masks for the embedded engine, truncated to `n_params` bits.
+    !!
+    !! An out-of-range `n_params` yields all-zero masks: `maskr` is undefined
+    !! outside [0, bit_size], and the engine rejects the count before the mask
+    !! values can matter.
+    !!
+    !! @param[in] n_params  Requested parameter count (may be out of range)
+    !! @return              One mask per tracked intermediate
+    pure function fos_masks_f(n_params) result(masks)
+
+        integer(kind = ik), intent(in) :: n_params
+        integer(kind = ik) :: masks(FOS_N_INTERMEDIATES)
+
+        integer(kind = ik) :: j
+
+        masks = 0_ik
+        if (n_params < 1_ik .or. n_params > SHAPE_CACHE_MAX_PARAMS) return
+
+        do j = 1_ik, FOS_N_INTERMEDIATES
+            masks(j) = iand(FOS_MASKS_FULL(j), maskr(n_params, ik))
+        end do
+
+    end function fos_masks_f
+
+    !> Initializes a cache that owns its trig tables (private mode).
+    !!
+    !! The tables are heap-allocated through `cache%tables` and released by
+    !! `cache_free_s`. Use `cache_init_shared_s` when many caches should share
+    !! one `tables_t`.
+    !!
+    !! **Call `cache_free_s` before re-initializing a live cache and before it
+    !! goes out of scope** — there is no finalizer, and `intent(out)` nulls the
+    !! pointer on entry, so a re-init without a free leaks the previous tables.
+    !!
+    !! @param[out] cache     Ready on success; default (uninitialized) state otherwise
+    !! @param[in]  n_params  1 <= n_params <= SHAPE_CACHE_MAX_PARAMS
+    !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
+    !! @param[in]  thetas    Polar angles in [0, pi]; may be empty
+    !! @param[out] status    SHAPE_VALID, SHAPE_ERROR_INVALID_INIT,
+    !!                       SHAPE_ERROR_TOO_MANY_PARAMS or SHAPE_ERROR_INVALID_GRID
+    subroutine cache_init_s(cache, n_params, n_points, thetas, status)
+
+        type(cache_t), intent(out) :: cache
+        integer(kind = ik), intent(in) :: n_params
+        integer(kind = ik), intent(in) :: n_points
+        real(kind = rk), intent(in) :: thetas(:)
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik) :: masks(FOS_N_INTERMEDIATES)
+
+        ! c is mandatory, so an empty parameter vector has no shape to describe.
+        if (n_params < 1_ik) then
+            status = SHAPE_ERROR_INVALID_INIT
+            return
+        end if
+
+        allocate(cache%tables)
+        call build_tables_s(cache%tables, n_points, thetas, FOS_TABLES_K_MAX, status)
+        if (status /= SHAPE_VALID) then
+            deallocate(cache%tables)
+            nullify(cache%tables)
+            return
+        end if
+        cache%owns_tables = .true.
+
+        ! The engine owns the upper end of the n_params contract: n_params > 8
+        ! is rejected HERE, which is what keeps every cached path inside the
+        ! FOS_TABLES_K_MAX = (8+2)/2+1 orders the tables above were built with.
+        masks = fos_masks_f(n_params)
+        call shape_engine_init_s(cache%engine, n_params, masks, status)
+        if (status /= SHAPE_VALID) then
+            call cache_free_s(cache)
+            return
+        end if
+
+        call cache_alloc_buffers_s(cache)
+        cache%n_params = n_params
+
+    end subroutine cache_init_s
+
+    !> Initializes a cache over caller-owned shared tables.
+    !!
+    !! The cache stores a pointer to `tables` and never frees it. **The caller
+    !! MUST declare `tables` with the `target` attribute**; without it the
+    !! association is undefined once this routine returns. `tables` must also
+    !! outlive the cache and must not be freed while the cache is in use.
+    !!
+    !! @param[out] cache     Ready on success; default (uninitialized) state otherwise
+    !! @param[in]  tables    Initialized shared tables; declared `target` by the caller
+    !! @param[in]  n_params  1 <= n_params <= SHAPE_CACHE_MAX_PARAMS
+    !! @param[out] status    SHAPE_VALID, SHAPE_ERROR_TABLES_NOT_INITIALIZED,
+    !!                       SHAPE_ERROR_INVALID_INIT or SHAPE_ERROR_TOO_MANY_PARAMS
+    subroutine cache_init_shared_s(cache, tables, n_params, status)
+
+        type(cache_t), intent(out) :: cache
+        type(tables_t), intent(in), target :: tables
+        integer(kind = ik), intent(in) :: n_params
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik) :: masks(FOS_N_INTERMEDIATES)
+
+        if (.not. tables%initialized) then
+            status = SHAPE_ERROR_TABLES_NOT_INITIALIZED
+            return
+        end if
+
+        ! The engine owns the whole n_params contract here: < 1 is
+        ! SHAPE_ERROR_INVALID_INIT, > SHAPE_CACHE_MAX_PARAMS is
+        ! SHAPE_ERROR_TOO_MANY_PARAMS. Nothing is allocated before it agrees.
+        masks = fos_masks_f(n_params)
+        call shape_engine_init_s(cache%engine, n_params, masks, status)
+        if (status /= SHAPE_VALID) return
+
+        cache%tables => tables
+        cache%owns_tables = .false.
+
+        call cache_alloc_buffers_s(cache)
+        cache%n_params = n_params
+
+    end subroutine cache_init_shared_s
+
+    !> Releases the cache. Infallible, and safe on an already-free instance.
+    !!
+    !! Frees the tables only in private mode; shared tables are left for their
+    !! owner. The engine is reset to its pristine default so that a compute call
+    !! on a freed cache reports SHAPE_ERROR_CACHE_NOT_INITIALIZED instead of
+    !! dereferencing the dead tables pointer.
+    !!
+    !! @param[in,out] cache  Reset to the default (uninitialized) state
+    subroutine cache_free_s(cache)
+
+        type(cache_t), intent(inout) :: cache
+
+        ! shape_engine_t has private components, so a structure constructor is
+        ! not available: assign a default-initialized instance instead.
+        type(shape_engine_t) :: blank
+
+        if (cache%owns_tables .and. associated(cache%tables)) then
+            call tables_free_s(cache%tables)
+            deallocate(cache%tables)
+        end if
+        nullify(cache%tables)
+        cache%owns_tables = .false.
+
+        cache%engine = blank
+
+        if (allocated(cache%f_grid)) deallocate(cache%f_grid)
+        if (allocated(cache%fp_grid)) deallocate(cache%fp_grid)
+        if (allocated(cache%z)) deallocate(cache%z)
+        if (allocated(cache%rho)) deallocate(cache%rho)
+        if (allocated(cache%drho_dz)) deallocate(cache%drho_dz)
+        if (allocated(cache%radii)) deallocate(cache%radii)
+        if (allocated(cache%radii_d)) deallocate(cache%radii_d)
+        if (allocated(cache%dr_dtheta)) deallocate(cache%dr_dtheta)
+
+        cache%n_params = 0_ik
+        cache%a2 = 0.0_rk
+        cache%z_shift_intrinsic = 0.0_rk
+        cache%f_min = 0.0_rk
+        cache%beak_ok = .false.
+        cache%rho_max = 0.0_rk
+        cache%rho_positive = .false.
+        cache%g0 = 0.0_rk
+        cache%s_opt = 0.0_rk
+        cache%g_opt = 0.0_rk
+        cache%z_shift_total = 0.0_rk
+        cache%r_north = 0.0_rk
+        cache%r_south = 0.0_rk
+        cache%star_ok = .false.
+
+    end subroutine cache_free_s
+
+    !> Times an intermediate was recomputed since init; 0 on a freed or
+    !! out-of-range query. Forwards the engine's counter for the contract's
+    !! mandated minimality tests.
+    !!
+    !! @param[in] cache         Cache to query
+    !! @param[in] intermediate  1-based intermediate index
+    !! @return                  Recompute count
+    pure function cache_recompute_count_f(cache, intermediate) result(count)
+
+        type(cache_t), intent(in) :: cache
+        integer(kind = ik), intent(in) :: intermediate
+        integer(kind = ikl) :: count
+
+        count = shape_engine_recompute_count_f(cache%engine, intermediate)
+
+    end function cache_recompute_count_f
+
+    !===========================================================================
+    ! CACHED COMPUTES
+    !===========================================================================
+
+    !> Cylindrical rho(z) profile in the COM frame.
+    !!
+    !! Gates: wrong parameter count (4), degenerate c (102), interior rho <= 0
+    !! (100), output size mismatch (105). Beak and star-convexity do NOT gate
+    !! here — both exist only to guarantee the R(theta) conversion, and a
+    !! beak-marginal shape still has a well-defined cylindrical profile.
+    !!
+    !! Every failure zero-fills the ENTIRE actual extent of every output and
+    !! returns the engine to cold.
+    !!
+    !! @param[in,out] cache    Initialized cache
+    !! @param[in]     params   Parameter vector, length == the cache's n_params
+    !! @param[out]    z        Axial coordinate, n_points long
+    !! @param[out]    rho      Cylindrical radius, n_points long
+    !! @param[out]    drho_dz  Slope, n_points long
+    !! @param[out]    z_shift  Intrinsic COM shift baked into z
+    !! @param[out]    status   SHAPE_VALID on success, else the rejecting code
+    subroutine cache_rho_z_grid_s(cache, params, z, rho, drho_dz, z_shift, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(out) :: z(:)
+        real(kind = rk), intent(out) :: rho(:)
+        real(kind = rk), intent(out) :: drho_dz(:)
+        real(kind = rk), intent(out) :: z_shift
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik) :: i, n
+
+        z_shift = 0.0_rk
+
+        call ensure_list_s(cache, params, NEEDS_RHO_Z_GRID, status)
+        if (status /= SHAPE_VALID) then
+            call zero_fill_grid_s(z, rho, drho_dz)
+            return
+        end if
+
+        ! The buffer check follows the engine so that a wrong parameter count
+        ! always outranks a buffer mismatch, and so that cache%tables is known
+        ! to be associated by the time its resolution is read.
+        n = cache%tables%n_points
+        if (size(z, kind = ik) /= n .or. size(rho, kind = ik) /= n &
+                .or. size(drho_dz, kind = ik) /= n) then
+            status = FOS_ERROR_BUFFER_MISMATCH
+            call shape_engine_invalidate_all_s(cache%engine)
+            call zero_fill_grid_s(z, rho, drho_dz)
+            return
+        end if
+
+        if (.not. cache%rho_positive) then
+            status = FOS_ERROR_RHO_NEGATIVE
+            call shape_engine_invalidate_all_s(cache%engine)
+            call zero_fill_grid_s(z, rho, drho_dz)
+            return
+        end if
+
+        do i = 1_ik, n
+            z(i) = cache%z(i)
+            rho(i) = cache%rho(i)
+            drho_dz(i) = cache%drho_dz(i)
+        end do
+        z_shift = cache%z_shift_intrinsic
+
+    end subroutine cache_rho_z_grid_s
+
+    !===========================================================================
+    ! ENGINE DRIVER (the module's single engine touchpoint)
+    !===========================================================================
+
+    !> Presents `params` to the engine and brings the listed intermediates up to
+    !! date, in list order.
+    !!
+    !! Gate order is normative: `shape_engine_begin_s` runs FIRST, so a vector
+    !! of the wrong length (including length 0) is rejected before any code
+    !! reads `params(1)`. Only then is c checked. Any failure leaves the engine
+    !! cold; zero-filling the outputs is the caller's half of the contract.
+    !!
+    !! `needs` is an explicit index list, not a range: an output that does not
+    !! consume an intermediate must leave it neither computed nor stamped.
+    !!
+    !! @param[in,out] cache   Cache to bring up to date
+    !! @param[in]     params  Incoming parameter vector
+    !! @param[in]     needs   Intermediate indices, in producer order
+    !! @param[out]    status  SHAPE_VALID, or the first rejecting code
+    subroutine ensure_list_s(cache, params, needs, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: needs(:)
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik) :: j, id
+
+        call shape_engine_begin_s(cache%engine, params, status)
+        if (status /= SHAPE_VALID) return
+
+        ! begin_s accepted the vector, so size(params) == n_params >= 1.
+        if (params(1) <= C_MIN) then
+            status = FOS_ERROR_INVALID_C
+            call shape_engine_invalidate_all_s(cache%engine)
+            return
+        end if
+
+        do j = 1_ik, size(needs, kind = ik)
+            id = needs(j)
+            if (.not. shape_engine_needs_f(cache%engine, id)) cycle
+            call compute_intermediate_s(cache, params, id, status)
+            if (status /= SHAPE_VALID) then
+                call shape_engine_invalidate_all_s(cache%engine)
+                return
+            end if
+            call shape_engine_note_computed_s(cache%engine, id)
+        end do
+
+    end subroutine ensure_list_s
+
+    !> Recomputes one intermediate from its producers.
+    !!
+    !! Preconditions (`ensure_list_s`'s): the cache is initialized, c > C_MIN,
+    !! and every producer of `id` is already up to date.
+    !!
+    !! @param[in,out] cache   Cache holding the intermediate
+    !! @param[in]     params  Parameter vector the engine accepted
+    !! @param[in]     id      Intermediate index
+    !! @param[out]    status  SHAPE_VALID, or the rejecting code
+    subroutine compute_intermediate_s(cache, params, id, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: id
+        integer(kind = ik), intent(out) :: status
+
+        status = SHAPE_VALID
+
+        select case (id)
+        case (I_A2)
+            call compute_a2_s(params, cache%a2, status)
+        case (I_Z_SHIFT)
+            call compute_z_shift_s(params, cache%z_shift_intrinsic, status)
+        case (I_F_GRID)
+            call compute_f_grid_s(cache%tables, params, cache%f_grid, cache%fp_grid)
+        case (I_RHO_GRID)
+            call scale_rho_grid_s(cache%tables, params(1), cache%z_shift_intrinsic, &
+                    cache%f_grid, cache%fp_grid, cache%z, cache%rho, cache%drho_dz, &
+                    cache%rho_max, cache%rho_positive)
+        case default
+            ! Intermediates 4 and 6-8 arrive with the outputs that consume them.
+            ! Unreachable today: every needs-list in this module is a literal,
+            ! and none of them names an index without an arm above.
+            continue
+        end select
+
+    end subroutine compute_intermediate_s
+
+    !===========================================================================
     ! PRIVATE HELPERS
     !===========================================================================
+
+    !> Allocates the per-shape buffers to the tables' resolution.
+    subroutine cache_alloc_buffers_s(cache)
+
+        type(cache_t), intent(inout) :: cache
+
+        integer(kind = ik) :: n_points
+
+        n_points = cache%tables%n_points
+
+        allocate(cache%f_grid(n_points), cache%fp_grid(n_points))
+        allocate(cache%z(n_points), cache%rho(n_points), cache%drho_dz(n_points))
+
+        cache%f_grid = 0.0_rk
+        cache%fp_grid = 0.0_rk
+        cache%z = 0.0_rk
+        cache%rho = 0.0_rk
+        cache%drho_dz = 0.0_rk
+
+    end subroutine cache_alloc_buffers_s
+
+    !> Zeroes the full actual extent of the cylindrical outputs, tail included:
+    !! an oversized buffer must not keep stale data after a rejection.
+    pure subroutine zero_fill_grid_s(z, rho, drho_dz)
+
+        real(kind = rk), intent(out) :: z(:)
+        real(kind = rk), intent(out) :: rho(:)
+        real(kind = rk), intent(out) :: drho_dz(:)
+
+        z = 0.0_rk
+        rho = 0.0_rk
+        drho_dz = 0.0_rk
+
+    end subroutine zero_fill_grid_s
 
     !> a2 from the volume constraint, without the length check.
     pure function a2_f(params) result(a2)
