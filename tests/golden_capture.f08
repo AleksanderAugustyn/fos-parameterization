@@ -21,6 +21,26 @@
 !!      tolerances UNCHANGED. Loosening a tolerance to make a recapture fit is
 !!      never the fix.
 !!
+!! ## The stored tolerances must absorb a codegen gap
+!!
+!! Capture is Debug (step 1), but the PUBLISHED wheel is a different codegen:
+!! `ci/build-wheel.sh` sets no `CMAKE_BUILD_TYPE` — so CMakeLists defaults to
+!! Release (`-O3 -ffast-math -flto`) — and builds with `GCC_OPTS_MARCH=nehalem`
+!! under manylinux2014's devtoolset-10 GCC 10.2. Local Release and a
+!! native-march wheel are two further variants. The same goldens are compared
+!! against ALL of them, so a tolerance is not a Debug-vs-Debug margin: it must
+!! cover the Debug-capture-vs-shipped-library difference in FMA/contraction and
+!! constant folding.
+!!
+!! Measured after the 2.0.0 recapture: worst case 2.2e-15 on `F2_DERIV_DR(1)`
+!! (Debug capture vs local Release) against an unchanged `DERIV_DR_ATOL` of
+!! 5e-15 — roughly 2.8e-15 of headroom left, and about double what 1.x consumed
+!! (~1.2e-15). Spend that budget deliberately: an algorithm change that widens
+!! the gap has to be measured against the SHIPPED configuration, not only
+!! Debug. If it no longer fits, the honest fix is a per-configuration golden
+!! set, never a loosened tolerance. CI does run the Python suite against the
+!! repaired wheel before publishing, so a bust surfaces at tag time.
+!!
 !! Every value is captured through the SAME entry points the Python bindings
 !! call, at the same internal resolution — the flat tier-1 C entries
 !! `fos_param_radius_grid`, `fos_param_shape` and
