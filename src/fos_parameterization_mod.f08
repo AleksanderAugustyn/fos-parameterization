@@ -60,6 +60,7 @@ module fos_parameterization_mod
             SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID, &
             SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
             SHAPE_ERROR_TABLES_NOT_INITIALIZED
+    use fos_parameterization_workers_mod, only: tables_t, tables_init_s, tables_free_s
 
     implicit none
 
@@ -98,6 +99,11 @@ module fos_parameterization_mod
     ! grid-level workflow (compute_rho_z_grid_s / validate_rho_grid_s /
     ! check_star_convexity_s) directly.
     public :: rho_z_grid_t
+
+    ! Parameter-independent trig tables (re-exported from the workers module)
+    public :: tables_t
+    public :: tables_init_s
+    public :: tables_free_s
 
     ! Module constants
     integer(kind = ik), parameter :: MAX_K = 50_ik

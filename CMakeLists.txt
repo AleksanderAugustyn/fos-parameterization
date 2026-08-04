@@ -41,6 +41,7 @@ create_fortran_library_interface(TARGET fos_parameterization_flags)
 
 # --- Source files ---
 set(FOS_PARAM_SOURCES
+        src/fos_parameterization_workers_mod.f08
         src/fos_parameterization_mod.f08
         src/fos_parameterization_c_api_mod.f08
 )
@@ -120,7 +121,7 @@ set_target_properties(fos_param_test_utils PROPERTIES
 target_include_directories(fos_param_test_utils PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests>)
 
-set(FOS_PARAM_TEST_SUITES core helpers error neck breakdown derivative status)
+set(FOS_PARAM_TEST_SUITES core helpers error neck breakdown derivative status tables)
 foreach (suite IN LISTS FOS_PARAM_TEST_SUITES)
     add_executable(fos_param_${suite}_test tests/fos_param_${suite}_test.f08)
     target_link_libraries(fos_param_${suite}_test PRIVATE
