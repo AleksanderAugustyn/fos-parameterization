@@ -22,16 +22,18 @@
 !!      never the fix.
 !!
 !! Every value is captured through the SAME entry points the Python bindings
-!! call, at the same internal resolution — `fos_compute_radius_grid`,
-!! `fos_compute_shape` and `fos_compute_radius_and_derivative_at_thetas` from
-!! the C API module. Capturing through the Fortran tier-1 forms directly would
-!! be a different internal resolution and the goldens would not reproduce.
+!! call, at the same internal resolution — the flat tier-1 C entries
+!! `fos_param_radius_grid`, `fos_param_shape` and
+!! `fos_param_radius_and_derivative`. Capturing through the Fortran forms
+!! directly would bypass the C-level marshalling and the goldens would not be
+!! the values Python sees.
 program golden_capture
 
     use precision_utilities_mod, only: ik, rk
-    use c_bindings_mod, only: ik_c, rk_c, c_char
-    use fos_parameterization_c_api_mod, only: fos_compute_radius_grid, &
-            fos_compute_shape, fos_compute_radius_and_derivative_at_thetas
+    use mathematical_and_physical_constants_mod, only: PI_C
+    use c_bindings_mod, only: ik_c, rk_c
+    use fos_parameterization_c_api_mod, only: fos_param_radius_grid, &
+            fos_param_shape, fos_param_radius_and_derivative
     use fos_parameterization_mod, only: FOS_VALID
     use test_utils_mod, only: assert_int_eq, test_summary
 
@@ -57,19 +59,35 @@ contains
         real(kind = rk),    intent(in) :: params(:)
 
         real(kind = rk_c)      :: c_params(size(params))
-        real(kind = rk_c)      :: radii(N_GRID), z_shift
+        real(kind = rk_c)      :: grid_thetas(N_GRID), radii(N_GRID)
         real(kind = rk_c)      :: shp_z_shift, r_north, r_south
         real(kind = rk_c)      :: eval_thetas(3), eval_r(3), eval_dr(3)
-        character(kind = c_char) :: msg_buf(256)
         integer(kind = ik_c)   :: code, n_params
         integer(kind = ik)     :: i
 
         c_params(:) = real(params(:), rk_c)
         n_params = int(size(params, kind = ik), ik_c)
 
-        code = fos_compute_radius_grid(c_params, n_params, int(N_GRID, ik_c), &
-                radii, z_shift, 256_ik_c, msg_buf)
+        ! Uniform nodes with the endpoints pinned: under -ffast-math the product
+        ! (n-1)*PI_C/(n-1) can land one ulp ABOVE PI_C, which the theta-domain
+        ! check then rejects.
+        do i = 1_ik, N_GRID
+            grid_thetas(i) = real(i - 1_ik, rk_c) * real(PI_C, rk_c) &
+                    / real(N_GRID - 1_ik, rk_c)
+        end do
+        grid_thetas(1) = 0.0_rk_c
+        grid_thetas(N_GRID) = real(PI_C, rk_c)
+
+        call fos_param_radius_grid(c_params, n_params, grid_thetas, &
+                int(N_GRID, ik_c), int(N_GRID, ik_c), radii, code)
         call assert_int_eq(int(code, ik), FOS_VALID, name // ': valid')
+        if (int(code, ik) /= FOS_VALID) return
+
+        ! Shape split (n_points = N_GRID, the resolution the grid above used),
+        ! so shp_z_shift is the total shift baked into those radii.
+        call fos_param_shape(c_params, n_params, int(N_GRID, ik_c), &
+                shp_z_shift, r_north, r_south, code)
+        call assert_int_eq(int(code, ik), FOS_VALID, name // ': shape valid')
         if (int(code, ik) /= FOS_VALID) return
 
         write(*, '(A,A)') name, '_EXPECTED = ['
@@ -77,14 +95,7 @@ contains
             write(*, '(A,ES24.16E3,A)') '    ', radii(IDX(i)), ','
         end do
         write(*, '(A)') ']'
-        write(*, '(A,A,ES24.16E3)') name, '_Z_SHIFT = ', z_shift
-
-        ! Shape split + derivative goldens (n_rho_grid = N_GRID, used verbatim,
-        ! so shp_z_shift must equal the grid API's z_shift above).
-        code = fos_compute_shape(c_params, n_params, int(N_GRID, ik_c), &
-                shp_z_shift, r_north, r_south, 256_ik_c, msg_buf)
-        call assert_int_eq(int(code, ik), FOS_VALID, name // ': shape valid')
-        if (int(code, ik) /= FOS_VALID) return
+        write(*, '(A,A,ES24.16E3)') name, '_Z_SHIFT = ', shp_z_shift
 
         ! Thetas as pre-rounded literals (pi/8, pi/2, 7pi/8), NOT arithmetic:
         ! Release builds use -ffast-math, which may reassociate 7*PI_C/8 during
@@ -92,8 +103,8 @@ contains
         ! identically here and in Python, so the goldens stay bit-comparable.
         eval_thetas = [0.39269908169872414_rk_c, 1.5707963267948966_rk_c, &
                 2.748893571891069_rk_c]
-        code = fos_compute_radius_and_derivative_at_thetas(c_params, n_params, &
-                eval_thetas, 3_ik_c, shp_z_shift, eval_r, eval_dr)
+        call fos_param_radius_and_derivative(c_params, n_params, eval_thetas, &
+                3_ik_c, int(N_GRID, ik_c), eval_r, eval_dr, code)
         call assert_int_eq(int(code, ik), FOS_VALID, name // ': derivative eval valid')
         if (int(code, ik) /= FOS_VALID) return
 
