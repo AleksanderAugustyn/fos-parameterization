@@ -235,6 +235,13 @@ module fos_parameterization_workers_mod
             [I_A2, I_Z_SHIFT, I_F_GRID, I_BEAK, I_RHO_GRID, I_RESOLVE, I_RADIUS_DERIV]
 
     !> Parameter-independent trigonometric tables for FoS shape evaluation.
+    !!
+    !! NOTE on `cos_thetas`: built, but no longer read by the R(theta) path. The
+    !! bitwise contract between the fixed-grid and at-thetas forms requires ONE
+    !! cos evaluation site (see `solve_thetas_s`), so both take `thetas` and
+    !! evaluate the cosine themselves. The field stays for now because
+    !! `tables_t` is public surface; it is a removal candidate once the tables
+    !! API is finalized.
     type, public :: tables_t
         integer(kind = ik) :: n_points = 0_ik, n_theta = 0_ik, k_max = 0_ik
         real(kind = rk), allocatable :: u(:)                              !! n_points
@@ -322,6 +329,7 @@ module fos_parameterization_workers_mod
         logical :: star_ok = .false.                      !! #6 verdict
 
         real(kind = rk), allocatable :: radii(:)          !! #7, n_theta
+        real(kind = rk), allocatable :: dr_scratch(:)     !! #7 sink, n_theta
         real(kind = rk), allocatable :: radii_d(:)        !! #8, n_theta
         real(kind = rk), allocatable :: dr_dtheta(:)      !! #8, n_theta
     end type cache_t
@@ -1151,6 +1159,7 @@ contains
         if (allocated(cache%rho)) deallocate(cache%rho)
         if (allocated(cache%drho_dz)) deallocate(cache%drho_dz)
         if (allocated(cache%radii)) deallocate(cache%radii)
+        if (allocated(cache%dr_scratch)) deallocate(cache%dr_scratch)
         if (allocated(cache%radii_d)) deallocate(cache%radii_d)
         if (allocated(cache%dr_dtheta)) deallocate(cache%dr_dtheta)
 
@@ -1436,7 +1445,6 @@ contains
 
         type(fos_bundle_t) :: bundle
         integer(kind = ik) :: i, n
-        logical :: converged
 
         call ensure_resolved_s(cache, params, status)
         if (status /= SHAPE_VALID) then
@@ -1462,13 +1470,7 @@ contains
         end do
 
         bundle = fos_bundle_f(params, cache%z_shift_total, cache%rho_max)
-
-        status = SHAPE_VALID
-        do i = 1_ik, n
-            call newton_radius_s(bundle, cos(thetas(i)), radii(i), dr_dtheta(i), &
-                    converged)
-            if (.not. converged) status = FOS_ERROR_CONVERGENCE
-        end do
+        call solve_thetas_s(bundle, thetas, radii, dr_dtheta, status)
 
         if (status /= SHAPE_VALID) then
             call shape_engine_invalidate_all_s(cache%engine)
@@ -1735,9 +1737,6 @@ contains
         integer(kind = ik), intent(out) :: status
 
         type(fos_bundle_t) :: bundle
-        real(kind = rk) :: dr_scratch
-        integer(kind = ik) :: i
-        logical :: converged
 
         status = SHAPE_VALID
 
@@ -1763,20 +1762,22 @@ contains
         case (I_RADIUS_GRID)
             ! Precondition (ensure_resolved_s's): the shape passed 103/100/101,
             ! so #5's rho_max and #6's z_shift_total describe a representable
-            ! surface and the analytic bracket below encloses every root.
-            bundle = fos_bundle_f(params, cache%z_shift_total, cache%rho_max)
-            do i = 1_ik, cache%tables%n_theta
-                call newton_radius_s(bundle, cache%tables%cos_thetas(i), &
-                        cache%radii(i), dr_scratch, converged)
-                if (.not. converged) status = FOS_ERROR_CONVERGENCE
-            end do
+            ! surface and the analytic bracket encloses every root.
+            !
+            ! The derivative lands in the write-only `dr_scratch` sink: the
+            ! shared solver always produces one, and #7 must not write #8's
+            ! buffers.
+            if (cache%tables%n_theta > 0_ik) then
+                bundle = fos_bundle_f(params, cache%z_shift_total, cache%rho_max)
+                call solve_thetas_s(bundle, cache%tables%thetas, cache%radii, &
+                        cache%dr_scratch, status)
+            end if
         case (I_RADIUS_DERIV)
-            bundle = fos_bundle_f(params, cache%z_shift_total, cache%rho_max)
-            do i = 1_ik, cache%tables%n_theta
-                call newton_radius_s(bundle, cache%tables%cos_thetas(i), &
-                        cache%radii_d(i), cache%dr_dtheta(i), converged)
-                if (.not. converged) status = FOS_ERROR_CONVERGENCE
-            end do
+            if (cache%tables%n_theta > 0_ik) then
+                bundle = fos_bundle_f(params, cache%z_shift_total, cache%rho_max)
+                call solve_thetas_s(bundle, cache%tables%thetas, cache%radii_d, &
+                        cache%dr_dtheta, status)
+            end if
         case default
             ! Unreachable today: every needs-list in this module is a named
             ! literal, and none of them contains an index without an arm above.
@@ -1806,7 +1807,8 @@ contains
 
         ! Zero-length for the theta-less tier-1 forms: the R(theta) outputs then
         ! accept only a zero-length buffer, which is the correct contract.
-        allocate(cache%radii(n_theta), cache%radii_d(n_theta), cache%dr_dtheta(n_theta))
+        allocate(cache%radii(n_theta), cache%dr_scratch(n_theta))
+        allocate(cache%radii_d(n_theta), cache%dr_dtheta(n_theta))
 
         cache%f_grid = 0.0_rk
         cache%fp_grid = 0.0_rk
@@ -1814,6 +1816,7 @@ contains
         cache%rho = 0.0_rk
         cache%drho_dz = 0.0_rk
         cache%radii = 0.0_rk
+        cache%dr_scratch = 0.0_rk
         cache%radii_d = 0.0_rk
         cache%dr_dtheta = 0.0_rk
 
@@ -1858,6 +1861,62 @@ contains
         bundle%r_hi_bound = 2.0_rk * sqrt(rho_max**2 + max(z_max, abs(z_min))**2)
 
     end function fos_bundle_f
+
+    !> The ONE R(theta) solve loop in the library: cos(theta) at every node, the
+    !! Newton root, and the convergence verdict folded into a single status.
+    !!
+    !! Every R(theta) path routes through here — the two cached intermediates
+    !! (#7, #8) and the at-thetas form alike — and that is a correctness
+    !! requirement, not tidiness. The contract is that identical thetas in give
+    !! bit-identical radii and derivatives out, in every build configuration.
+    !! Two mechanisms enforce it, and both are needed:
+    !!
+    !!   - ONE cos evaluation site. The fixed-grid arms pass `tables%thetas`,
+    !!     not the precomputed `tables%cos_thetas`, because under `-ffast-math`
+    !!     the compiler may lower a vectorizable cos loop (the one in
+    !!     `build_tables_s`) to libmvec and a scalar one to the libm call, whose
+    !!     results differ by an ulp — and one ulp on cos(theta) moves the Newton
+    !!     iterate.
+    !!   - ONE machine-code copy, via the `noinline` attribute below.
+    !!
+    !! Preconditions (caller's, unchecked): `bundle` from a resolved,
+    !! representable shape; `thetas` in [0, pi]; `radii` and `dr_dtheta` at
+    !! least size(thetas) long.
+    !!
+    !! @param[in]  bundle     Resolved shape (params, z_shift, bracket bound)
+    !! @param[in]  thetas     Polar angles in [0, pi]
+    !! @param[out] radii      R(theta) at those angles
+    !! @param[out] dr_dtheta  dR/dtheta at those angles
+    !! @param[out] status     SHAPE_VALID, or FOS_ERROR_CONVERGENCE if ANY node
+    !!                        missed NR_TOLERANCE
+    subroutine solve_thetas_s(bundle, thetas, radii, dr_dtheta, status)
+
+        ! One source loop is not enough: at -O3 with -flto and -finline-limit=1000
+        ! this body is inlined into BOTH call sites, and -ffast-math then
+        ! contracts the two copies differently — measured as a 1-ulp split in
+        ! dR/dtheta while the radii still agreed. `noinline` collapses them back
+        ! to one machine-code copy, which is what the bitwise contract actually
+        ! needs. The cost is one call per R(theta) batch, not per node.
+        !GCC$ ATTRIBUTES noinline :: solve_thetas_s
+
+        type(fos_bundle_t), intent(in) :: bundle
+        real(kind = rk), intent(in) :: thetas(:)
+        real(kind = rk), intent(out) :: radii(:)
+        real(kind = rk), intent(out) :: dr_dtheta(:)
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik) :: i
+        logical :: converged
+
+        status = SHAPE_VALID
+
+        do i = 1_ik, size(thetas, kind = ik)
+            call newton_radius_s(bundle, cos(thetas(i)), radii(i), dr_dtheta(i), &
+                    converged)
+            if (.not. converged) status = FOS_ERROR_CONVERGENCE
+        end do
+
+    end subroutine solve_thetas_s
 
     !> Zeroes the full actual extent of a radius/derivative output pair.
     pure subroutine zero_fill_pair_s(a, b)
