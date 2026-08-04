@@ -83,6 +83,14 @@ int main() {
     void* null_tables_cache = fos_param_cache_create_shared(nullptr, n_params);
     check(null_tables_cache == nullptr, "cache_create_shared(NULL tables) is NULL");
 
+    // n_theta floor is 1, the same floor tables_create applies.
+    void* no_theta_cache = fos_param_cache_create(n_params, n_points, thetas.data(), 0);
+    check(no_theta_cache == nullptr, "cache_create with n_theta = 0 is NULL");
+    void* neg_theta_cache = fos_param_cache_create(n_params, n_points, thetas.data(), -4);
+    check(neg_theta_cache == nullptr, "cache_create with negative n_theta is NULL");
+    void* neg_theta_tables = fos_param_tables_create(n_points, thetas.data(), -4);
+    check(neg_theta_tables == nullptr, "tables_create with negative n_theta is NULL");
+
     // --- Cached computes ----------------------------------------------------
     std::vector<double> radii(n_theta, -1.0);
     int s = fos_param_cache_radius_grid(cache, params.data(), n_params,
@@ -98,6 +106,22 @@ int main() {
                                     short_radii.data(), n_theta - 1);
     check(s == FOS_ERROR_BUFFER_MISMATCH, "wrong n_radii -> FOS_ERROR_BUFFER_MISMATCH (105)");
     check(all_zero(short_radii), "buffer mismatch zero-fills the output");
+
+    // A negative size is read as zero, so it mismatches the handle's extent
+    // like any other wrong size — 105, not a crash and not an allocation.
+    // (No large-stated-size case here: the contract is that the stated size IS
+    // the buffer's real extent, so overstating it is undefined behavior by
+    // construction. What is covered is that an outsized size cannot overflow
+    // the stack, which the heap marshalling buffers guarantee structurally.)
+    s = fos_param_cache_radius_grid(cache, params.data(), n_params,
+                                    short_radii.data(), -5);
+    check(s == FOS_ERROR_BUFFER_MISMATCH, "negative n_radii -> FOS_ERROR_BUFFER_MISMATCH (105)");
+
+    double neg_shift = -1.0;
+    std::vector<double> gz_probe(1, -1.0), rho_probe(1, -1.0), drho_probe(1, -1.0);
+    s = fos_param_cache_rho_z_grid(cache, params.data(), n_params, gz_probe.data(),
+                                   rho_probe.data(), drho_probe.data(), -1, &neg_shift);
+    check(s == FOS_ERROR_BUFFER_MISMATCH, "negative n_z -> FOS_ERROR_BUFFER_MISMATCH (105)");
 
     // Wrong parameter count -> 4 (the cached tier is exact-length).
     s = fos_param_cache_radius_grid(cache, params.data(), n_params - 1,
@@ -199,6 +223,14 @@ int main() {
     const std::vector<double> a4_only{2.0, 0.0, 0.5};
     fos_param_a2(a4_only.data(), 3, &a2, &st);
     check(st == FOS_VALID && std::fabs(a2 - 0.5 / 3.0) < 1e-15, "flat a2 = a4/3");
+
+    // A negative size on a flat call is a bad C argument, not a handle
+    // mismatch: FOS_ERROR_INVALID_INIT (5).
+    fos_param_radius_grid(params.data(), n_params, thetas.data(), -3, n_points,
+                          flat_radii.data(), &st);
+    check(st == FOS_ERROR_INVALID_INIT, "flat radius_grid, negative n_thetas -> 5");
+    fos_param_z_shift(params.data(), -2, &zs, &st);
+    check(st == FOS_ERROR_INVALID_INIT, "flat z_shift, negative n_params -> 5");
 
     // Rejections still travel through the flat tier.
     const std::vector<double> bad_c{0.0, 0.0, 0.0};

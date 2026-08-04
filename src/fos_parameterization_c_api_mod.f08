@@ -17,8 +17,33 @@
 !! own extent becomes a Fortran array of that size, so the tier's own size
 !! comparison rejects it with `FOS_ERROR_BUFFER_MISMATCH` (105) and zero-fills
 !! exactly the caller's stated extent. The checks that live HERE are the ones
-!! the Fortran layer cannot see: the NULL-handle guard and the negative-size
-!! guard on the C integer arguments.
+!! the Fortran layer cannot see: the NULL-handle guard, the negative-size guard
+!! on the C integer arguments, and the allocation guard described next.
+!!
+!! ## Marshalling buffers are HEAP, not automatic (divergence from beta-param)
+!!
+!! `beta_parameterization_c_api_mod` marshals through automatic arrays sized
+!! from the caller's stated size. This module deliberately does NOT. An
+!! automatic array is allocated on procedure entry, BEFORE the stated size ever
+!! reaches the Fortran tier that would reject it, so the precise caller error
+!! the size argument exists to catch — the wrong variable passed as `n_radii`
+!! or `n_z` — becomes a stack overflow instead of `FOS_ERROR_BUFFER_MISMATCH`
+!! (105), and no compiler flag mitigates it. Here every marshalling buffer is
+!! `allocatable` with an explicit `allocate(..., stat = ...)`, so an outsized
+!! request fails recoverably: 105 in the cached tier (the size argument is what
+!! is implicated) and `SHAPE_ERROR_INVALID_INIT` in the flat tier (no handle
+!! extent exists to mismatch, so the rejection is about the C argument).
+!! Candidate backport to beta-param.
+!!
+!! ## A stated size must be the ACTUAL buffer extent
+!!
+!! The size arguments are a contract, not a bound this layer can verify: an
+!! output dummy is declared with the caller's stated extent, so both this layer
+!! and the Fortran tier zero-fill exactly that many elements on a rejection. A
+!! stated size LARGER than the caller's real buffer is undefined behaviour that
+!! no check here can catch. What the 105 path guarantees is that a stated size
+!! which is merely wrong — but honest about the caller's own memory — is
+!! reported rather than computed on, and never crashes the process.
 module fos_parameterization_c_api_mod
 
     use, intrinsic :: iso_c_binding, only: &
@@ -118,6 +143,21 @@ module fos_parameterization_c_api_mod
 contains
 
     !===========================================================================
+    ! INTERNAL HELPER
+    !===========================================================================
+
+    !> Non-negative Fortran extent for a C size argument.
+    !!
+    !! A negative size is not an extent. Clamping it to zero turns it into a
+    !! length the Fortran tier can compare against its own and reject with 105,
+    !! rather than an invalid allocation here.
+    pure function extent_f(n) result(extent)
+        integer(c_int), intent(in) :: n
+        integer(kind = ik) :: extent
+        extent = max(int(n, ik), 0_ik)
+    end function extent_f
+
+    !===========================================================================
     ! DIAGNOSTICS
     !===========================================================================
 
@@ -152,13 +192,18 @@ contains
 
         type(tables_t), pointer :: p
         integer(kind = ik) :: st
-        real(kind = rk) :: thetas_f(max(n_theta, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: thetas_f(:)
 
         handle = c_null_ptr
         if (n_theta < 1_c_int) return
 
+        allocate(thetas_f(extent_f(n_theta)), stat = alloc_stat)
+        if (alloc_stat /= 0) return
         thetas_f = real(thetas, rk)
-        allocate(p)
+
+        allocate(p, stat = alloc_stat)
+        if (alloc_stat /= 0) return
         call tables_init_s(p, int(n_points, ik), thetas_f, st)
         if (st == SHAPE_VALID) then
             handle = c_loc(p)
@@ -184,6 +229,10 @@ contains
     !===========================================================================
 
     !> Create a cache owning private tables. Null on failure.
+    !!
+    !! `n_theta` must be at least 1, the same floor `fos_param_tables_create`
+    !! applies: a cache with no theta nodes can serve no R(theta) output, and
+    !! the two create paths must not disagree about what a usable handle is.
     function fos_param_cache_create(n_params, n_points, thetas, n_theta) &
             result(handle) bind(c, name = 'fos_param_cache_create')
         integer(c_int), value, intent(in) :: n_params, n_points, n_theta
@@ -192,13 +241,18 @@ contains
 
         type(cache_t), pointer :: p
         integer(kind = ik) :: st
-        real(kind = rk) :: thetas_f(max(n_theta, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: thetas_f(:)
 
         handle = c_null_ptr
-        if (n_theta < 0_c_int) return
+        if (n_theta < 1_c_int) return
 
+        allocate(thetas_f(extent_f(n_theta)), stat = alloc_stat)
+        if (alloc_stat /= 0) return
         thetas_f = real(thetas, rk)
-        allocate(p)
+
+        allocate(p, stat = alloc_stat)
+        if (alloc_stat /= 0) return
         call cache_init_s(p, int(n_params, ik), int(n_points, ik), thetas_f, st)
         if (st == SHAPE_VALID) then
             handle = c_loc(p)
@@ -219,12 +273,14 @@ contains
         type(cache_t),  pointer :: p
         type(tables_t), pointer :: tp
         integer(kind = ik) :: st
+        integer :: alloc_stat
 
         handle = c_null_ptr
         if (.not. c_associated(tables)) return
 
         call c_f_pointer(tables, tp)
-        allocate(p)
+        allocate(p, stat = alloc_stat)
+        if (alloc_stat /= 0) return
         call cache_init_shared_s(p, tp, int(n_params, ik), st)
         if (st == SHAPE_VALID) then
             handle = c_loc(p)
@@ -248,6 +304,9 @@ contains
     !===========================================================================
     ! CACHED COMPUTES (tier 2)
     !===========================================================================
+    ! Marshalling buffers are heap allocatables sized from the caller's stated
+    ! size, so an outsized size argument fails recoverably as 105 instead of
+    ! overflowing the stack on entry (see the module header).
 
     !> R(theta) at the cache's own thetas. n_radii must equal the handle's n_theta.
     function fos_param_cache_radius_grid(cache, params, n_params, radii, n_radii) &
@@ -260,12 +319,18 @@ contains
 
         type(cache_t), pointer :: p
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
-        real(kind = rk) :: radii_f(max(n_radii, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:), radii_f(:)
 
         radii = 0.0_c_double
         if (.not. c_associated(cache)) then
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), radii_f(extent_f(n_radii)), &
+                stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
         call c_f_pointer(cache, p)
@@ -287,13 +352,19 @@ contains
 
         type(cache_t), pointer :: p
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
-        real(kind = rk) :: radii_f(max(n_radii, 0_c_int)), dr_f(max(n_radii, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:), radii_f(:), dr_f(:)
 
         radii     = 0.0_c_double
         dr_dtheta = 0.0_c_double
         if (.not. c_associated(cache)) then
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), radii_f(extent_f(n_radii)), &
+                dr_f(extent_f(n_radii)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
         call c_f_pointer(cache, p)
@@ -316,15 +387,20 @@ contains
 
         type(cache_t), pointer :: p
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
-        real(kind = rk) :: thetas_f(max(n_thetas, 0_c_int))
-        real(kind = rk) :: radii_f(max(n_thetas, 0_c_int))
-        real(kind = rk) :: dr_f(max(n_thetas, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:), thetas_f(:), radii_f(:), dr_f(:)
 
         radii     = 0.0_c_double
         dr_dtheta = 0.0_c_double
         if (.not. c_associated(cache)) then
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), thetas_f(extent_f(n_thetas)), &
+                radii_f(extent_f(n_thetas)), dr_f(extent_f(n_thetas)), &
+                stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
         call c_f_pointer(cache, p)
@@ -348,7 +424,8 @@ contains
 
         type(cache_t), pointer :: p
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: z_shift_f, r_north_f, r_south_f
 
         z_shift = 0.0_c_double
@@ -356,6 +433,11 @@ contains
         r_south = 0.0_c_double
         if (.not. c_associated(cache)) then
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
         call c_f_pointer(cache, p)
@@ -379,9 +461,8 @@ contains
 
         type(cache_t), pointer :: p
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
-        real(kind = rk) :: z_f(max(n_z, 0_c_int)), rho_f(max(n_z, 0_c_int))
-        real(kind = rk) :: drho_f(max(n_z, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:), z_f(:), rho_f(:), drho_f(:)
         real(kind = rk) :: z_shift_f
 
         z       = 0.0_c_double
@@ -390,6 +471,12 @@ contains
         z_shift = 0.0_c_double
         if (.not. c_associated(cache)) then
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), z_f(extent_f(n_z)), &
+                rho_f(extent_f(n_z)), drho_f(extent_f(n_z)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
         call c_f_pointer(cache, p)
@@ -414,7 +501,8 @@ contains
 
         type(cache_t), pointer :: p
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: z_neck_f, rho_neck_f
         logical :: found_f
 
@@ -423,6 +511,11 @@ contains
         found    = 0_c_int
         if (.not. c_associated(cache)) then
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
         call c_f_pointer(cache, p)
@@ -446,13 +539,19 @@ contains
 
         type(cache_t), pointer :: p
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: z_shift_f, g_opt_f
 
         z_shift_total = 0.0_c_double
         g_opt         = 0.0_c_double
         if (.not. c_associated(cache)) then
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
         call c_f_pointer(cache, p)
@@ -466,6 +565,9 @@ contains
     !===========================================================================
     ! FLAT TIER-1 COMPUTES — trailing nullable status
     !===========================================================================
+    ! Same heap rule as the cached tier. An unsatisfiable n_points / n_thetas is
+    ! SHAPE_ERROR_INVALID_INIT here: the flat tier has no handle whose extent
+    ! the request could mismatch, so the rejection is about the C argument.
 
     !> One-shot R(theta) at caller thetas; builds and discards its own tables.
     subroutine fos_param_radius_grid(params, n_params, thetas, n_thetas, &
@@ -476,12 +578,17 @@ contains
         integer(c_int), intent(out), optional :: status   ! NULL-able from C
 
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
-        real(kind = rk) :: thetas_f(max(n_thetas, 0_c_int))
-        real(kind = rk) :: radii_f(max(n_thetas, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:), thetas_f(:), radii_f(:)
 
         radii = 0.0_c_double
         if (n_params < 0_c_int .or. n_thetas < 0_c_int) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), thetas_f(extent_f(n_thetas)), &
+                radii_f(extent_f(n_thetas)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
             if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
             return
         end if
@@ -503,14 +610,19 @@ contains
         integer(c_int), intent(out), optional :: status
 
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
-        real(kind = rk) :: thetas_f(max(n_thetas, 0_c_int))
-        real(kind = rk) :: radii_f(max(n_thetas, 0_c_int))
-        real(kind = rk) :: dr_f(max(n_thetas, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:), thetas_f(:), radii_f(:), dr_f(:)
 
         radii     = 0.0_c_double
         dr_dtheta = 0.0_c_double
         if (n_params < 0_c_int .or. n_thetas < 0_c_int) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), thetas_f(extent_f(n_thetas)), &
+                radii_f(extent_f(n_thetas)), dr_f(extent_f(n_thetas)), &
+                stat = alloc_stat)
+        if (alloc_stat /= 0) then
             if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
             return
         end if
@@ -532,13 +644,19 @@ contains
         integer(c_int), intent(out), optional :: status
 
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: z_shift_f, r_north_f, r_south_f
 
         z_shift = 0.0_c_double
         r_north = 0.0_c_double
         r_south = 0.0_c_double
         if (n_params < 0_c_int) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
             if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
             return
         end if
@@ -561,9 +679,8 @@ contains
         integer(c_int), intent(out), optional :: status
 
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
-        real(kind = rk) :: z_f(max(n_points, 0_c_int)), rho_f(max(n_points, 0_c_int))
-        real(kind = rk) :: drho_f(max(n_points, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:), z_f(:), rho_f(:), drho_f(:)
         real(kind = rk) :: z_shift_f
 
         z       = 0.0_c_double
@@ -571,6 +688,13 @@ contains
         drho_dz = 0.0_c_double
         z_shift = 0.0_c_double
         if (n_params < 0_c_int .or. n_points < 0_c_int) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), z_f(extent_f(n_points)), &
+                rho_f(extent_f(n_points)), drho_f(extent_f(n_points)), &
+                stat = alloc_stat)
+        if (alloc_stat /= 0) then
             if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
             return
         end if
@@ -594,7 +718,8 @@ contains
         integer(c_int), intent(out), optional :: status
 
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: z_neck_f, rho_neck_f
         logical :: found_f
 
@@ -602,6 +727,11 @@ contains
         rho_neck = 0.0_c_double
         found    = 0_c_int
         if (n_params < 0_c_int) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
             if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
             return
         end if
@@ -624,12 +754,18 @@ contains
         integer(c_int), intent(out), optional :: status
 
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: z_shift_f, g_opt_f
 
         z_shift_total = 0.0_c_double
         g_opt         = 0.0_c_double
         if (n_params < 0_c_int) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
             if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
             return
         end if
@@ -650,11 +786,17 @@ contains
         integer(c_int), intent(out), optional :: status
 
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: z_shift_f
 
         z_shift = 0.0_c_double
         if (n_params < 0_c_int) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
             if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
             return
         end if
@@ -673,11 +815,17 @@ contains
         integer(c_int), intent(out), optional :: status
 
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: a2_f
 
         a2 = 0.0_c_double
         if (n_params < 0_c_int) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
             if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
             return
         end if
@@ -692,6 +840,7 @@ contains
     !===========================================================================
 
     !> rho and drho/dz at one z in the SHIFTED frame. No validation, no status.
+    !! An unsatisfiable n_params leaves the documented fallback in place.
     subroutine fos_param_rho_at_z(params, n_params, z, z_shift, rho, drho_dz) &
             bind(c, name = 'fos_param_rho_at_z')
         integer(c_int), value, intent(in) :: n_params
@@ -699,12 +848,15 @@ contains
         real(c_double), value, intent(in) :: z, z_shift
         real(c_double), intent(out) :: rho, drho_dz
 
-        real(kind = rk) :: params_f(max(n_params, 0_c_int))
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: rho_f, drho_f
 
         rho     = 0.0_c_double
         drho_dz = 0.0_c_double
         if (n_params < 0_c_int) return
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) return
         params_f = real(params, rk)
         call compute_rho_at_z_s(params_f, real(z, rk), real(z_shift, rk), rho_f, drho_f)
         rho     = real(rho_f, c_double)

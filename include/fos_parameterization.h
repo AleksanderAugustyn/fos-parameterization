@@ -60,6 +60,15 @@
  *   A mismatch returns FOS_ERROR_BUFFER_MISMATCH (105) with the outputs
  *   zero-filled; nothing is written past the caller's stated size.
  *
+ *   A stated size MUST also be the ACTUAL extent of the buffer you pass. It is
+ *   a contract, not a bound the library can verify: on the 105 path the
+ *   library zero-fills exactly the stated number of elements, so a size larger
+ *   than your real buffer is undefined behavior no check can catch. What 105
+ *   guarantees is that a size which is merely wrong — but honest about your
+ *   own memory — is reported rather than computed on. Negative sizes are read
+ *   as zero and therefore also report 105. Internal marshalling buffers are
+ *   heap-allocated, so an outsized size argument can never overflow the stack.
+ *
  * Frames:
  *   The R(theta) outputs and fos_param_*shape / *star_convexity_optimum
  *   report the TOTAL z-shift (intrinsic COM shift + any extra star-convexity
@@ -140,6 +149,8 @@ void fos_param_tables_destroy(void *tables);
  * thetas.
  *
  * @param n_params  1 .. FOS_PARAM_CACHE_MAX_PARAMS
+ * @param n_theta   Number of thetas, at least 1 (same floor as
+ *                  fos_param_tables_create)
  * @return          Handle, or NULL on failure
  */
 void *fos_param_cache_create(int32_t n_params, int32_t n_points,
