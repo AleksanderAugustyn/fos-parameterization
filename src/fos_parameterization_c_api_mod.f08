@@ -1,7 +1,7 @@
 !> C-interop API for the FoS parameterization library.
 !!
 !! Standalone functions only — FoS has no shape-independent precompute, so
-!! there is no cache/handle tier. Status codes 0-4 match the Fortran FOS_*
+!! there is no cache/handle tier. Status codes 100+ match the Fortran FOS_*
 !! parameters and the C FOS_* macros; FOS_ERROR_INVALID_ARGUMENTS (5) exists
 !! only at this layer (bad n_grid / n_z — the Fortran API takes assumed-size
 !! arrays and cannot receive these).

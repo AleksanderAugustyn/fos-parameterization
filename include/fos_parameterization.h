@@ -16,7 +16,7 @@
  * On any failure, numeric output buffers are zero-filled.
  *
  * FOS_ERROR_INVALID_ARGUMENTS (5) is C-API-level only (bad n_grid / n_z);
- * codes 0-4 mirror the Fortran FOS_* parameters exactly.
+ * codes 100+ mirror the Fortran FOS_* parameters exactly.
  *
  * Thread safety: the library is stateless; all functions are safe to call
  * concurrently.
@@ -29,13 +29,15 @@
 extern "C" {
 #endif
 
-/* --- Status codes (0-4 mirror Fortran FOS_* parameters) --- */
+/* --- Status codes (100+ mirror the Fortran FOS_* parameters) --- */
 #define FOS_VALID                    0
-#define FOS_ERROR_RHO_NEGATIVE       1
-#define FOS_ERROR_NOT_STAR_CONVEX    2
-#define FOS_ERROR_INVALID_C          3
-#define FOS_ERROR_BEAK_SINGULARITY   4
 #define FOS_ERROR_INVALID_ARGUMENTS  5
+#define FOS_ERROR_RHO_NEGATIVE       100
+#define FOS_ERROR_NOT_STAR_CONVEX    101
+#define FOS_ERROR_INVALID_C          102
+#define FOS_ERROR_BEAK_SINGULARITY   103
+#define FOS_ERROR_CONVERGENCE        104
+#define FOS_ERROR_BUFFER_MISMATCH    105
 
 /**
  * Validate the shape and compute R(theta) on n_grid uniform points over [0, pi].

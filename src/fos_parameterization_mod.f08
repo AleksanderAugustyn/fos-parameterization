@@ -56,6 +56,10 @@ module fos_parameterization_mod
 
     use precision_utilities_mod, only: ik, rk
     use mathematical_and_physical_constants_mod, only: PI_C
+    use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
+            SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID, &
+            SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
+            SHAPE_ERROR_TABLES_NOT_INITIALIZED
 
     implicit none
 
@@ -129,12 +133,32 @@ module fos_parameterization_mod
     !---------------------------------------------------------------------------
     integer(kind = ik), parameter :: F_MIN_SAMPLE_POINTS = 1001_ik
 
-    ! Validation error codes
-    integer(kind = ik), parameter, public :: FOS_VALID = 0_ik
-    integer(kind = ik), parameter, public :: FOS_ERROR_RHO_NEGATIVE = 1_ik
-    integer(kind = ik), parameter, public :: FOS_ERROR_NOT_STAR_CONVEX = 2_ik
-    integer(kind = ik), parameter, public :: FOS_ERROR_INVALID_C = 3_ik
-    integer(kind = ik), parameter, public :: FOS_ERROR_BEAK_SINGULARITY = 4_ik
+    !---------------------------------------------------------------------------
+    ! Status codes
+    !---------------------------------------------------------------------------
+    !! Two disjoint ranges share one integer space. 0-99 are the shared
+    !! shape_core codes, re-exported here so a caller never has to use
+    !! shape_core_mod directly; 100+ are FoS-specific. FOS_VALID is an alias of
+    !! SHAPE_VALID, so success compares equal across both libraries.
+    public :: SHAPE_VALID
+    public :: SHAPE_ERROR_TOO_MANY_PARAMS
+    public :: SHAPE_ERROR_CACHE_NOT_INITIALIZED
+    public :: SHAPE_ERROR_INVALID_GRID
+    public :: SHAPE_ERROR_WRONG_PARAM_COUNT
+    public :: SHAPE_ERROR_INVALID_INIT
+    public :: SHAPE_ERROR_TABLES_NOT_INITIALIZED
+
+    integer(kind = ik), parameter, public :: FOS_VALID = SHAPE_VALID
+    integer(kind = ik), parameter, public :: FOS_ERROR_RHO_NEGATIVE = 100_ik
+    integer(kind = ik), parameter, public :: FOS_ERROR_NOT_STAR_CONVEX = 101_ik
+    integer(kind = ik), parameter, public :: FOS_ERROR_INVALID_C = 102_ik
+    integer(kind = ik), parameter, public :: FOS_ERROR_BEAK_SINGULARITY = 103_ik
+    integer(kind = ik), parameter, public :: FOS_ERROR_CONVERGENCE = 104_ik
+    integer(kind = ik), parameter, public :: FOS_ERROR_BUFFER_MISMATCH = 105_ik
+
+    !> Length of every string returned by status_message.
+    integer(kind = ik), parameter, public :: STATUS_MESSAGE_LEN = 64_ik
+    public :: status_message
 
     !---------------------------------------------------------------------------
     ! Star-convexity safety margin
@@ -193,6 +217,35 @@ module fos_parameterization_mod
     end type rho_z_grid_t
 
 contains
+
+    !===========================================================================
+    ! STATUS
+    !===========================================================================
+
+    !> Fixed diagnostic string for a status code, shared or FoS-specific.
+    !!
+    !! @param[in] code  Any integer; unrecognised values get a fallback message
+    !! @return          Blank-padded message, never empty
+    pure function status_message(code) result(msg)
+        integer(kind = ik), intent(in) :: code
+        character(len = STATUS_MESSAGE_LEN) :: msg
+        select case (code)
+        case (SHAPE_VALID);                        msg = 'valid'
+        case (SHAPE_ERROR_TOO_MANY_PARAMS);        msg = 'too many parameters for this tier'
+        case (SHAPE_ERROR_CACHE_NOT_INITIALIZED);  msg = 'cache not initialized'
+        case (SHAPE_ERROR_INVALID_GRID);           msg = 'theta grid below minimum size (2)'
+        case (SHAPE_ERROR_WRONG_PARAM_COUNT);      msg = 'params length differs from n_params'
+        case (SHAPE_ERROR_INVALID_INIT);           msg = 'invalid init arguments'
+        case (SHAPE_ERROR_TABLES_NOT_INITIALIZED); msg = 'tables not initialized'
+        case (FOS_ERROR_RHO_NEGATIVE);             msg = 'rho <= 0 away from the poles'
+        case (FOS_ERROR_NOT_STAR_CONVEX);          msg = 'shape not star-convex from any origin'
+        case (FOS_ERROR_INVALID_C);                msg = 'elongation c below the minimum'
+        case (FOS_ERROR_BEAK_SINGULARITY);         msg = 'f_min below the beak threshold'
+        case (FOS_ERROR_CONVERGENCE);              msg = 'iteration did not converge'
+        case (FOS_ERROR_BUFFER_MISMATCH);          msg = 'output buffer size mismatch'
+        case default;                              msg = 'unknown status code'
+        end select
+    end function status_message
 
     !===========================================================================
     ! MAIN ENTRY POINT

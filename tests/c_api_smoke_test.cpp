@@ -60,7 +60,7 @@ int main() {
     // Beak error code surfaces through the C API.
     std::vector<double> beak{2.0, 0.0, 0.7497, 0.0, 0.0, 0.0, 0.0};
     s = fos_compute_radius_grid(beak.data(), 7, 41, radii_fail.data(), &z_shift, nbuf, buf.data());
-    check(s == FOS_ERROR_BEAK_SINGULARITY, "C: near-scission beak -> code 4");
+    check(s == FOS_ERROR_BEAK_SINGULARITY, "C: near-scission beak -> FOS_ERROR_BEAK_SINGULARITY");
 
     // --- fos_compute_rho_profile: sphere, odd n_z so z = 0 is on-grid ---
     const int nz = 201;

@@ -29,11 +29,13 @@ def _get_lib() -> ctypes.CDLL:
 class Status(IntEnum):
     """Mirrors FOS_* codes in include/fos_parameterization.h."""
     VALID = 0
-    ERROR_RHO_NEGATIVE = 1
-    ERROR_NOT_STAR_CONVEX = 2
-    ERROR_INVALID_C = 3
-    ERROR_BEAK_SINGULARITY = 4
     ERROR_INVALID_ARGUMENTS = 5
+    ERROR_RHO_NEGATIVE = 100
+    ERROR_NOT_STAR_CONVEX = 101
+    ERROR_INVALID_C = 102
+    ERROR_BEAK_SINGULARITY = 103
+    ERROR_CONVERGENCE = 104
+    ERROR_BUFFER_MISMATCH = 105
 
 
 @dataclass(frozen=True)
