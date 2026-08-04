@@ -75,6 +75,8 @@ module fos_parameterization_workers_mod
     public :: cache_radius_grid_s
     public :: cache_radius_and_derivative_s
     public :: cache_radius_and_derivative_at_thetas_s
+    public :: cache_neck_s
+    public :: cache_star_convexity_optimum_s
     public :: cache_recompute_count_f
 
     !---------------------------------------------------------------------------
@@ -158,6 +160,12 @@ module fos_parameterization_workers_mod
     real(kind = rk), parameter :: GOLDEN = 0.6180339887498949_rk
     real(kind = rk), parameter :: SHIFT_TOL = 1.0e-6_rk
     integer(kind = ik), parameter :: SHIFT_MAX_ITER = 200_ik
+
+    !> Newton refinement of the neck: iteration cap and the step size below
+    !! which the minimum of f is taken as located. Duplicated from the 1.x neck
+    !! scanner (see the migration note above).
+    integer(kind = ik), parameter :: NECK_NEWTON_MAX_ITER = 50_ik
+    real(kind = rk), parameter :: NECK_NEWTON_TOL = 1.0e-14_rk
 
     !> Degenerate or missing elongation. Duplicated from fos_parameterization_mod
     !! (see the migration note above).
@@ -1469,6 +1477,131 @@ contains
 
     end subroutine cache_radius_and_derivative_at_thetas_s
 
+    !> Neck of the cylindrical profile: the interior rho minimum between the two
+    !! largest rho maxima, refined to machine precision.
+    !!
+    !! Gates: wrong parameter count (4), degenerate c (102), interior rho <= 0
+    !! (100). Beak (103) and star-convexity (101) do NOT gate here — the neck is
+    !! a property of the rho(z) profile, which a beak-marginal or
+    !! non-star-convex shape still has. That asymmetry is the point of this
+    !! entry: `rho_neck -> 0` defines the scission line, and scission-adjacent
+    !! shapes are exactly the ones the R(theta) gates reject.
+    !!
+    !! A coarse scan over the cached grid (#5) brackets the neck, then Newton
+    !! iteration on f'(u) = 0, bracketed to one grid spacing around the scan
+    !! result, refines it. `found` is .false. — with status SHAPE_VALID — for a
+    !! shape with fewer than two rho maxima: having no neck is an answer, not an
+    !! error.
+    !!
+    !! Every failure zero-fills both outputs, clears `found`, and returns the
+    !! engine to cold.
+    !!
+    !! @param[in,out] cache     Initialized cache
+    !! @param[in]     params    Parameter vector, length == the cache's n_params
+    !! @param[out]    z_neck    Neck z-position in the COM frame
+    !! @param[out]    rho_neck  Neck radius, reduced units (R0 = 1)
+    !! @param[out]    found     .true. iff the profile has a neck
+    !! @param[out]    status    SHAPE_VALID on success, else the rejecting code
+    subroutine cache_neck_s(cache, params, z_neck, rho_neck, found, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(out) :: z_neck
+        real(kind = rk), intent(out) :: rho_neck
+        logical, intent(out) :: found
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik) :: neck_idx, iter, n
+        real(kind = rk) :: c, u, u_lo, u_hi, du, step
+        real(kind = rk) :: f_val, fp_val, fpp_val
+
+        z_neck = 0.0_rk
+        rho_neck = 0.0_rk
+        found = .false.
+
+        call ensure_list_s(cache, params, NEEDS_RHO_Z_GRID, status)
+        if (status /= SHAPE_VALID) return
+
+        if (.not. cache%rho_positive) then
+            status = FOS_ERROR_RHO_NEGATIVE
+            call shape_engine_invalidate_all_s(cache%engine)
+            return
+        end if
+
+        call find_neck_index_s(cache%rho, neck_idx, found)
+        if (.not. found) return
+
+        ! Newton refinement of the f-minimum, bracketed to one grid spacing
+        ! around the scan result so it cannot escape to a different extremum.
+        c = params(1)
+        n = cache%tables%n_points
+        du = 2.0_rk / real(n - 1_ik, rk)
+        u = cache%tables%u(neck_idx)
+        u_lo = max(-1.0_rk, u - du)
+        u_hi = min(1.0_rk, u + du)
+
+        do iter = 1_ik, NECK_NEWTON_MAX_ITER
+            call eval_f_s(params, u, f_val, fp_val, fpp_val)
+            if (fpp_val <= 0.0_rk) exit
+            step = fp_val / fpp_val
+            u = min(u_hi, max(u_lo, u - step))
+            if (abs(step) < NECK_NEWTON_TOL) exit
+        end do
+
+        call eval_f_s(params, u, f_val, fp_val)
+        rho_neck = sqrt(max(f_val, 0.0_rk) / c)
+        z_neck = c * u + cache%z_shift_intrinsic
+
+    end subroutine cache_neck_s
+
+    !> Diagnostic: the raw, UNGATED star-convexity optimum of a shape.
+    !!
+    !! Returns g(s*) = min_s max_i[(z_i + s) drho_dz_i - rho_i] and the total
+    !! shift z_shift_intrinsic + s*, WITHOUT applying STAR_CONVEXITY_MARGIN. The
+    !! mathematical single-valued (representable) boundary is g(s*) = 0; the
+    !! production gate accepts g(s*) <= -STAR_CONVEXITY_MARGIN. This entry
+    !! exposes the quantity the margin thresholds, so a shape the R(theta) path
+    !! rejects with 101 is still reported on here — that is the whole purpose,
+    !! and the reason star-convexity is the one resolve gate this path omits.
+    !!
+    !! The returned shift is ALWAYS the optimum, intrinsic + s*, never the
+    !! branch-selected R(theta) origin (which keeps the COM when the COM is
+    !! already well-conditioned).
+    !!
+    !! Gates: wrong parameter count (4), degenerate c (102), beak singularity
+    !! (103), interior rho <= 0 (100) — the resolve gate set minus 101, in the
+    !! same order, so a shape that 1.x rejected with 100 is rejected here with
+    !! 103 exactly as in `cache_shape_s`.
+    !!
+    !! Reads the STORED resolve (#6): after a successful `cache_shape_s` on the
+    !! same vector this call recomputes nothing.
+    !!
+    !! Every failure zero-fills both outputs and returns the engine to cold.
+    !!
+    !! @param[in,out] cache          Initialized cache
+    !! @param[in]     params         Parameter vector, length == the cache's n_params
+    !! @param[out]    z_shift_total  Intrinsic COM shift plus the optimum s*
+    !! @param[out]    g_opt          g(s*), the star-convexity test value there
+    !! @param[out]    status         SHAPE_VALID on success, else the rejecting code
+    subroutine cache_star_convexity_optimum_s(cache, params, z_shift_total, g_opt, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(out) :: z_shift_total
+        real(kind = rk), intent(out) :: g_opt
+        integer(kind = ik), intent(out) :: status
+
+        z_shift_total = 0.0_rk
+        g_opt = 0.0_rk
+
+        call ensure_gated_s(cache, params, .false., status)
+        if (status /= SHAPE_VALID) return
+
+        z_shift_total = cache%z_shift_intrinsic + cache%s_opt
+        g_opt = cache%g_opt
+
+    end subroutine cache_star_convexity_optimum_s
+
     !===========================================================================
     ! ENGINE DRIVER (the module's single engine touchpoint)
     !===========================================================================
@@ -1538,6 +1671,30 @@ contains
         real(kind = rk), intent(in) :: params(:)
         integer(kind = ik), intent(out) :: status
 
+        call ensure_gated_s(cache, params, .true., status)
+
+    end subroutine ensure_resolved_s
+
+    !> Brings intermediates #1-#6 up to date and applies the shape gates, with
+    !! the star-convexity gate optional.
+    !!
+    !! `gate_star = .false.` is the ungated-diagnostic path
+    !! (`cache_star_convexity_optimum_s`): it must report g(s*) for exactly the
+    !! shapes the margin rejects, so 101 cannot fire. Every other gate, and
+    !! their order, is shared with the resolved path — one code path, one
+    !! normative order.
+    !!
+    !! @param[in,out] cache       Cache to resolve
+    !! @param[in]     params      Incoming parameter vector
+    !! @param[in]     gate_star   .true. to reject on the star-convexity margin
+    !! @param[out]    status      SHAPE_VALID, or the rejecting code
+    subroutine ensure_gated_s(cache, params, gate_star, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        logical, intent(in) :: gate_star
+        integer(kind = ik), intent(out) :: status
+
         call ensure_list_s(cache, params, NEEDS_SHAPE, status)
         if (status /= SHAPE_VALID) return
 
@@ -1553,13 +1710,13 @@ contains
             return
         end if
 
-        if (.not. cache%star_ok) then
+        if (gate_star .and. .not. cache%star_ok) then
             status = FOS_ERROR_NOT_STAR_CONVEX
             call shape_engine_invalidate_all_s(cache%engine)
             return
         end if
 
-    end subroutine ensure_resolved_s
+    end subroutine ensure_gated_s
 
     !> Recomputes one intermediate from its producers.
     !!
@@ -1727,6 +1884,70 @@ contains
 
     end subroutine zero_fill_grid_s
 
+    !> Grid index of the neck: the smallest rho between the two largest interior
+    !! rho maxima. Reproduces the 1.x scan node for node.
+    !!
+    !! Fewer than two maxima means no neck — a shape property, not a failure.
+    pure subroutine find_neck_index_s(rho, neck_idx, found)
+
+        real(kind = rk), intent(in) :: rho(:)
+        integer(kind = ik), intent(out) :: neck_idx
+        logical, intent(out) :: found
+
+        integer(kind = ik) :: i, j, n, n_maxima, max1_idx, max2_idx
+        integer(kind = ik) :: left_idx, right_idx
+        real(kind = rk) :: max1_rho, max2_rho, min_rho
+
+        neck_idx = 0_ik
+        found = .false.
+
+        n = size(rho, kind = ik)
+
+        n_maxima = 0_ik
+        max1_idx = 0_ik
+        max2_idx = 0_ik
+        max1_rho = -1.0_rk
+        max2_rho = -1.0_rk
+
+        do i = 2_ik, n - 1_ik
+            if (rho(i) > rho(i - 1_ik) .and. rho(i) > rho(i + 1_ik)) then
+                n_maxima = n_maxima + 1_ik
+                if (rho(i) > max1_rho) then
+                    max2_rho = max1_rho
+                    max2_idx = max1_idx
+                    max1_rho = rho(i)
+                    max1_idx = i
+                else if (rho(i) > max2_rho) then
+                    max2_rho = rho(i)
+                    max2_idx = i
+                end if
+            end if
+        end do
+
+        if (n_maxima < 2_ik .or. max1_idx == 0_ik .or. max2_idx == 0_ik) return
+
+        if (max1_idx < max2_idx) then
+            left_idx = max1_idx
+            right_idx = max2_idx
+        else
+            left_idx = max2_idx
+            right_idx = max1_idx
+        end if
+
+        min_rho = huge(1.0_rk)
+        neck_idx = left_idx
+
+        do j = left_idx, right_idx
+            if (rho(j) < min_rho) then
+                min_rho = rho(j)
+                neck_idx = j
+            end if
+        end do
+
+        found = .true.
+
+    end subroutine find_neck_index_s
+
     !> a2 from the volume constraint, without the length check.
     pure function a2_f(params) result(a2)
 
@@ -1804,19 +2025,24 @@ contains
 
     end subroutine pair_coefficients_s
 
-    !> Live (untabled) f(u) and f'(u) — the Newton path evaluates f at arbitrary
-    !! u, off every grid node.
-    pure subroutine eval_f_s(params, u, f, fp)
+    !> Live (untabled) f(u), f'(u) and — on request — f''(u). The Newton paths
+    !! evaluate f at arbitrary u, off every grid node; only the neck refinement
+    !! needs the curvature, so it is optional rather than always summed.
+    pure subroutine eval_f_s(params, u, f, fp, fpp)
 
         real(kind = rk), intent(in) :: params(:)
         real(kind = rk), intent(in) :: u
         real(kind = rk), intent(out) :: f
         real(kind = rk), intent(out) :: fp
+        real(kind = rk), intent(out), optional :: fpp
 
         integer(kind = ik) :: k, k_max, n_params
         real(kind = rk) :: a2, omega_k, psi_k, a_even, a_odd
         real(kind = rk) :: cos_even, sin_even, cos_odd, sin_odd
-        real(kind = rk) :: sum_f, sum_fp
+        real(kind = rk) :: sum_f, sum_fp, sum_fpp
+        logical :: need_fpp
+
+        need_fpp = present(fpp)
 
         a2 = a2_f(params)
         n_params = size(params, kind = ik)
@@ -1824,6 +2050,7 @@ contains
 
         sum_f = 0.0_rk
         sum_fp = 0.0_rk
+        sum_fpp = 0.0_rk
 
         do k = 1_ik, k_max
             a_even = coefficient_f(params, 2_ik * k, a2)
@@ -1840,10 +2067,15 @@ contains
 
             sum_f = sum_f + a_even * cos_even + a_odd * sin_odd
             sum_fp = sum_fp - a_even * omega_k * sin_even + a_odd * psi_k * cos_odd
+            if (need_fpp) then
+                sum_fpp = sum_fpp - a_even * omega_k**2 * cos_even &
+                        - a_odd * psi_k**2 * sin_odd
+            end if
         end do
 
         f = 1.0_rk - u**2 - sum_f
         fp = -2.0_rk * u - sum_fp
+        if (need_fpp) fpp = -2.0_rk - sum_fpp
 
     end subroutine eval_f_s
 
