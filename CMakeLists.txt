@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(fos-parameterization
-        VERSION 1.3.2
+        VERSION 2.0.0
         LANGUAGES Fortran CXX
         DESCRIPTION "Fourier-over-Spheroid (FoS) nuclear shape parameterization"
 )
@@ -131,6 +131,17 @@ foreach (suite IN LISTS FOS_PARAM_TEST_SUITES)
             Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/${suite})
     add_test(NAME ${suite} COMMAND fos_param_${suite}_test)
 endforeach ()
+
+# PES-range sweep gate: incremental == cold over the PES parameter box, every
+# cached slot moving. Small enough (~9k points x 2 caches) to run as a ctest in
+# both configurations; the throughput it prints is a record, not a threshold.
+add_executable(fos_param_pes_sweep tests/fos_pes_sweep.f08)
+target_link_libraries(fos_param_pes_sweep PRIVATE
+        fos_parameterization fos_param_test_utils fos_parameterization_flags)
+set_target_properties(fos_param_pes_sweep PROPERTIES
+        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/sweep)
+add_test(NAME pes_sweep COMMAND fos_param_pes_sweep)
+set_tests_properties(pes_sweep PROPERTIES LABELS sweep TIMEOUT 1800)
 
 add_executable(fos_param_golden_capture tests/golden_capture.f08)
 target_link_libraries(fos_param_golden_capture PRIVATE
