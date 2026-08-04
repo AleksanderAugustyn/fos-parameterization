@@ -15,6 +15,9 @@
 !! externally resolved z_shift, which no tier-1 form does. It is built directly
 !! on the worker evaluator (`fos_bundle_t` + `newton_radius_s`), with the
 !! Newton bracket bound taken from a rho(z) grid at N_RHO_AT_THETAS nodes.
+!! That grid is a GATED form, so the call now validates the shape where 1.x
+!! evaluated unconditionally: a pinched interior propagates 100 and an
+!! over-length vector propagates 1, both with the outputs zero-filled.
 module fos_parameterization_c_api_mod
 
     use c_bindings_mod, only: ik_c, rk_c, c_char, c_null_char

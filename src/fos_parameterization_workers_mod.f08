@@ -157,54 +157,78 @@ module fos_parameterization_workers_mod
     real(kind = rk), parameter :: R_LO_FLOOR = 1.0e-10_rk
     real(kind = rk), parameter :: DF_DR_FLOOR = 1.0e-14_rk
 
-    !> Star-convexity acceptance margin: a shape is representable as R(theta)
-    !! from its best origin s* iff g(s*) <= -STAR_CONVEXITY_MARGIN. The
-    !! mathematical boundary is g(s*) = 0, where R(theta) develops a vertical
-    !! wall; the margin holds shapes off that singularity. In reduced units
-    !! (R0 = 1). Duplicated (see the migration note above).
+    !---------------------------------------------------------------------------
+    ! Star-convexity safety margin
+    !---------------------------------------------------------------------------
+    !> A shape is accepted iff, at its best origin s* = argmin_s g(s),
+    !! g(s*) = max_i[(z_i+s*)*drho/dz_i - rho_i] <= -margin. The mathematical
+    !! single-valued (representable) boundary is g(s*) = 0, where R(theta)
+    !! develops a vertical wall (|dR/dtheta| -> infinity); the margin holds
+    !! shapes off that singularity.
+    !!
+    !! Value empirically retuned 2026-07-05 (0.1 -> 0.01) via the RewriteProject
+    !! representability probe. At spectral GL-4096 density the FoS -> R(theta)
+    !! conversion reproduces V/S to well within tolerance for EVERY
+    !! single-valued shape (round-trip ~3e-12, dS <= 1.2e-6 even in the last bin
+    !! before g=0), so the intrinsic representability limit is g=0 and the
+    !! margin is only a safety buffer off that singularity. At 0.01 the
+    !! production sweep keeps ~400x (volume) / 1e6x (surface) headroom under the
+    !! tolerances; 0.01 is one bin off the g=0 singularity. Lowering it required
+    !! fixing origin selection (see ORIGIN_CONDITION_MARGIN): the former s=0 fast
+    !! path evaluated marginal-at-COM shapes from a steep origin, corrupting the
+    !! volume integral. The energy model's neck-radius cutoff selects physical
+    !! shapes downstream. In reduced units (R0 = 1).
     real(kind = rk), parameter, public :: STAR_CONVEXITY_MARGIN = 1.0e-2_rk
 
-    !> COM-origin conditioning threshold: the R(theta) origin stays at the COM
-    !! (additional shift 0) when g(0) <= -ORIGIN_CONDITION_MARGIN, otherwise it
-    !! moves to s*, which is always at least as well-conditioned. Held fixed and
-    !! independent of the acceptance margin above, so lowering that margin
-    !! preserves the origin of every previously-accepted shape. Duplicated (see
-    !! the migration note above).
+    !---------------------------------------------------------------------------
+    ! COM-origin conditioning threshold for star-convexity origin selection
+    !---------------------------------------------------------------------------
+    !> The R(theta) origin is the COM (additional shift 0) when the shape is
+    !! already well-conditioned there — g(0) = max_i[z_i*drho/dz_i - rho_i] <=
+    !! -threshold — and otherwise the star-convexity optimum s* = argmin_s g(s),
+    !! which is always at least as well-conditioned (g(s*) <= g(0)). 0.1 is the
+    !! empirically-validated COM conditioning bound: at g(0) <= -0.1 the GL
+    !! volume/surface integrals converge to ~1e-12 from the COM origin. Held
+    !! fixed (independent of the acceptance margin above) so lowering the margin
+    !! preserves the origin — and thus the z_shift — of every previously-accepted
+    !! shape, while routing the newly-admitted marginal shapes to their
+    !! best-conditioned origin.
     real(kind = rk), parameter :: ORIGIN_CONDITION_MARGIN = 1.0e-1_rk
 
     !> Golden-section constants for the origin search: (sqrt(5) - 1) / 2, the
     !! bracket half-width factor (the bracket is [-2c, 2c]), the stopping width,
-    !! and the iteration cap. Values duplicated from the 1.x minimizer.
+    !! and the iteration cap. Values carried over from the 1.x minimizer, which
+    !! this module replaced.
     real(kind = rk), parameter :: GOLDEN = 0.6180339887498949_rk
     real(kind = rk), parameter :: SHIFT_TOL = 1.0e-6_rk
     integer(kind = ik), parameter :: SHIFT_MAX_ITER = 200_ik
 
     !> Newton refinement of the neck: iteration cap and the step size below
-    !! which the minimum of f is taken as located. Duplicated from the 1.x neck
-    !! scanner (see the migration note above).
+    !! which the minimum of f is taken as located. Carried over from the 1.x
+    !! neck scanner, which this module replaced.
     integer(kind = ik), parameter :: NECK_NEWTON_MAX_ITER = 50_ik
     real(kind = rk), parameter :: NECK_NEWTON_TOL = 1.0e-14_rk
 
-    !> Degenerate or missing elongation. Duplicated from fos_parameterization_mod
-    !! (see the migration note above).
+    !> Degenerate or missing elongation. Owned here and re-exported by
+    !! fos_parameterization_mod, which is where consumers meet it.
     integer(kind = ik), parameter, public :: FOS_ERROR_INVALID_C = 102_ik
 
-    !> Interior node with rho <= 0. Duplicated (see the migration note above).
+    !> Interior node with rho <= 0. Owned here, re-exported by the main module.
     integer(kind = ik), parameter, public :: FOS_ERROR_RHO_NEGATIVE = 100_ik
 
     !> A Newton radius solve that did not meet NR_TOLERANCE at some node.
-    !! Duplicated (see the migration note above).
+    !! Owned here, re-exported by the main module.
     integer(kind = ik), parameter, public :: FOS_ERROR_CONVERGENCE = 104_ik
 
     !> Output array whose size differs from the cache's init-time resolution.
-    !! Duplicated (see the migration note above).
+    !! Owned here, re-exported by the main module.
     integer(kind = ik), parameter, public :: FOS_ERROR_BUFFER_MISMATCH = 105_ik
 
-    !> Shape not star-convex from any origin. Duplicated (see the migration
-    !! note above).
+    !> Shape not star-convex from any origin. Owned here, re-exported by the
+    !! main module.
     integer(kind = ik), parameter, public :: FOS_ERROR_NOT_STAR_CONVEX = 101_ik
 
-    !> f_min below the beak threshold. Duplicated (see the migration note above).
+    !> f_min below the beak threshold. Owned here, re-exported by the main module.
     integer(kind = ik), parameter, public :: FOS_ERROR_BEAK_SINGULARITY = 103_ik
 
     !---------------------------------------------------------------------------

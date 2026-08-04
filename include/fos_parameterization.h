@@ -100,9 +100,13 @@ int fos_compute_shape(
  * Batch R(theta) and analytic dR/dtheta at caller-supplied thetas in [0, pi].
  * z_shift must come from fos_compute_shape. No message buffer.
  *
- * The 1.x unit-sphere fallback for degenerate params is withdrawn: an empty
- * vector or c <= C_MIN is now a rejection (FOS_ERROR_INVALID_C) with the
- * outputs left zero-filled.
+ * This call now VALIDATES the shape, which 1.x did not: it builds an internal
+ * rho(z) grid for the Newton bracket bound, and that grid's gates propagate.
+ * So on top of the withdrawn 1.x unit-sphere fallback for degenerate params
+ * (an empty vector or c <= C_MIN is now FOS_ERROR_INVALID_C), a pinched
+ * interior returns FOS_ERROR_RHO_NEGATIVE (100) and more than 50 parameters
+ * returns SHAPE_ERROR_TOO_MANY_PARAMS (1) — each with the outputs zero-filled,
+ * where 1.x evaluated unconditionally and returned numbers.
  *
  * @param thetas     n_thetas angles in [0, pi]
  * @param radii      Output buffer, n_thetas doubles
@@ -115,10 +119,19 @@ int fos_compute_radius_and_derivative_at_thetas(
         const double* thetas, int n_thetas, double z_shift,
         double* radii, double* dr_dtheta);
 
-/** Intrinsic COM z-shift (closed form). Returns 0 for invalid params. */
+/**
+ * Intrinsic COM z-shift (closed form). Returns 0 for invalid params, which now
+ * includes more than 50 parameters (the library's N_max): 1.x summed the first
+ * 50 and returned that truncated value, 2.0 rejects and this sentinel-returning
+ * wrapper reports the rejection as 0.
+ */
 double fos_z_shift(const double* params, int n_params);
 
-/** a2 from the volume-conservation constraint. Returns 0 for empty params. */
+/**
+ * a2 from the volume-conservation constraint. Returns 0 for empty params and,
+ * as for fos_z_shift, for more than 50 parameters — 1.x returned a truncated
+ * sum there.
+ */
 double fos_a2(const double* params, int n_params);
 
 #ifdef __cplusplus
