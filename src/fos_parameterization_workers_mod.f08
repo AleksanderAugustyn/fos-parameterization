@@ -2557,7 +2557,15 @@ contains
         ! dR/dtheta while the radii still agreed. `noinline` collapses them back
         ! to one machine-code copy, which is what the bitwise contract actually
         ! needs. The cost is one call per R(theta) batch, not per node.
+        !
+        ! gfortran only learned ATTRIBUTES noinline in GCC 12. The manylinux2014
+        ! wheel builds with devtoolset GCC 10 (glibc 2.17 floor for the
+        ! cluster), so there the directive is compiled out and the wheel-verify
+        ! pytest cross-path checks (radii bitwise, dR/dtheta atol 1e-14) are
+        ! the gate against a recurrence of the split.
+#if __GNUC__ >= 12
         !GCC$ ATTRIBUTES noinline :: solve_thetas_s
+#endif
 
         type(fos_bundle_t), intent(in) :: bundle
         real(kind = rk), intent(in) :: thetas(:)
