@@ -24,7 +24,7 @@ FetchContent_MakeAvailable(GCC-Compiler-Options)
 FetchContent_Declare(
         Fortran-Foundations
         GIT_REPOSITORY https://github.com/AleksanderAugustyn/Fortran-Foundations.git
-        GIT_TAG 2.3.2
+        GIT_TAG 2.4.0
 )
 FetchContent_MakeAvailable(Fortran-Foundations)
 
