@@ -14,6 +14,13 @@
 !! Degenerate coverage is per entry point: all six forms are driven with an
 !! empty parameter vector and with a degenerate c, and each must report 102 and
 !! zero-fill every output it owns.
+!!
+!! The third subject is the per-call k_max itself. Accepting a 50-vector is not
+!! evidence that its high Fourier orders were TABULATED — a tier that silently
+!! kept the cached tier's fixed k_max = 6 would accept the same vectors and
+!! quietly drop every order above 6. The pin is a 20-parameter vector whose only
+!! nonzero coefficient is a_21, which lives at order k = 10: it must move the
+!! rho(z) grid, and the grid must match the order-complete 1.x live evaluator.
 program fos_param_standalone_test
 
     use precision_utilities_mod, only: ik, rk
@@ -29,6 +36,7 @@ program fos_param_standalone_test
             cache_shape_s, cache_rho_z_grid_s, cache_radius_grid_s, &
             cache_radius_and_derivative_s, cache_neck_s, &
             cache_star_convexity_optimum_s, &
+            rho_z_grid_t, compute_rho_z_grid_s, &
             FOS_ERROR_INVALID_C
     use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS
     use test_utils_mod, only: assert_true, assert_int_eq, assert_abs_close, &
@@ -53,8 +61,21 @@ program fos_param_standalone_test
 
     real(kind = rk), parameter :: NO_PARAMS(0) = [real(kind = rk) ::]
 
+    !> Length of the k_max pin vector, and the slot its lone coefficient sits in.
+    !! params(20) is a_21, the ODD coefficient of Fourier order k = 10 — well
+    !! above the cached tier's fixed k_max = 6, and (unlike an even coefficient)
+    !! invisible to the volume constraint, so it cannot reach the grid through
+    !! a2 instead of through the tabulated sum.
+    integer(kind = ik), parameter :: N_HIGH = 20_ik
+    integer(kind = ik), parameter :: SLOT_A21 = 20_ik
+
+    !> Parity tolerance against the 1.x live evaluator: the two paths derive u
+    !! differently (tabled u_i vs z*(1/c)), so this is tight, not bitwise.
+    real(kind = rk), parameter :: TOL_PARITY = 1.0e-11_rk
+
     type(cache_t)      :: cache
-    integer(kind = ik) :: status, cstatus, i
+    type(rho_z_grid_t) :: ref_grid
+    integer(kind = ik) :: status, cstatus, code, i
     real(kind = rk)    :: thetas(N_THETA)
     real(kind = rk)    :: params50(50), params51(51), params_bad_c(1)
     real(kind = rk)    :: radii(N_THETA), dr(N_THETA)
@@ -66,7 +87,11 @@ program fos_param_standalone_test
     real(kind = rk)    :: cz_shift, cr_north, cr_south
     real(kind = rk)    :: z_neck, rho_neck, cz_neck, crho_neck
     real(kind = rk)    :: g_opt, z_shift_total, cg_opt, cz_shift_total
+    real(kind = rk)    :: params_high(N_HIGH), params_flat(N_HIGH)
+    real(kind = rk)    :: rho_high(N_POINTS), rho_flat(N_POINTS)
+    real(kind = rk)    :: max_move, max_dev
     logical            :: found, cfound
+    character(len = 256) :: message
 
     do i = 1_ik, N_THETA
         thetas(i) = real(i - 1_ik, rk) * PI_C / real(N_THETA - 1_ik, rk)
@@ -205,6 +230,57 @@ program fos_param_standalone_test
     call assert_abs_close(z_shift_total, cz_shift_total, 0.0_rk, &
             'star optimum z_shift_total bitwise')
     call assert_abs_close(g_opt, cg_opt, 0.0_rk, 'star optimum g_opt bitwise')
+
+    !---------------------------------------------------------------------------
+    ! Per-call k_max: the high-order coefficient must reach the tabled sum
+    !---------------------------------------------------------------------------
+    ! This is the assertion that pins the ledger closure. A 20-parameter vector
+    ! gets k_max = min((20+2)/2+1, 50) = 12 orders, so a_21 (order k = 10) is
+    ! tabulated and contributes. Hard-code k_max back to FOS_TABLES_K_MAX = 6 and
+    ! `pair_coefficients_s` never even looks at order 10: the coefficient
+    ! vanishes from f(u), both assertions below fail, and the regression is
+    ! caught. Nothing else in the suite would notice — accepting a long vector is
+    ! not the same as evaluating it.
+    !
+    ! The comparison is on rho, deliberately: a_21 also enters the intrinsic
+    ! z-shift (an odd coefficient always does), so z would move under a fixed
+    ! k_max too and would prove nothing about the tables.
+    write(*, '(A)') '=== Per-call k_max reaches high Fourier orders ==='
+
+    params_high = 0.0_rk
+    params_high(1) = 1.5_rk
+    params_high(SLOT_A21) = 0.02_rk
+    params_flat = params_high
+    params_flat(SLOT_A21) = 0.0_rk
+
+    call compute_rho_z_grid_standalone_s(params_high, N_POINTS, z, rho_high, &
+            drho, z_shift, status)
+    call assert_int_eq(status, SHAPE_VALID, 'a_21 vector: rho(z) grid valid')
+
+    call compute_rho_z_grid_standalone_s(params_flat, N_POINTS, cz, rho_flat, &
+            cdrho, cz_shift, status)
+    call assert_int_eq(status, SHAPE_VALID, 'a_21 = 0 vector: rho(z) grid valid')
+
+    max_move = 0.0_rk
+    do i = 1_ik, N_POINTS
+        max_move = max(max_move, abs(rho_high(i) - rho_flat(i)))
+    end do
+    call assert_true(max_move > 1.0e-3_rk, &
+            'a_21 (Fourier order 10) moves the rho(z) grid')
+
+    ! Stronger than "something changed": the tabled sum must agree with the 1.x
+    ! live evaluator, which carries the same min((n+2)/2+1, 50) orders and is
+    ! order-complete for 20 parameters. This pins the VALUE of the high-order
+    ! term, not merely its presence.
+    call compute_rho_z_grid_s(params_high, N_POINTS, ref_grid, code, message)
+    call assert_int_eq(code, SHAPE_VALID, 'a_21 vector: 1.x live grid valid')
+
+    max_dev = 0.0_rk
+    do i = 1_ik, N_POINTS
+        max_dev = max(max_dev, abs(rho_high(i) - ref_grid%rho(i)))
+    end do
+    call assert_abs_close(max_dev, 0.0_rk, TOL_PARITY, &
+            'tier-1 rho(z) matches the order-complete 1.x evaluator')
 
     call test_summary()
 
