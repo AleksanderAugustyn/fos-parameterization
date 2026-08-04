@@ -216,7 +216,7 @@ contains
         case (SHAPE_VALID);                        msg = 'valid'
         case (SHAPE_ERROR_TOO_MANY_PARAMS);        msg = 'too many parameters for this tier'
         case (SHAPE_ERROR_CACHE_NOT_INITIALIZED);  msg = 'cache not initialized'
-        case (SHAPE_ERROR_INVALID_GRID);           msg = 'theta grid below minimum size (2)'
+        case (SHAPE_ERROR_INVALID_GRID);           msg = 'invalid grid: n_points, theta count, or theta domain'
         case (SHAPE_ERROR_WRONG_PARAM_COUNT);      msg = 'params length differs from n_params'
         case (SHAPE_ERROR_INVALID_INIT);           msg = 'invalid init arguments'
         case (SHAPE_ERROR_TABLES_NOT_INITIALIZED); msg = 'tables not initialized'

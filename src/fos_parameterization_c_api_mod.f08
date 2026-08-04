@@ -11,14 +11,28 @@
 !! entry point stops, allocates for the caller, or formats a message:
 !! diagnostics are the static strings behind `fos_param_status_message`.
 !!
-!! This layer only marshals. The buffer-length and parameter-count contracts
-!! are checked once, in the Fortran tiers, and their codes pass through
-!! untouched: an output buffer whose stated C size differs from the handle's
-!! own extent becomes a Fortran array of that size, so the tier's own size
-!! comparison rejects it with `FOS_ERROR_BUFFER_MISMATCH` (105) and zero-fills
-!! exactly the caller's stated extent. The checks that live HERE are the ones
-!! the Fortran layer cannot see: the NULL-handle guard, the negative-size guard
-!! on the C integer arguments, and the allocation guard described next.
+!! This layer mostly marshals: the parameter-count contract is checked once, in
+!! the Fortran tiers, and its codes pass through untouched. The checks that live
+!! HERE are the ones the Fortran layer cannot see or cannot order correctly: the
+!! NULL-handle guard, the negative-size guard on the C integer arguments, the
+!! allocation guard described next, and the stated-size check below.
+!!
+!! ## The stated size of a cached compute is judged HERE, before the tier
+!!
+!! A wrong buffer size is the CALLER's error and must outrank the shape's:
+!! passing a beak-invalid shape with the wrong `n_radii` has to report
+!! `FOS_ERROR_BUFFER_MISMATCH` (105), not `FOS_ERROR_BEAK_SINGULARITY` (103).
+!! The Fortran tier cannot deliver that order — it must resolve the shape before
+!! `cache%tables` is safe to read — so each cached wrapper with a size argument
+!! compares the stated extent against the handle's own (`tables%n_theta`,
+!! `tables%n_points`) before invoking the tier, and returns 105 with nothing
+!! written. The two codes that outrank a buffer mismatch keep doing so: a cache
+!! whose tables pointer is not associated, and a stated parameter count that is
+!! not the handle's own, both fall through to the tier, which reports
+!! `SHAPE_ERROR_CACHE_NOT_INITIALIZED` (2) and `SHAPE_ERROR_WRONG_PARAM_COUNT`
+!! (4) as before. Full precedence: 2 > 4 > 105 > the shape gates. The tier's
+!! identical size check stays where it is: pure-Fortran callers never pass
+!! through this layer.
 !!
 !! ## Marshalling buffers are HEAP, not automatic (divergence from beta-param)
 !!
@@ -124,7 +138,7 @@ module fos_parameterization_c_api_mod
                     'valid' // c_null_char, &
                     'too many parameters for this tier' // c_null_char, &
                     'cache not initialized' // c_null_char, &
-                    'theta grid below minimum size (2)' // c_null_char, &
+                    'invalid grid: n_points, theta count, or theta domain' // c_null_char, &
                     'params length differs from n_params' // c_null_char, &
                     'invalid init arguments' // c_null_char, &
                     'tables not initialized' // c_null_char, &
@@ -156,6 +170,46 @@ contains
         integer(kind = ik) :: extent
         extent = max(int(n, ik), 0_ik)
     end function extent_f
+
+    !> .true. when a stated buffer size differs from the handle's own extent.
+    !!
+    !! The stated size of a cached compute is judged HERE, before the tier runs,
+    !! so a wrong size outranks every shape gate: a beak-invalid shape passed
+    !! with the wrong `n_radii` must report the caller's own error (105), not the
+    !! shape's (103). The tier keeps its identical check for pure-Fortran
+    !! callers, which never come through this layer.
+    !!
+    !! Two cases defer to the tier rather than reporting here, so that the codes
+    !! outranking 105 keep their precedence: a cache whose tables pointer is not
+    !! associated — freed, or never initialized — has no extent to compare
+    !! against and must report SHAPE_ERROR_CACHE_NOT_INITIALIZED (2); and a
+    !! stated parameter count that is not the handle's own must report
+    !! SHAPE_ERROR_WRONG_PARAM_COUNT (4), which outranks a buffer mismatch in
+    !! every tier of this library. The full precedence is therefore
+    !! 2 > 4 > 105 > the shape gates.
+    !!
+    !! @param[in] cache      Cache behind the caller's handle
+    !! @param[in] n_params   Caller's stated parameter count, already clamped
+    !! @param[in] stated     Caller's stated buffer extent, already clamped
+    !! @param[in] u_grid     .true. for an n_points buffer, .false. for n_theta
+    !! @return               .true. iff the two extents differ
+    function size_mismatch_f(cache, n_params, stated, u_grid) result(mismatch)
+        type(cache_t), intent(in) :: cache
+        integer(kind = ik), intent(in) :: n_params
+        integer(kind = ik), intent(in) :: stated
+        logical, intent(in) :: u_grid
+        logical :: mismatch
+
+        mismatch = .false.
+        if (.not. associated(cache%tables)) return
+        if (n_params /= cache%n_params) return
+
+        if (u_grid) then
+            mismatch = stated /= cache%tables%n_points
+        else
+            mismatch = stated /= cache%tables%n_theta
+        end if
+    end function size_mismatch_f
 
     !===========================================================================
     ! DIAGNOSTICS
@@ -327,13 +381,17 @@ contains
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
             return
         end if
+        call c_f_pointer(cache, p)
+        if (size_mismatch_f(p, extent_f(n_params), extent_f(n_radii), .false.)) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
+            return
+        end if
         allocate(params_f(extent_f(n_params)), radii_f(extent_f(n_radii)), &
                 stat = alloc_stat)
         if (alloc_stat /= 0) then
             status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
-        call c_f_pointer(cache, p)
         params_f = real(params, rk)
         call cache_radius_grid_s(p, params_f, radii_f, st)
         radii = real(radii_f, c_double)
@@ -361,13 +419,17 @@ contains
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
             return
         end if
+        call c_f_pointer(cache, p)
+        if (size_mismatch_f(p, extent_f(n_params), extent_f(n_radii), .false.)) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
+            return
+        end if
         allocate(params_f(extent_f(n_params)), radii_f(extent_f(n_radii)), &
                 dr_f(extent_f(n_radii)), stat = alloc_stat)
         if (alloc_stat /= 0) then
             status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
-        call c_f_pointer(cache, p)
         params_f = real(params, rk)
         call cache_radius_and_derivative_s(p, params_f, radii_f, dr_f, st)
         radii     = real(radii_f, c_double)
@@ -394,6 +456,14 @@ contains
         dr_dtheta = 0.0_c_double
         if (.not. c_associated(cache)) then
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
+            return
+        end if
+        ! A negative n_thetas is not an extent. Clamping it would make the
+        ! stated and the expected extent both zero, so the tier's size check
+        ! would agree with itself and return FOS_VALID having written nothing;
+        ! rejecting it here keeps the header's "negative sizes report 105" true.
+        if (n_thetas < 0_c_int) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
         allocate(params_f(extent_f(n_params)), thetas_f(extent_f(n_thetas)), &
@@ -473,13 +543,17 @@ contains
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
             return
         end if
+        call c_f_pointer(cache, p)
+        if (size_mismatch_f(p, extent_f(n_params), extent_f(n_z), .true.)) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
+            return
+        end if
         allocate(params_f(extent_f(n_params)), z_f(extent_f(n_z)), &
                 rho_f(extent_f(n_z)), drho_f(extent_f(n_z)), stat = alloc_stat)
         if (alloc_stat /= 0) then
             status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
-        call c_f_pointer(cache, p)
         params_f = real(params, rk)
         call cache_rho_z_grid_s(p, params_f, z_f, rho_f, drho_f, z_shift_f, st)
         z       = real(z_f, c_double)

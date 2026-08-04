@@ -17,9 +17,15 @@
 !!   3. Replace the F2/F3/F4/F5 blocks at the top of `python/tests/test_api.py`
 !!      with the printed lines, leaving the `*_PARAMS`, `GOLDEN_IDX`,
 !!      `DERIV_THETAS` and tolerance definitions alone.
-!!   4. Run the Python suite: `pytest python/tests -q`. It must pass with the
-!!      tolerances UNCHANGED. Loosening a tolerance to make a recapture fit is
-!!      never the fix.
+!!   4. Run the Python suite against THIS tree, not the installed package:
+!!        `PYTHONPATH=python FOS_PARAM_LIB=build-debug/libfos_parameterization.so \
+!!           pytest python/tests -q`
+!!      A bare `pytest python/tests` from the repo root imports whatever
+!!      `fos_parameterization` is installed in the environment and loads
+!!      whatever library that resolves — which is how a fresh recapture "passes"
+!!      against the previous release. Both variables are required. The suite
+!!      must pass with the tolerances UNCHANGED; loosening a tolerance to make a
+!!      recapture fit is never the fix.
 !!
 !! ## The stored tolerances must absorb a codegen gap
 !!

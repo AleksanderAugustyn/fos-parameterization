@@ -128,6 +128,11 @@ int main() {
                                     radii.data(), n_theta);
     check(s == FOS_ERROR_WRONG_PARAM_COUNT, "short params -> FOS_ERROR_WRONG_PARAM_COUNT (4)");
 
+    // Precedence 4 > 105: both wrong at once still reports the parameter count.
+    s = fos_param_cache_radius_grid(cache, params.data(), n_params - 1,
+                                    short_radii.data(), n_theta - 1);
+    check(s == FOS_ERROR_WRONG_PARAM_COUNT, "wrong params + wrong n_radii -> 4");
+
     // NULL handle -> 2, never a dereference.
     s = fos_param_cache_radius_grid(nullptr, params.data(), n_params,
                                     radii.data(), n_theta);
@@ -146,6 +151,28 @@ int main() {
             extra_r.data(), extra_dr.data());
     check(s == FOS_VALID, "cache_radius_and_derivative_at_thetas returns FOS_VALID");
     check(all_finite_positive(extra_r), "at_thetas radii positive");
+
+    // A negative size is not an extent on this form either: 105, nothing
+    // written. (Clamping it to zero would make the stated and the expected
+    // extent agree and return FOS_VALID having computed nothing.)
+    s = fos_param_cache_radius_and_derivative_at_thetas(
+            cache, params.data(), n_params, extra_thetas.data(), -3,
+            extra_r.data(), extra_dr.data());
+    check(s == FOS_ERROR_BUFFER_MISMATCH, "negative n_thetas -> FOS_ERROR_BUFFER_MISMATCH (105)");
+
+    // A wrong buffer size is the CALLER's error and outranks the SHAPE's.
+    // Probe the beak vector at the right size first, so the 105 below is known
+    // to be reported instead of a live 103 and not merely instead of success.
+    std::vector<double> beak_params(static_cast<std::size_t>(n_params), 0.0);
+    beak_params[0] = 2.0;
+    beak_params[2] = 0.7495;  // the frozen 1.x beak probe vector
+    s = fos_param_cache_radius_grid(cache, beak_params.data(), n_params,
+                                    radii.data(), n_theta);
+    check(s == FOS_ERROR_BEAK_SINGULARITY, "beak vector at the right size -> 103");
+    s = fos_param_cache_radius_grid(cache, beak_params.data(), n_params,
+                                    short_radii.data(), n_theta - 1);
+    check(s == FOS_ERROR_BUFFER_MISMATCH,
+          "beak vector with wrong n_radii -> 105 (size outranks shape)");
 
     double z_shift = -1.0, r_north = -1.0, r_south = -1.0;
     s = fos_param_cache_shape(cache, params.data(), n_params, &z_shift, &r_north, &r_south);

@@ -40,6 +40,8 @@ program fos_param_boundary_test
             [1.6_rk, 0.12_rk, 0.08_rk, 0.05_rk, 0.03_rk, 0.01_rk, 0.005_rk, 0.002_rk]
 
     type(cache_t)      :: cache
+    !! Second handle for the theta-count probes: `cache` stays live across them.
+    type(cache_t)      :: cache_probe
     type(tables_t)     :: tables
     real(kind = rk)    :: thetas(N_THETA)
     real(kind = rk)    :: one_theta(1), no_thetas(0)
@@ -155,7 +157,9 @@ program fos_param_boundary_test
             'at_thetas: out-of-range node zero-fills')
 
     !---------------------------------------------------------------------------
-    ! Theta count: one node is enough, zero is not
+    ! Theta count: one node is enough, zero is not — at every init path that
+    ! carries thetas (tables, cache, and the theta-bearing standalone forms).
+    ! The theta-LESS standalone forms are exempt by design and not asserted here.
     !---------------------------------------------------------------------------
     call tables_init_s(tables, N_POINTS, one_theta, status)
     call assert_int_eq(status, SHAPE_VALID, 'tables: one theta node accepted')
@@ -164,6 +168,19 @@ program fos_param_boundary_test
     call tables_init_s(tables, N_POINTS, no_thetas, status)
     call assert_int_eq(status, SHAPE_ERROR_INVALID_GRID, 'tables: n_theta 0 -> 3')
     call tables_free_s(tables)
+
+    call cache_init_s(cache_probe, 8_ik, N_POINTS, one_theta, status)
+    call assert_int_eq(status, SHAPE_VALID, 'cache: one theta node accepted')
+    call cache_free_s(cache_probe)
+
+    call cache_init_s(cache_probe, 8_ik, N_POINTS, no_thetas, status)
+    call assert_int_eq(status, SHAPE_ERROR_INVALID_GRID, 'cache: n_theta 0 -> 3')
+    call cache_free_s(cache_probe)
+
+    call compute_radius_grid_standalone_s(BASE8, no_thetas, N_POINTS, &
+            radii50(1:0), status)
+    call assert_int_eq(status, SHAPE_ERROR_INVALID_GRID, &
+            'standalone radius grid: n_theta 0 -> 3')
 
     !---------------------------------------------------------------------------
     ! Vector length: exactly n_params, nothing else

@@ -481,10 +481,16 @@ contains
     !! tier-1 forms (shape, rho_z_grid, neck, optimum) need no theta nodes, and
     !! then `thetas` stays unallocated with `n_theta = 0`.
     !!
+    !! A grid the process cannot allocate is SHAPE_ERROR_INVALID_GRID, not an
+    !! abort: `n_points` and `k_max` come from the caller, so a request the heap
+    !! cannot satisfy is a rejected grid like any other. Every allocation is
+    !! checked, and a failure releases whatever was already taken, leaving
+    !! `tables` in the freed (uninitialized) state.
+    !!
     !! @param[out] tables    Freshly built tables (reset on any rejection)
     !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
     !! @param[in]  thetas    Polar angles in [0, pi]; may be empty
-    !! @param[in]  k_max     Number of Fourier orders to tabulate
+    !! @param[in]  k_max     Number of Fourier orders to tabulate, >= 1
     !! @param[out] status    SHAPE_VALID, or SHAPE_ERROR_INVALID_GRID
     subroutine build_tables_s(tables, n_points, thetas, k_max, status)
 
@@ -495,9 +501,17 @@ contains
         integer(kind = ik), intent(out) :: status
 
         integer(kind = ik) :: i, k, n_theta
+        integer :: alloc_stat
         real(kind = rk) :: u_raw
 
         if (n_points < FOS_N_POINTS_FLOOR) then
+            status = SHAPE_ERROR_INVALID_GRID
+            return
+        end if
+
+        ! Zero Fourier orders would tabulate nothing and silently return the
+        ! sphere for every parameter vector.
+        if (k_max < 1_ik) then
             status = SHAPE_ERROR_INVALID_GRID
             return
         end if
@@ -514,20 +528,33 @@ contains
         tables%n_theta = n_theta
         tables%k_max = k_max
 
-        allocate(tables%omega(k_max), tables%psi(k_max))
+        allocate(tables%omega(k_max), tables%psi(k_max), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            call reject_tables_s(tables, status)
+            return
+        end if
         do k = 1_ik, k_max
             tables%omega(k) = real(2_ik * k - 1_ik, rk) * PI_C / 2.0_rk
             tables%psi(k) = real(k, rk) * PI_C
         end do
 
         ! u-grid and its Fourier basis
-        allocate(tables%u(n_points))
+        allocate(tables%u(n_points), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            call reject_tables_s(tables, status)
+            return
+        end if
         do i = 1_ik, n_points
             tables%u(i) = -1.0_rk + 2.0_rk * real(i - 1_ik, rk) / real(n_points - 1_ik, rk)
         end do
 
-        allocate(tables%cos_even(n_points, k_max), tables%sin_even(n_points, k_max))
-        allocate(tables%cos_odd(n_points, k_max), tables%sin_odd(n_points, k_max))
+        allocate(tables%cos_even(n_points, k_max), tables%sin_even(n_points, k_max), &
+                tables%cos_odd(n_points, k_max), tables%sin_odd(n_points, k_max), &
+                stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            call reject_tables_s(tables, status)
+            return
+        end if
         do k = 1_ik, k_max
             do i = 1_ik, n_points
                 tables%cos_even(i, k) = cos(tables%omega(k) * tables%u(i))
@@ -538,15 +565,23 @@ contains
         end do
 
         ! Beak-scan grid: same construction, clamped away from the poles
-        allocate(tables%u_beak(FOS_BEAK_SCAN_POINTS))
+        allocate(tables%u_beak(FOS_BEAK_SCAN_POINTS), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            call reject_tables_s(tables, status)
+            return
+        end if
         do i = 1_ik, FOS_BEAK_SCAN_POINTS
             u_raw = -1.0_rk + 2.0_rk * real(i - 1_ik, rk) &
                     / real(FOS_BEAK_SCAN_POINTS - 1_ik, rk)
             tables%u_beak(i) = max(-U_BEAK_CLAMP, min(U_BEAK_CLAMP, u_raw))
         end do
 
-        allocate(tables%bk_cos_even(FOS_BEAK_SCAN_POINTS, k_max))
-        allocate(tables%bk_sin_odd(FOS_BEAK_SCAN_POINTS, k_max))
+        allocate(tables%bk_cos_even(FOS_BEAK_SCAN_POINTS, k_max), &
+                tables%bk_sin_odd(FOS_BEAK_SCAN_POINTS, k_max), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            call reject_tables_s(tables, status)
+            return
+        end if
         do k = 1_ik, k_max
             do i = 1_ik, FOS_BEAK_SCAN_POINTS
                 tables%bk_cos_even(i, k) = cos(tables%omega(k) * tables%u_beak(i))
@@ -556,7 +591,11 @@ contains
 
         ! Theta nodes (absent for the theta-less tier-1 forms)
         if (n_theta > 0_ik) then
-            allocate(tables%thetas(n_theta))
+            allocate(tables%thetas(n_theta), stat = alloc_stat)
+            if (alloc_stat /= 0) then
+                call reject_tables_s(tables, status)
+                return
+            end if
             do i = 1_ik, n_theta
                 tables%thetas(i) = thetas(i)
             end do
@@ -566,6 +605,24 @@ contains
         status = SHAPE_VALID
 
     end subroutine build_tables_s
+
+    !> Releases a half-built `tables_t` and reports the grid as unsatisfiable.
+    !!
+    !! The single exit `build_tables_s` uses when an allocation fails: whatever
+    !! was already taken is given back, so the caller sees the same freed state a
+    !! never-built tables object has.
+    !!
+    !! @param[in,out] tables  Partially built tables, freed here
+    !! @param[out]    status  Always SHAPE_ERROR_INVALID_GRID
+    subroutine reject_tables_s(tables, status)
+
+        type(tables_t), intent(inout) :: tables
+        integer(kind = ik), intent(out) :: status
+
+        call tables_free_s(tables)
+        status = SHAPE_ERROR_INVALID_GRID
+
+    end subroutine reject_tables_s
 
     !===========================================================================
     ! COEFFICIENTS
@@ -1131,7 +1188,7 @@ contains
     !! @param[out] cache     Ready on success; default (uninitialized) state otherwise
     !! @param[in]  n_params  1 <= n_params <= SHAPE_CACHE_MAX_PARAMS
     !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
-    !! @param[in]  thetas    Polar angles in [0, pi]; may be empty
+    !! @param[in]  thetas    Polar angles in [0, pi], at least one
     !! @param[out] status    SHAPE_VALID, SHAPE_ERROR_INVALID_INIT,
     !!                       SHAPE_ERROR_TOO_MANY_PARAMS or SHAPE_ERROR_INVALID_GRID
     subroutine cache_init_s(cache, n_params, n_points, thetas, status)
@@ -1143,6 +1200,7 @@ contains
         integer(kind = ik), intent(out) :: status
 
         integer(kind = ik) :: masks(FOS_N_INTERMEDIATES)
+        integer :: alloc_stat
 
         ! c is mandatory, so an empty parameter vector has no shape to describe.
         if (n_params < 1_ik) then
@@ -1150,7 +1208,21 @@ contains
             return
         end if
 
-        allocate(cache%tables)
+        ! The same theta floor `tables_init_s` applies. `build_tables_s` below is
+        ! the permissive worker the theta-less tier-1 forms share, so the floor
+        ! has to be stated here: a cache with no theta nodes can serve no
+        ! R(theta) output, and the two init paths must not disagree about what a
+        ! usable handle is.
+        if (size(thetas, kind = ik) < 1_ik) then
+            status = SHAPE_ERROR_INVALID_GRID
+            return
+        end if
+
+        allocate(cache%tables, stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = SHAPE_ERROR_INVALID_GRID
+            return
+        end if
         call build_tables_s(cache%tables, n_points, thetas, FOS_TABLES_K_MAX, status)
         if (status /= SHAPE_VALID) then
             deallocate(cache%tables)
@@ -1169,7 +1241,11 @@ contains
             return
         end if
 
-        call cache_alloc_buffers_s(cache)
+        call cache_alloc_buffers_s(cache, status)
+        if (status /= SHAPE_VALID) then
+            call cache_free_s(cache)
+            return
+        end if
         cache%n_params = n_params
 
     end subroutine cache_init_s
@@ -1185,7 +1261,8 @@ contains
     !! @param[in]  tables    Initialized shared tables; declared `target` by the caller
     !! @param[in]  n_params  1 <= n_params <= SHAPE_CACHE_MAX_PARAMS
     !! @param[out] status    SHAPE_VALID, SHAPE_ERROR_TABLES_NOT_INITIALIZED,
-    !!                       SHAPE_ERROR_INVALID_INIT or SHAPE_ERROR_TOO_MANY_PARAMS
+    !!                       SHAPE_ERROR_INVALID_INIT, SHAPE_ERROR_TOO_MANY_PARAMS
+    !!                       or SHAPE_ERROR_INVALID_GRID (buffers unallocatable)
     subroutine cache_init_shared_s(cache, tables, n_params, status)
 
         type(cache_t), intent(out) :: cache
@@ -1210,7 +1287,11 @@ contains
         cache%tables => tables
         cache%owns_tables = .false.
 
-        call cache_alloc_buffers_s(cache)
+        call cache_alloc_buffers_s(cache, status)
+        if (status /= SHAPE_VALID) then
+            call cache_free_s(cache)
+            return
+        end if
         cache%n_params = n_params
 
     end subroutine cache_init_shared_s
@@ -1708,14 +1789,18 @@ contains
     !> R(theta) at caller-supplied theta nodes, standalone.
     !!
     !! Gate order matches `cache_radius_grid_s`: the parameter-vector gates (1,
-    !! 102), the grid (invalid grid, covering both `n_points` and the theta
-    !! range), the shape gates (103, 100, 101), the buffer size (105), then the
-    !! Newton solve (104).
+    !! 102), the grid (invalid grid, covering `n_points`, the theta range and an
+    !! empty theta set), the shape gates (103, 100, 101), the buffer size (105),
+    !! then the Newton solve (104).
+    !!
+    !! An empty theta set is a grid rejection here, not an empty answer: this
+    !! form exists to produce R(theta), and the same floor holds at every init
+    !! path that carries thetas.
     !!
     !! Every failure zero-fills the ENTIRE actual extent of `radii`.
     !!
     !! @param[in]  params    FoS parameters, 1 to FOS_MAX_PARAMS entries
-    !! @param[in]  thetas    Polar angles in [0, pi]
+    !! @param[in]  thetas    Polar angles in [0, pi], at least one
     !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
     !! @param[out] radii     R(theta), size(thetas) long
     !! @param[out] status    SHAPE_VALID on success, else the rejecting code
@@ -1738,6 +1823,12 @@ contains
             return
         end if
 
+        if (st%tables%n_theta < 1_ik) then
+            status = SHAPE_ERROR_INVALID_GRID
+            radii = 0.0_rk
+            return
+        end if
+
         call sa_gate_s(st, .true., status)
         if (status /= SHAPE_VALID) then
             radii = 0.0_rk
@@ -1750,10 +1841,6 @@ contains
             radii = 0.0_rk
             return
         end if
-
-        ! An empty theta set is a well-formed (empty) answer, and `tables%thetas`
-        ! is unallocated then — there is nothing to pass to the solver.
-        if (n < 1_ik) return
 
         ! The derivative lands in a write-only sink: the shared solver always
         ! produces one, and this form does not report it.
@@ -1772,7 +1859,7 @@ contains
     !! the two forms agree bitwise on identical input.
     !!
     !! @param[in]  params     FoS parameters, 1 to FOS_MAX_PARAMS entries
-    !! @param[in]  thetas     Polar angles in [0, pi]
+    !! @param[in]  thetas     Polar angles in [0, pi], at least one
     !! @param[in]  n_points   u-grid resolution, >= FOS_N_POINTS_FLOOR
     !! @param[out] radii      R(theta), size(thetas) long
     !! @param[out] dr_dtheta  dR/dtheta, size(thetas) long
@@ -1797,6 +1884,12 @@ contains
             return
         end if
 
+        if (st%tables%n_theta < 1_ik) then
+            status = SHAPE_ERROR_INVALID_GRID
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
         call sa_gate_s(st, .true., status)
         if (status /= SHAPE_VALID) then
             call zero_fill_pair_s(radii, dr_dtheta)
@@ -1809,8 +1902,6 @@ contains
             call zero_fill_pair_s(radii, dr_dtheta)
             return
         end if
-
-        if (n < 1_ik) return
 
         bundle = fos_bundle_f(params, st%z_shift_total, st%rho_max)
         call solve_thetas_s(bundle, st%tables%thetas, radii, dr_dtheta, status)
@@ -2347,22 +2438,35 @@ contains
     !===========================================================================
 
     !> Allocates the per-shape buffers to the tables' resolution.
-    subroutine cache_alloc_buffers_s(cache)
+    !!
+    !! A resolution the heap cannot satisfy is SHAPE_ERROR_INVALID_GRID, the
+    !! same verdict `build_tables_s` gives an unsatisfiable grid: nothing is
+    !! aborted, and the caller frees the half-built cache.
+    !!
+    !! @param[in,out] cache   Cache whose tables are already built
+    !! @param[out]    status  SHAPE_VALID, or SHAPE_ERROR_INVALID_GRID
+    subroutine cache_alloc_buffers_s(cache, status)
 
         type(cache_t), intent(inout) :: cache
+        integer(kind = ik), intent(out) :: status
 
         integer(kind = ik) :: n_points, n_theta
+        integer :: alloc_stat
 
         n_points = cache%tables%n_points
         n_theta = cache%tables%n_theta
 
-        allocate(cache%f_grid(n_points), cache%fp_grid(n_points))
-        allocate(cache%z(n_points), cache%rho(n_points), cache%drho_dz(n_points))
-
-        ! Zero-length for the theta-less tier-1 forms: the R(theta) outputs then
-        ! accept only a zero-length buffer, which is the correct contract.
-        allocate(cache%radii(n_theta), cache%dr_scratch(n_theta))
-        allocate(cache%radii_d(n_theta), cache%dr_dtheta(n_theta))
+        ! Zero-length theta buffers are legal (the theta-less tier-1 forms): the
+        ! R(theta) outputs then accept only a zero-length buffer, which is the
+        ! correct contract.
+        allocate(cache%f_grid(n_points), cache%fp_grid(n_points), &
+                cache%z(n_points), cache%rho(n_points), cache%drho_dz(n_points), &
+                cache%radii(n_theta), cache%dr_scratch(n_theta), &
+                cache%radii_d(n_theta), cache%dr_dtheta(n_theta), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = SHAPE_ERROR_INVALID_GRID
+            return
+        end if
 
         cache%f_grid = 0.0_rk
         cache%fp_grid = 0.0_rk
@@ -2373,6 +2477,8 @@ contains
         cache%dr_scratch = 0.0_rk
         cache%radii_d = 0.0_rk
         cache%dr_dtheta = 0.0_rk
+
+        status = SHAPE_VALID
 
     end subroutine cache_alloc_buffers_s
 

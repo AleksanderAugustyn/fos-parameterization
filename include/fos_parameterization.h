@@ -58,16 +58,28 @@
  *   size must equal the handle's own extent — n_theta for the radius grids,
  *   n_points for the rho(z) grid, size(thetas) for the at-thetas form.
  *   A mismatch returns FOS_ERROR_BUFFER_MISMATCH (105) with the outputs
- *   zero-filled; nothing is written past the caller's stated size.
+ *   zero-filled; nothing is written past the caller's stated size. A wrong
+ *   size is checked before the shape is judged, so it outranks every shape
+ *   rejection: a beak-invalid shape passed with the wrong n_radii reports 105,
+ *   not 103. Only a NULL or closed handle (2) and a wrong n_params (4) outrank
+ *   it — the precedence is 2 > 4 > 105 > the shape gates.
  *
  *   A stated size MUST also be the ACTUAL extent of the buffer you pass. It is
  *   a contract, not a bound the library can verify: on the 105 path the
  *   library zero-fills exactly the stated number of elements, so a size larger
  *   than your real buffer is undefined behavior no check can catch. What 105
  *   guarantees is that a size which is merely wrong — but honest about your
- *   own memory — is reported rather than computed on. Negative sizes are read
- *   as zero and therefore also report 105. Internal marshalling buffers are
- *   heap-allocated, so an outsized size argument can never overflow the stack.
+ *   own memory — is reported rather than computed on. A negative size is not
+ *   an extent: every cached compute reports it as 105 and writes nothing. The
+ *   flat tier-1 calls have no handle extent to mismatch, so a negative size is
+ *   a bad C argument there and reports FOS_ERROR_INVALID_INIT (5) instead.
+ *   Internal marshalling buffers are heap-allocated, so an outsized size
+ *   argument can never overflow the stack.
+ *
+ * Resolution the process cannot allocate:
+ *   A handle's tables and per-shape buffers are sized from your n_points and
+ *   n_theta. A request the heap cannot satisfy is reported, never aborted: the
+ *   _create functions return NULL, exactly as for any other rejected grid.
  *
  * Frames:
  *   The R(theta) outputs and fos_param_*shape / *star_convexity_optimum
