@@ -1,8 +1,9 @@
 !> Cache suite: `cache_t` lifecycle, `shape_engine_t` wiring, and the first
 !! cached output (`cache_rho_z_grid_s`).
 !!
-!! Parity anchor is the OLD 1.x grid workflow (`compute_rho_z_grid_s` +
-!! `compute_fos_z_shift_f`): the cached cylindrical output must reproduce it
+!! Parity anchor is the raw evaluator `compute_rho_at_z_s` driven over the 1.x
+!! grid formula, plus a z-shift literal frozen from the 1.x
+!! `compute_fos_z_shift_f`: the cached cylindrical output must reproduce them
 !! node-for-node, including `drho_dz`. The two paths derive u differently
 !! (tabled u_i vs z*(1/c)), so the comparison is to a tight tolerance, not
 !! bitwise.
@@ -17,8 +18,7 @@ program fos_param_cache_test
     use fos_parameterization_mod, only: cache_t, cache_init_s, cache_init_shared_s, &
             cache_free_s, cache_rho_z_grid_s, cache_recompute_count_f, &
             tables_t, tables_init_s, tables_free_s, &
-            rho_z_grid_t, compute_rho_z_grid_s, validate_rho_grid_s, &
-            compute_fos_z_shift_f, &
+            compute_rho_at_z_s, compute_rho_z_grid_standalone_s, &
             FOS_ERROR_INVALID_C, FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_BUFFER_MISMATCH
     use fos_parameterization_workers_mod, only: fos_masks_f
     use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
@@ -35,21 +35,30 @@ program fos_param_cache_test
     real(kind = rk), parameter :: PARAMS7(N_PARAMS) = &
             [1.5_rk, 0.1_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk, 0.002_rk]
 
+    !> Intrinsic z-shift of PARAMS7, frozen from the 1.x `compute_fos_z_shift_f`
+    !! at commit 648428c (the last commit carrying that surface). The 1.x
+    !! function is gone and its 2.0 counterpart is the code under test, so the
+    !! captured number is the anchor.
+    real(kind = rk), parameter :: ZS_PARAMS7_1X = 6.565141402540683E-002_rk
+
+    !> a3 of the (c = 1) family whose interior rho pinches shut — the 1.x probe
+    !! scan's first grid point, frozen from that surface.
+    real(kind = rk), parameter :: RHO_NEG_A3_1X = 0.90_rk
+
     type(cache_t)      :: cache
     type(tables_t), target :: shared_tables
     type(tables_t)     :: dead_tables
-    type(rho_z_grid_t) :: grid
     integer(kind = ik) :: status, i, err_code
     integer(kind = ik) :: masks(8)
     real(kind = rk)    :: thetas(4)
     real(kind = rk)    :: params_step(N_PARAMS), params_bad_c(N_PARAMS)
-    real(kind = rk)    :: params_rho(N_PARAMS), a3
+    real(kind = rk)    :: params_rho(N_PARAMS)
+    real(kind = rk)    :: rho_ref, drho_ref, z_ref, dz_ref, c_ref
     real(kind = rk)    :: z(N_POINTS), rho(N_POINTS), drho_dz(N_POINTS)
     real(kind = rk)    :: z_shift, zs_ref
     real(kind = rk)    :: big_z(N_POINTS + 3_ik), big_rho(N_POINTS + 3_ik)
     real(kind = rk)    :: big_drho(N_POINTS + 3_ik)
     logical            :: all_zero
-    character(len = 256) :: message
 
     do i = 1_ik, 4_ik
         thetas(i) = real(i, rk) * PI_C / 5.0_rk
@@ -147,19 +156,25 @@ program fos_param_cache_test
     call cache_rho_z_grid_s(cache, PARAMS7, z, rho, drho_dz, z_shift, status)
     call assert_int_eq(status, SHAPE_VALID, 'rho_z_grid valid')
 
-    call compute_rho_z_grid_s(PARAMS7, N_POINTS, grid, err_code, message)
-    call assert_int_eq(err_code, SHAPE_VALID, 'reference grid built')
-    zs_ref = compute_fos_z_shift_f(PARAMS7)
-    call assert_abs_close(z_shift, zs_ref, 0.0_rk, 'z_shift bitwise-parity')
+    zs_ref = ZS_PARAMS7_1X
+    call assert_abs_close(z_shift, zs_ref, 0.0_rk, 'z_shift bitwise-parity with 1.x')
+
+    ! Node reference: the raw evaluator on the 1.x grid formula
+    ! (z_i = -c + (i-1) dz, dz = 2c/(n-1), unshifted frame), which is literally
+    ! what the deleted compute_rho_z_grid_s did at every node.
+    c_ref = PARAMS7(1)
+    dz_ref = 2.0_rk * c_ref / real(N_POINTS - 1_ik, rk)
 
     all_zero = .true.
     do i = 1_ik, N_POINTS
-        call assert_abs_close(z(i), grid%z(i) + zs_ref, 1.0e-14_rk, 'z node parity')
-        call assert_abs_close(rho(i), grid%rho(i), 1.0e-14_rk, 'rho node parity')
+        z_ref = -c_ref + real(i - 1_ik, rk) * dz_ref
+        call compute_rho_at_z_s(PARAMS7, z_ref, 0.0_rk, rho_ref, drho_ref)
+        call assert_abs_close(z(i), z_ref + zs_ref, 1.0e-14_rk, 'z node parity')
+        call assert_abs_close(rho(i), rho_ref, 1.0e-14_rk, 'rho node parity')
         ! drho_dz is the u-derivative amplified by 1/sqrt(f) near the tips, so
         ! the ~1 ulp difference in u between the two paths is magnified there:
         ! relative, not absolute, tolerance (observed worst case ~1e-15 relative).
-        call assert_close(drho_dz(i), grid%drho_dz(i), 1.0e-13_rk, 'drho_dz node parity')
+        call assert_close(drho_dz(i), drho_ref, 1.0e-13_rk, 'drho_dz node parity')
         if (i > 1_ik .and. i < N_POINTS) then
             if (abs(drho_dz(i)) > 0.0_rk) all_zero = .false.
         end if
@@ -217,24 +232,17 @@ program fos_param_cache_test
             '102 zero-fills')
 
     !---------------------------------------------------------------------------
-    ! rho <= 0 in the interior: 100. Never hardcode an unverified vector —
-    ! confirm the rejection against the OLD validate_rho_grid_s path first, and
-    ! probe a3 upward if the first guess is accepted.
+    ! rho <= 0 in the interior: 100. The vector is RHO_NEG_A3_1X, frozen from
+    ! the 1.x probe; the tier-1 cylindrical form (same gate, no cache) is
+    ! re-checked here so the two tiers are known to agree on the verdict.
     !---------------------------------------------------------------------------
     params_rho = 0.0_rk
     params_rho(1) = 1.0_rk
-    params_rho(2) = 0.9_rk
-    call probe_old_rho_s(params_rho, err_code)
-    if (err_code /= FOS_ERROR_RHO_NEGATIVE) then
-        do i = 0_ik, 120_ik
-            a3 = 0.90_rk + 5.0e-3_rk * real(i, rk)
-            params_rho(2) = a3
-            call probe_old_rho_s(params_rho, err_code)
-            if (err_code == FOS_ERROR_RHO_NEGATIVE) exit
-        end do
-    end if
+    params_rho(2) = RHO_NEG_A3_1X
+    call compute_rho_z_grid_standalone_s(params_rho, N_POINTS, big_z(1:N_POINTS), &
+            big_rho(1:N_POINTS), big_drho(1:N_POINTS), z_shift, err_code)
     call assert_int_eq(err_code, FOS_ERROR_RHO_NEGATIVE, &
-            'probe vector is rho-rejected by the 1.x surface')
+            'probe vector is rho-rejected by the tier-1 form too')
 
     z = 1.0_rk
     call cache_rho_z_grid_s(cache, params_rho, z, rho, drho_dz, z_shift, status)
@@ -283,20 +291,5 @@ contains
             if (abs(a(j)) > 0.0_rk) zeroed = .false.
         end do
     end function all_zero_f
-
-    !> Runs the 1.x grid + validation path purely for its rejection code.
-    subroutine probe_old_rho_s(p, code)
-        real(kind = rk), intent(in) :: p(:)
-        integer(kind = ik), intent(out) :: code
-
-        type(rho_z_grid_t) :: probe_grid
-        character(len = 256) :: probe_message
-        logical :: is_valid
-
-        call compute_rho_z_grid_s(p, N_POINTS, probe_grid, code, probe_message)
-        if (code /= 0_ik) return
-        call validate_rho_grid_s(probe_grid, p, is_valid, code, probe_message)
-
-    end subroutine probe_old_rho_s
 
 end program fos_param_cache_test

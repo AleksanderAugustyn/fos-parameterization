@@ -1,18 +1,19 @@
 !> Worker-kernel suite: status-reporting a2/z_shift, tabled f-grid and beak
 !! scan, rho scaling, and the bounded-bracket Newton radius core.
 !!
-!! Parity anchors are the 1.x publics (`compute_fos_a2_f`,
-!! `compute_fos_z_shift_f`, `compute_fos_f_and_derivatives_s`): the kernels
-!! must reproduce them node-for-node, bitwise where the arithmetic is
-!! identical.
+!! Parity anchors survive the 1.x removal in three forms: the raw evaluators
+!! that stayed public (`get_fos_coefficient_f`, whose k = 2 branch IS the
+!! volume-constraint a2, and `compute_fos_f_and_derivatives_s`), and — where
+!! the 1.x routine was deleted outright — a literal frozen from that surface
+!! before it went (`ZS_PARAMS7_1X`, `BEAK_A4_1X`). The kernels must reproduce
+!! them node-for-node, bitwise where the arithmetic is identical.
 program fos_param_workers_test
 
     use precision_utilities_mod, only: ik, rk
     use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: compute_a2_s, compute_z_shift_s, &
-            compute_fos_a2_f, compute_fos_z_shift_f, &
-            compute_fos_f_and_derivatives_s, FOS_ERROR_INVALID_C, &
-            FOS_ERROR_BEAK_SINGULARITY
+            get_fos_coefficient_f, compute_fos_f_and_derivatives_s, &
+            FOS_ERROR_INVALID_C
     use fos_parameterization_workers_mod, only: tables_t, tables_init_s, &
             tables_free_s, fos_bundle_t, compute_f_grid_s, beak_scan_f_min_s, &
             scale_rho_grid_s, newton_radius_s
@@ -25,17 +26,28 @@ program fos_param_workers_test
     real(kind = rk), parameter :: PARAMS7(7) = &
             [1.5_rk, 0.1_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk, 0.002_rk]
 
+    !> Frozen 1.x anchors, captured from `compute_fos_z_shift_f` and the 1.x
+    !! beak probe at commit 648428c, the last commit that carried that surface.
+    !! `compute_fos_z_shift_f` has no 2.0 counterpart to compare against (the
+    !! status form `compute_z_shift_s` IS the code under test), so the number
+    !! itself is the anchor.
+    real(kind = rk), parameter :: ZS_PARAMS7_1X = 6.565141402540683E-002_rk
+
+    !> a4 of the symmetric (c = 2) family that the 1.x surface rejected as a
+    !! beak: the first grid point of the 1.x probe scan (0.60 + 5e-4 k) with
+    !! f_min < F_MIN_THRESHOLD. f(0) = 1 - 4 a4 / 3 = 6.67e-4 there.
+    real(kind = rk), parameter :: BEAK_A4_1X = 0.7495_rk
+
     type(tables_t)     :: tables
     type(fos_bundle_t) :: bundle
-    integer(kind = ik) :: status, i, err_code
+    integer(kind = ik) :: status, i
     real(kind = rk)    :: thetas(4), params51(51), params_beak(3)
-    real(kind = rk)    :: a2_new, zs, f_ref, fp_ref, f_min, a4
+    real(kind = rk)    :: a2_new, zs, f_ref, fp_ref, f_min
     real(kind = rk)    :: r, dr, rho_max, c_oblate
     real(kind = rk)    :: f_grid(N_POINTS), fp_grid(N_POINTS)
     real(kind = rk)    :: z(N_POINTS), rho(N_POINTS), drho_dz(N_POINTS)
     logical            :: beak_ok, rho_positive, converged
-    ! NOTE (-Werror hygiene): declare ONLY what this program uses; the
-    ! contained probe declares its own scratch outputs.
+    ! NOTE (-Werror hygiene): declare ONLY what this program uses.
 
     do i = 1_ik, 4_ik
         thetas(i) = real(i, rk) * PI_C / 5.0_rk
@@ -45,11 +57,14 @@ program fos_param_workers_test
     call assert_int_eq(int(status), int(SHAPE_VALID), 'tables built')
 
     !---------------------------------------------------------------------------
-    ! a2: parity with the 1.x pure function, empty ok, oversize rejected
+    ! a2: parity with the raw coefficient reader, empty ok, oversize rejected
     !---------------------------------------------------------------------------
     call compute_a2_s(PARAMS7, a2_new, status)
     call assert_int_eq(int(status), int(SHAPE_VALID), 'a2 valid')
-    call assert_abs_close(a2_new, compute_fos_a2_f(PARAMS7), 0.0_rk, 'a2 bitwise-parity')
+    ! get_fos_coefficient_f(p, 2) is the surviving public spelling of the 1.x
+    ! volume-constraint a2 — same code, so the comparison is exact.
+    call assert_abs_close(a2_new, get_fos_coefficient_f(PARAMS7, 2_ik), 0.0_rk, &
+            'a2 bitwise-parity')
 
     call compute_a2_s(PARAMS7(1:0), a2_new, status)
     call assert_int_eq(int(status), int(SHAPE_VALID), 'a2 empty ok')
@@ -66,7 +81,7 @@ program fos_param_workers_test
     !---------------------------------------------------------------------------
     call compute_z_shift_s(PARAMS7, zs, status)
     call assert_int_eq(int(status), int(SHAPE_VALID), 'z_shift valid')
-    call assert_abs_close(zs, compute_fos_z_shift_f(PARAMS7), 0.0_rk, 'z_shift parity')
+    call assert_abs_close(zs, ZS_PARAMS7_1X, 0.0_rk, 'z_shift bitwise-parity with 1.x')
 
     call compute_z_shift_s(PARAMS7(1:0), zs, status)
     call assert_int_eq(int(status), int(FOS_ERROR_INVALID_C), 'z_shift empty -> 102')
@@ -86,23 +101,11 @@ program fos_param_workers_test
     !---------------------------------------------------------------------------
     ! Beak scan: sphere passes; a vector the 1.x surface rejects as a beak fails
     !---------------------------------------------------------------------------
-    ! Never hardcode an unverified vector: confirm the rejection against the OLD
-    ! surface, and if [2.0, 0.0, 0.72] is not rejected, probe a4 in 0.60..0.80
-    ! and adopt the first a4 that is.
+    ! The vector is not a guess: BEAK_A4_1X is what the 1.x probe scan settled
+    ! on, frozen from that surface before it was deleted (see the declaration).
     params_beak(1) = 2.0_rk
     params_beak(2) = 0.0_rk
-    params_beak(3) = 0.72_rk
-    call probe_old_surface_s(params_beak, err_code)
-    if (err_code /= FOS_ERROR_BEAK_SINGULARITY) then
-        do i = 0_ik, 400_ik
-            a4 = 0.60_rk + 5.0e-4_rk * real(i, rk)
-            params_beak(3) = a4
-            call probe_old_surface_s(params_beak, err_code)
-            if (err_code == FOS_ERROR_BEAK_SINGULARITY) exit
-        end do
-    end if
-    call assert_int_eq(int(err_code), int(FOS_ERROR_BEAK_SINGULARITY), &
-            'probe vector is beak-rejected by the 1.x surface')
+    params_beak(3) = BEAK_A4_1X
 
     call beak_scan_f_min_s(tables, [1.0_rk], f_min, beak_ok)
     call assert_true(beak_ok, 'sphere passes beak scan')
@@ -173,22 +176,5 @@ program fos_param_workers_test
 
     call tables_free_s(tables)
     call test_summary()
-
-contains
-
-    !> Runs the 1.x radius-grid entry point purely for its rejection code.
-    subroutine probe_old_surface_s(p, code)
-        use fos_parameterization_mod, only: compute_fos_radius_grid_s
-        real(kind = rk), intent(in) :: p(:)
-        integer(kind = ik), intent(out) :: code
-
-        real(kind = rk) :: radii(64), z_shift_out
-        logical :: is_valid
-        character(len = 256) :: message
-
-        call compute_fos_radius_grid_s(p, 64_ik, radii, z_shift_out, is_valid, &
-                message, n_rho_grid = N_POINTS, error_code = code)
-
-    end subroutine probe_old_surface_s
 
 end program fos_param_workers_test

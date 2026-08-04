@@ -191,8 +191,9 @@ def radius_and_derivative(params: npt.ArrayLike, thetas: npt.ArrayLike,
                           z_shift: float) -> RadiusDerivativeResult:
     """Batch R(theta) and analytic dR/dtheta at caller-supplied thetas.
 
-    z_shift must come from shape(); degenerate params yield the unit-sphere
-    fallback (r = 1, dr_dtheta = 0) — a library guarantee, not an error.
+    z_shift must come from shape(). The 1.x unit-sphere fallback for degenerate
+    params is withdrawn: an empty vector or c <= C_MIN is a rejection
+    (Status.ERROR_INVALID_C) with zero-filled outputs.
     """
     arr = _as_params(params)
     t = np.ascontiguousarray(thetas, dtype=np.float64)

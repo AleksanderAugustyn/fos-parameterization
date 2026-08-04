@@ -10,8 +10,9 @@ module fos_test_reference_mod
     use precision_utilities_mod, only: ik, rk
     use mathematical_and_physical_constants_mod, only: PI_C
     use mathematical_utilities_mod, only: compute_gauss_legendre_quadrature_s
-    use fos_parameterization_mod, only: compute_radius_at_theta_s, compute_rho_at_z_s, &
-            compute_fos_f_and_derivatives_s
+    use fos_parameterization_mod, only: compute_rho_at_z_s, &
+            compute_fos_f_and_derivatives_s, compute_radius_and_derivative_standalone_s, &
+            SHAPE_VALID
 
     implicit none
 
@@ -74,17 +75,42 @@ contains
     !!   dR/dtheta = (R cos(theta) + rho' R sin(theta)) / (rho' cos(theta) - sin(theta))
     !! using the exact rho' from compute_rho_at_z_s - no finite differences.
     !! Round-trip residual |R sin(theta) - rho(R cos(theta))| checks each node directly.
-    subroutine evaluate_shape_quality_s(params, z_shift, s_ref, dv_rel, ds_rel, rt_max)
+    !!
+    !! R(theta) comes from the tier-1 form, which resolves the shift itself from
+    !! (params, n_points). `z_shift` is the caller's copy of that same resolved
+    !! shift and is used only for the cylindrical side; pass the value the same
+    !! (params, n_points) produced. An inconsistent pair is not silent — the two
+    !! sides then describe different bodies and rt_max blows up.
+    !!
+    !! `status` is the tier-1 verdict: on a rejection every metric is returned
+    !! as huge(), so a caller that ignores it still fails its tolerance.
+    subroutine evaluate_shape_quality_s(params, n_points, z_shift, s_ref, &
+            dv_rel, ds_rel, rt_max, status)
         real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: n_points
         real(kind = rk), intent(in) :: z_shift
         real(kind = rk), intent(in) :: s_ref
         real(kind = rk), intent(out) :: dv_rel
         real(kind = rk), intent(out) :: ds_rel
         real(kind = rk), intent(out) :: rt_max
+        integer(kind = ik), intent(out) :: status
 
         integer(kind = ik) :: i
-        real(kind = rk) :: x, sin_theta, theta, r, z, rho, drho_dz
+        real(kind = rk) :: x, sin_theta, r, z, rho, drho_dz
         real(kind = rk) :: denom, dr_dtheta, vol, surf
+        real(kind = rk) :: thetas(N_GL_THETA), radii(N_GL_THETA), dr_sink(N_GL_THETA)
+
+        dv_rel = huge(1.0_rk)
+        ds_rel = huge(1.0_rk)
+        rt_max = huge(1.0_rk)
+
+        do i = 1_ik, N_GL_THETA
+            thetas(i) = acos(gl_theta_x(i))
+        end do
+
+        call compute_radius_and_derivative_standalone_s(params, thetas, n_points, &
+                radii, dr_sink, status)
+        if (status /= SHAPE_VALID) return
 
         vol = 0.0_rk
         surf = 0.0_rk
@@ -93,9 +119,7 @@ contains
         do i = 1_ik, N_GL_THETA
             x = gl_theta_x(i)
             sin_theta = sqrt(max(1.0_rk - x**2, 0.0_rk))
-            theta = acos(x)
-
-            call compute_radius_at_theta_s(params, theta, z_shift, r)
+            r = radii(i)
             vol = vol + gl_theta_w(i) * r**3
 
             z = r * x

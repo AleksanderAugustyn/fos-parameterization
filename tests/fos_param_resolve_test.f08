@@ -1,7 +1,9 @@
 !> Resolve suite: the origin/star-convexity intermediate (#6) and the cached
 !! shape output (`cache_shape_s`).
 !!
-!! Parity anchor is the OLD 1.x resolve step (`compute_fos_shape_s`): total
+!! Parity anchor is the tier-1 resolve (`compute_shape_standalone_s`), which
+!! runs the same gates outside the cache, plus z-shift literals frozen from the
+!! deleted 1.x `compute_fos_shape_s` before it went (commit 648428c): total
 !! z-shift and both pole radii must match it to 1e-12 relative. The comparison
 !! is NOT bitwise — the cached path derives u from the trig tables while 1.x
 !! computes z*(1/c) — but the ORIGIN BRANCH is exact: a COM-conditioned shape
@@ -16,7 +18,7 @@ program fos_param_resolve_test
     use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
             cache_shape_s, cache_rho_z_grid_s, cache_recompute_count_f, &
-            compute_z_shift_s, compute_fos_shape_s, &
+            compute_z_shift_s, compute_shape_standalone_s, &
             FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_NOT_STAR_CONVEX, &
             FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_INVALID_C
     use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_WRONG_PARAM_COUNT
@@ -32,6 +34,20 @@ program fos_param_resolve_test
             [1.5_rk, 0.1_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk, 0.002_rk]
     real(kind = rk), parameter :: ASYM7(N_PARAMS) = &
             [1.8_rk, 0.15_rk, 0.1_rk, 0.08_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+
+    !> Total z-shifts the 1.x `compute_fos_shape_s` resolved at N_POINTS,
+    !! frozen from commit 648428c (the last commit carrying that surface). The
+    !! pole radii are not frozen separately: they are c + z_shift and
+    !! |-c + z_shift| by definition, and asserting that identity against the
+    !! frozen shift is the stronger statement.
+    real(kind = rk), parameter :: SHIFT_PARAMS7_1X = 6.565141402540683E-002_rk
+    real(kind = rk), parameter :: SHIFT_ASYM7_1X = 9.453803619658581E-002_rk
+
+    !> The marginal-origin vector the 1.x probe settled on (ODD_HEAVY at
+    !! c = 1.0) and the total shift it resolved there — the optimum branch, not
+    !! the COM branch. Frozen from the same commit.
+    real(kind = rk), parameter :: MARGINAL_C_1X = 1.0_rk
+    real(kind = rk), parameter :: SHIFT_MARGINAL_1X = 5.667639178165991E-001_rk
 
     !> Odd-heavy asymmetric family. Its COM is a poor R(theta) origin, so it
     !! takes the star-convexity optimum instead; raising c drives g(s*) up
@@ -85,11 +101,12 @@ program fos_param_resolve_test
     !---------------------------------------------------------------------------
     call cache_shape_s(cache, PARAMS7, z_shift, r_north, r_south, status)
     call assert_int_eq(status, SHAPE_VALID, 'params7 shape valid')
-    call probe_old_s(PARAMS7, code, ref_shift, ref_north, ref_south)
-    call assert_int_eq(code, SHAPE_VALID, 'params7 accepted by the 1.x surface')
-    call assert_close(z_shift, ref_shift, 1.0e-12_rk, 'params7 z_shift parity')
-    call assert_close(r_north, ref_north, 1.0e-12_rk, 'params7 r_north parity')
-    call assert_close(r_south, ref_south, 1.0e-12_rk, 'params7 r_south parity')
+    call probe_tier1_s(PARAMS7, code, ref_shift, ref_north, ref_south)
+    call assert_int_eq(code, SHAPE_VALID, 'params7 accepted by the tier-1 resolve')
+    call assert_close(z_shift, ref_shift, 1.0e-12_rk, 'params7 z_shift tier parity')
+    call assert_close(r_north, ref_north, 1.0e-12_rk, 'params7 r_north tier parity')
+    call assert_close(r_south, ref_south, 1.0e-12_rk, 'params7 r_south tier parity')
+    call assert_close(z_shift, SHIFT_PARAMS7_1X, 1.0e-12_rk, 'params7 z_shift 1.x parity')
 
     ! COM branch: the origin search adds exactly nothing (within-2.0.0, exact)
     call compute_z_shift_s(PARAMS7, zs_intrinsic, status)
@@ -104,11 +121,12 @@ program fos_param_resolve_test
 
     call cache_shape_s(cache, ASYM7, z_shift, r_north, r_south, status)
     call assert_int_eq(status, SHAPE_VALID, 'asym shape valid')
-    call probe_old_s(ASYM7, code, ref_shift, ref_north, ref_south)
-    call assert_int_eq(code, SHAPE_VALID, 'asym accepted by the 1.x surface')
-    call assert_close(z_shift, ref_shift, 1.0e-12_rk, 'asym z_shift parity')
-    call assert_close(r_north, ref_north, 1.0e-12_rk, 'asym r_north parity')
-    call assert_close(r_south, ref_south, 1.0e-12_rk, 'asym r_south parity')
+    call probe_tier1_s(ASYM7, code, ref_shift, ref_north, ref_south)
+    call assert_int_eq(code, SHAPE_VALID, 'asym accepted by the tier-1 resolve')
+    call assert_close(z_shift, ref_shift, 1.0e-12_rk, 'asym z_shift tier parity')
+    call assert_close(r_north, ref_north, 1.0e-12_rk, 'asym r_north tier parity')
+    call assert_close(r_south, ref_south, 1.0e-12_rk, 'asym r_south tier parity')
+    call assert_close(z_shift, SHIFT_ASYM7_1X, 1.0e-12_rk, 'asym z_shift 1.x parity')
 
     call compute_z_shift_s(ASYM7, zs_intrinsic, status)
     call assert_true(bits_eq_f(z_shift, zs_intrinsic), &
@@ -146,27 +164,24 @@ program fos_param_resolve_test
     !---------------------------------------------------------------------------
     ! Marginal origin branch: the COM is too steep, so s* is taken
     !---------------------------------------------------------------------------
-    ! Probe rule: adopt the first c whose 1.x resolve accepts the shape AND
-    ! returns a z_shift different from the intrinsic one (= the optimum branch).
+    ! MARGINAL_C_1X is the c the 1.x probe settled on: accepted, and resolved to
+    ! a z_shift different from the intrinsic one (= the optimum branch). The
+    ! tier-1 resolve is re-run here so both tiers are known to agree on it.
     params_marginal = ODD_HEAVY
-    found = .false.
-    do i = 0_ik, 20_ik
-        params_marginal(1) = 1.0_rk - 0.025_rk * real(i, rk)
-        call probe_old_s(params_marginal, code, ref_shift, ref_north, ref_south)
-        if (code /= SHAPE_VALID) cycle
-        call compute_z_shift_s(params_marginal, zs_intrinsic, status)
-        if (.not. bits_eq_f(ref_shift, zs_intrinsic)) then
-            found = .true.
-            exit
-        end if
-    end do
-    call assert_true(found, 'probe found a marginal-origin vector on the 1.x surface')
+    params_marginal(1) = MARGINAL_C_1X
+    call probe_tier1_s(params_marginal, code, ref_shift, ref_north, ref_south)
+    call assert_int_eq(code, SHAPE_VALID, 'marginal vector accepted by tier-1')
+    call compute_z_shift_s(params_marginal, zs_intrinsic, status)
+    found = .not. bits_eq_f(ref_shift, zs_intrinsic)
+    call assert_true(found, 'marginal vector takes the optimum origin on tier-1')
+    call assert_close(ref_shift, SHIFT_MARGINAL_1X, 1.0e-12_rk, &
+            'marginal z_shift 1.x parity')
 
     call cache_shape_s(cache, params_marginal, z_shift, r_north, r_south, status)
     call assert_int_eq(status, SHAPE_VALID, 'marginal vector accepted')
-    call assert_close(z_shift, ref_shift, 1.0e-12_rk, 'marginal z_shift parity')
-    call assert_close(r_north, ref_north, 1.0e-12_rk, 'marginal r_north parity')
-    call assert_close(r_south, ref_south, 1.0e-12_rk, 'marginal r_south parity')
+    call assert_close(z_shift, ref_shift, 1.0e-12_rk, 'marginal z_shift tier parity')
+    call assert_close(r_north, ref_north, 1.0e-12_rk, 'marginal r_north tier parity')
+    call assert_close(r_south, ref_south, 1.0e-12_rk, 'marginal r_south tier parity')
     call assert_true(.not. bits_eq_f(z_shift, zs_intrinsic), &
             'marginal vector takes the optimum, not the COM origin')
     call assert_true(abs(z_shift - zs_intrinsic) > 1.0e-3_rk, &
@@ -177,17 +192,12 @@ program fos_param_resolve_test
     !---------------------------------------------------------------------------
     params_beak = 0.0_rk
     params_beak(1) = 2.0_rk
+    ! a4 = 0.7495 is the vector the 1.x beak probe settled on, frozen here; the
+    ! tier-1 resolve must reject it the same way.
     params_beak(3) = 0.7495_rk
-    call probe_old_s(params_beak, code, ref_shift, ref_north, ref_south)
-    if (code /= FOS_ERROR_BEAK_SINGULARITY) then
-        do i = 0_ik, 400_ik
-            params_beak(3) = 0.60_rk + 5.0e-4_rk * real(i, rk)
-            call probe_old_s(params_beak, code, ref_shift, ref_north, ref_south)
-            if (code == FOS_ERROR_BEAK_SINGULARITY) exit
-        end do
-    end if
+    call probe_tier1_s(params_beak, code, ref_shift, ref_north, ref_south)
     call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
-            'probe vector is beak-rejected by the 1.x surface')
+            'probe vector is beak-rejected by the tier-1 resolve')
 
     call check_rejection_s(params_beak, FOS_ERROR_BEAK_SINGULARITY, 'beak vector -> 103')
 
@@ -200,17 +210,13 @@ program fos_param_resolve_test
     ! output, which never runs #4, still reports 100.
     params_rho = 0.0_rk
     params_rho(1) = 1.0_rk
+    ! a3 = 0.9 is the vector the 1.x rho probe settled on. Tier-1 applies the
+    ! same gate order as the cache, so the resolve reports 103 here too; the
+    ! 1.x verdict, 100, survives on the cylindrical form asserted below.
     params_rho(2) = 0.9_rk
-    call probe_old_s(params_rho, code, ref_shift, ref_north, ref_south)
-    if (code /= FOS_ERROR_RHO_NEGATIVE) then
-        do i = 0_ik, 120_ik
-            params_rho(2) = 0.90_rk + 5.0e-3_rk * real(i, rk)
-            call probe_old_s(params_rho, code, ref_shift, ref_north, ref_south)
-            if (code == FOS_ERROR_RHO_NEGATIVE) exit
-        end do
-    end if
-    call assert_int_eq(code, FOS_ERROR_RHO_NEGATIVE, &
-            'probe vector is rho-rejected by the 1.x surface')
+    call probe_tier1_s(params_rho, code, ref_shift, ref_north, ref_south)
+    call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
+            'probe vector is beak-gated by the tier-1 resolve')
 
     z = 1.0_rk
     rho = 1.0_rk
@@ -229,17 +235,12 @@ program fos_param_resolve_test
     !---------------------------------------------------------------------------
     ! Same odd-heavy family, walked up in c: g(s*) rises toward 0 until the
     ! margin rejects it.
+    ! c = 1.3 is the first elongation the 1.x probe rejected with 101, frozen.
     params_star = ODD_HEAVY
-    found = .false.
-    do i = 0_ik, 60_ik
-        params_star(1) = 1.3_rk + 0.05_rk * real(i, rk)
-        call probe_old_s(params_star, code, ref_shift, ref_north, ref_south)
-        if (code == FOS_ERROR_NOT_STAR_CONVEX) then
-            found = .true.
-            exit
-        end if
-    end do
-    call assert_true(found, 'probe found a non-star-convex vector on the 1.x surface')
+    params_star(1) = 1.3_rk
+    call probe_tier1_s(params_star, code, ref_shift, ref_north, ref_south)
+    call assert_int_eq(code, FOS_ERROR_NOT_STAR_CONVEX, &
+            'probe vector is 101-rejected by the tier-1 resolve')
 
     call check_rejection_s(params_star, FOS_ERROR_NOT_STAR_CONVEX, &
             'non-star-convex vector -> 101')
@@ -274,19 +275,18 @@ contains
         end do
     end function all_zero_f
 
-    !> The 1.x resolve step, for its verdict and its outputs.
-    subroutine probe_old_s(p, old_code, old_shift, old_north, old_south)
+    !> The tier-1 resolve at the cache's own resolution, for its verdict and
+    !! its outputs. Same gates, same order, no cache — the cross-tier oracle
+    !! that replaced the deleted 1.x resolve.
+    subroutine probe_tier1_s(p, tier1_code, tier1_shift, tier1_north, tier1_south)
         real(kind = rk), intent(in) :: p(:)
-        integer(kind = ik), intent(out) :: old_code
-        real(kind = rk), intent(out) :: old_shift, old_north, old_south
+        integer(kind = ik), intent(out) :: tier1_code
+        real(kind = rk), intent(out) :: tier1_shift, tier1_north, tier1_south
 
-        logical :: is_valid
-        character(len = 256) :: probe_message
+        call compute_shape_standalone_s(p, N_POINTS, tier1_shift, tier1_north, &
+                tier1_south, tier1_code)
 
-        call compute_fos_shape_s(p, N_POINTS, old_shift, old_north, old_south, &
-                is_valid, probe_message, old_code)
-
-    end subroutine probe_old_s
+    end subroutine probe_tier1_s
 
     !> A rejected shape zero-fills every output and returns the cache to cold:
     !! the next good call recomputes intermediates #1-#6 from scratch.

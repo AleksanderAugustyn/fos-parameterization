@@ -18,6 +18,10 @@
  * FOS_ERROR_INVALID_ARGUMENTS (5) is C-API-level only (bad n_grid / n_z);
  * codes 100+ mirror the Fortran FOS_* parameters exactly.
  *
+ * Internal rho(z) resolution: the library floors it at 100 nodes, so every
+ * call here uses max(100, requested). 1.x used the request verbatim; below
+ * the floor the resolved z-shift therefore moves slightly.
+ *
  * Thread safety: the library is stateless; all functions are safe to call
  * concurrently.
  */
@@ -85,7 +89,7 @@ int fos_compute_neck(
  * fos_compute_radius_and_derivative_at_thetas for any number of theta sets.
  * On any failure all numeric outputs are zero-filled.
  *
- * @param n_rho_grid  Internal rho(z) grid size, used verbatim (>= 2)
+ * @param n_rho_grid  Internal rho(z) grid size (>= 2, raised to the 100 floor)
  */
 int fos_compute_shape(
         const double* params, int n_params, int n_rho_grid,
@@ -94,14 +98,17 @@ int fos_compute_shape(
 
 /**
  * Batch R(theta) and analytic dR/dtheta at caller-supplied thetas in [0, pi].
- * z_shift must come from fos_compute_shape. Pure evaluation, no message
- * buffer: degenerate params (empty, c <= C_MIN) yield the unit-sphere
- * fallback r = 1, dr_dtheta = 0 — a library guarantee, not an error.
+ * z_shift must come from fos_compute_shape. No message buffer.
+ *
+ * The 1.x unit-sphere fallback for degenerate params is withdrawn: an empty
+ * vector or c <= C_MIN is now a rejection (FOS_ERROR_INVALID_C) with the
+ * outputs left zero-filled.
  *
  * @param thetas     n_thetas angles in [0, pi]
  * @param radii      Output buffer, n_thetas doubles
  * @param dr_dtheta  Output buffer, n_thetas doubles
- * @return           FOS_VALID, or FOS_ERROR_INVALID_ARGUMENTS if n_thetas < 1
+ * @return           FOS_VALID, FOS_ERROR_INVALID_ARGUMENTS if n_thetas < 1,
+ *                   or the rejecting status code
  */
 int fos_compute_radius_and_derivative_at_thetas(
         const double* params, int n_params,

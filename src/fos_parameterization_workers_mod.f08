@@ -108,12 +108,10 @@ module fos_parameterization_workers_mod
     !---------------------------------------------------------------------------
     ! Kernel constants
     !---------------------------------------------------------------------------
-    ! MIGRATION NOTE: every constant below duplicates one in
-    ! fos_parameterization_mod. The workers module sits UNDER the main module in
-    ! the dependency order and cannot import from it, and the 1.x surface must
-    ! stay bit-for-bit untouched until it is retired. The duplicates disappear
-    ! with that surface; this module is their permanent home. Values must match
-    ! their 1.x twin exactly — the kernels are parity-tested against it.
+    ! This module is the single owner of every kernel constant. The 1.x
+    ! duplicates in fos_parameterization_mod were deleted with the 1.x surface;
+    ! the two constants the raw evaluators there still need
+    ! (FOS_COEFF_NEGLIGIBLE, FOS_U_TIP_TOL) are public and imported from here.
 
     !> Largest Fourier coefficient index the evaluator reads.
     integer(kind = ik), parameter, public :: FOS_MAX_K = 50_ik
@@ -127,9 +125,11 @@ module fos_parameterization_workers_mod
     !! goes all the way to N_max.
     integer(kind = ik), parameter, public :: FOS_MAX_PARAMS = FOS_MAX_K
 
-    !> Coefficient pairs below this magnitude contribute nothing and are skipped
-    !! — skipping is load-bearing for bitwise parity with the 1.x evaluator.
-    real(kind = rk), parameter :: COEFF_NEGLIGIBLE = 1.0e-30_rk
+    !> Coefficient pairs below this magnitude contribute nothing and are
+    !! skipped — skipping is load-bearing for bitwise parity between the tabled
+    !! kernels and the live evaluator. Public: the raw evaluators in
+    !! fos_parameterization_mod share it.
+    real(kind = rk), parameter, public :: FOS_COEFF_NEGLIGIBLE = 1.0e-30_rk
 
     !> Smallest elongation the evaluator treats as a shape.
     real(kind = rk), parameter, public :: C_MIN = 1.0e-10_rk
@@ -138,8 +138,9 @@ module fos_parameterization_workers_mod
     real(kind = rk), parameter, public :: F_MIN_THRESHOLD = 1.0e-3_rk
 
     !> Tip detection tolerance: f(±1) = 0 analytically, so u within roundoff of
-    !! a tip is treated AS the tip (rho = 0, drho/dz = 0).
-    real(kind = rk), parameter :: U_TIP_TOL = 4.0_rk * epsilon(1.0_rk)
+    !! a tip is treated AS the tip (rho = 0, drho/dz = 0). Public: the raw
+    !! evaluators in fos_parameterization_mod share it.
+    real(kind = rk), parameter, public :: FOS_U_TIP_TOL = 4.0_rk * epsilon(1.0_rk)
 
     !> Interior nodes at or below this rho are a pinched (invalid) shape.
     real(kind = rk), parameter :: RHO_TOLERANCE = 1.0e-12_rk
@@ -253,12 +254,15 @@ module fos_parameterization_workers_mod
 
     !> Parameter-independent trigonometric tables for FoS shape evaluation.
     !!
-    !! NOTE on `cos_thetas`: built, but no longer read by the R(theta) path. The
-    !! bitwise contract between the fixed-grid and at-thetas forms requires ONE
-    !! cos evaluation site (see `solve_thetas_s`), so both take `thetas` and
-    !! evaluate the cosine themselves. The field stays for now because
-    !! `tables_t` is public surface; it is a removal candidate once the tables
-    !! API is finalized.
+    !! Immutable after `tables_init_s`, therefore shareable across threads. A
+    !! tables object bound to a cache with `cache_init_shared_s` MUST be
+    !! declared `target` and MUST outlive every cache bound to it — the cache
+    !! stores a pointer, not a copy.
+    !!
+    !! The theta nodes are stored raw, WITHOUT a precomputed cosine: the bitwise
+    !! contract between the fixed-grid and at-thetas forms requires ONE cos
+    !! evaluation site (see `solve_thetas_s`), so both pass `thetas` and let the
+    !! solver take the cosine.
     type, public :: tables_t
         integer(kind = ik) :: n_points = 0_ik, n_theta = 0_ik, k_max = 0_ik
         real(kind = rk), allocatable :: u(:)                              !! n_points
@@ -266,7 +270,7 @@ module fos_parameterization_workers_mod
         real(kind = rk), allocatable :: cos_odd(:, :), sin_odd(:, :)      !! (n_points, k_max)
         real(kind = rk), allocatable :: bk_cos_even(:, :), bk_sin_odd(:, :) !! (FOS_BEAK_SCAN_POINTS, k_max)
         real(kind = rk), allocatable :: u_beak(:)                         !! FOS_BEAK_SCAN_POINTS
-        real(kind = rk), allocatable :: thetas(:), cos_thetas(:)          !! n_theta
+        real(kind = rk), allocatable :: thetas(:)                         !! n_theta
         real(kind = rk), allocatable :: omega(:), psi(:)                  !! k_max
         logical :: initialized = .false.
     end type tables_t
@@ -437,7 +441,6 @@ contains
         if (allocated(tables%bk_sin_odd)) deallocate(tables%bk_sin_odd)
         if (allocated(tables%u_beak)) deallocate(tables%u_beak)
         if (allocated(tables%thetas)) deallocate(tables%thetas)
-        if (allocated(tables%cos_thetas)) deallocate(tables%cos_thetas)
         if (allocated(tables%omega)) deallocate(tables%omega)
         if (allocated(tables%psi)) deallocate(tables%psi)
 
@@ -452,7 +455,7 @@ contains
     !!
     !! Unlike `tables_init_s` this accepts an empty theta set — the theta-less
     !! tier-1 forms (shape, rho_z_grid, neck, optimum) need no theta nodes, and
-    !! then `thetas`/`cos_thetas` stay unallocated with `n_theta = 0`.
+    !! then `thetas` stays unallocated with `n_theta = 0`.
     !!
     !! @param[out] tables    Freshly built tables (reset on any rejection)
     !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
@@ -529,10 +532,9 @@ contains
 
         ! Theta nodes (absent for the theta-less tier-1 forms)
         if (n_theta > 0_ik) then
-            allocate(tables%thetas(n_theta), tables%cos_thetas(n_theta))
+            allocate(tables%thetas(n_theta))
             do i = 1_ik, n_theta
                 tables%thetas(i) = thetas(i)
-                tables%cos_thetas(i) = cos(thetas(i))
             end do
         end if
 
@@ -607,7 +609,7 @@ contains
         sum_term = 0.0_rk
         do n = 1_ik, FOS_MAX_K
             a_odd = coefficient_f(params, 2_ik * n + 1_ik, 0.0_rk)
-            if (abs(a_odd) < COEFF_NEGLIGIBLE) cycle
+            if (abs(a_odd) < FOS_COEFF_NEGLIGIBLE) cycle
             sign_factor = merge(-1.0_rk, 1.0_rk, mod(n, 2_ik) == 0_ik)
             sum_term = sum_term + sign_factor * a_odd / real(n, rk)
         end do
@@ -755,7 +757,7 @@ contains
             u = tables%u(i)
             z(i) = c * u + z_shift_intrinsic
 
-            if (abs(u) >= 1.0_rk - U_TIP_TOL) then
+            if (abs(u) >= 1.0_rk - FOS_U_TIP_TOL) then
                 rho(i) = 0.0_rk
                 drho_dz(i) = 0.0_rk
                 cycle
@@ -2013,7 +2015,7 @@ contains
     !! only up to a_(n+1), i.e. through order floor((n+1)/2) — and every order
     !! above that has both coefficients zero, so `pair_coefficients_s` marks it
     !! inactive and both `compute_f_grid_s` and `beak_scan_f_min_s` skip it under
-    !! the COEFF_NEGLIGIBLE rule. Two tables differing only in trailing inactive
+    !! the FOS_COEFF_NEGLIGIBLE rule. Two tables differing only in trailing inactive
     !! orders therefore sum the SAME terms in the SAME order. At n <= 8, where a
     !! cold cache exists to compare against, this k_max (2 to 6) and the cache's
     !! fixed FOS_TABLES_K_MAX = 6 are interchangeable bit for bit.
@@ -2179,14 +2181,12 @@ contains
 
     end subroutine ensure_list_s
 
-    !> Brings intermediates #1-#6 up to date and applies the three shape gates.
+    !> Brings intermediates #1-#6 up to date and applies all three shape gates.
     !!
-    !! The single entry point of every output that needs a resolved, R(theta)-
-    !! representable shape. Gate order is normative and matches 1.x's: beak
-    !! singularity (103), interior rho <= 0 (100), star-convexity margin (101),
-    !! after the wrong-parameter-count (4) and degenerate-c (102) gates inside
-    !! `ensure_list_s`. Any rejection leaves the engine cold; zero-filling the
-    !! outputs is the caller's half of the contract.
+    !! The entry point of every output that needs a resolved, R(theta)-
+    !! representable shape. A thin name for `ensure_gated_s` with the
+    !! star-convexity gate ON — that routine holds the gate order and the
+    !! invalidation policy, and is the only place either is written down.
     !!
     !! @param[in,out] cache   Cache to resolve
     !! @param[in]     params  Incoming parameter vector
@@ -2209,6 +2209,12 @@ contains
     !! shapes the margin rejects, so 101 cannot fire. Every other gate, and
     !! their order, is shared with the resolved path — one code path, one
     !! normative order.
+    !!
+    !! Gate order is normative: beak singularity (103), interior rho <= 0 (100),
+    !! star-convexity margin (101), after the wrong-parameter-count (4) and
+    !! degenerate-c (102) gates inside `ensure_list_s`. Any rejection leaves the
+    !! engine cold; zero-filling the outputs is the caller's half of the
+    !! contract.
     !!
     !! @param[in,out] cache       Cache to resolve
     !! @param[in]     params      Incoming parameter vector
@@ -2396,7 +2402,7 @@ contains
     !! Two mechanisms enforce it, and both are needed:
     !!
     !!   - ONE cos evaluation site. The fixed-grid arms pass `tables%thetas`,
-    !!     not the precomputed `tables%cos_thetas`, because under `-ffast-math`
+    !!     not a precomputed cosine table, because under `-ffast-math`
     !!     the compiler may lower a vectorizable cos loop (the one in
     !!     `build_tables_s`) to libmvec and a scalar one to the libm call, whose
     !!     results differ by an ulp — and one ulp on cos(theta) moves the Newton
@@ -2547,7 +2553,7 @@ contains
             idx = 2_ik * n - 1_ik
             if (idx > n_params) exit
             a_2n = params(idx)
-            if (abs(a_2n) < COEFF_NEGLIGIBLE) cycle
+            if (abs(a_2n) < FOS_COEFF_NEGLIGIBLE) cycle
             sign_factor = merge(1.0_rk, -1.0_rk, mod(n, 2_ik) == 0_ik)
             a2 = a2 + sign_factor * a_2n / real(2_ik * n - 1_ik, rk)
         end do
@@ -2584,7 +2590,7 @@ contains
     !! Fourier order, flagging the pairs that contribute.
     !!
     !! `active` reproduces the 1.x skip rule verbatim — a pair with both
-    !! coefficients below COEFF_NEGLIGIBLE is dropped from the sum, not added as
+    !! coefficients below FOS_COEFF_NEGLIGIBLE is dropped from the sum, not added as
     !! zero, so tabled sums are bitwise-identical to the live evaluator's.
     pure subroutine pair_coefficients_s(params, k_max, a_even, a_odd, active)
 
@@ -2602,8 +2608,8 @@ contains
         do k = 1_ik, k_max
             a_even(k) = coefficient_f(params, 2_ik * k, a2)
             a_odd(k) = coefficient_f(params, 2_ik * k + 1_ik, a2)
-            active(k) = abs(a_even(k)) >= COEFF_NEGLIGIBLE &
-                    .or. abs(a_odd(k)) >= COEFF_NEGLIGIBLE
+            active(k) = abs(a_even(k)) >= FOS_COEFF_NEGLIGIBLE &
+                    .or. abs(a_odd(k)) >= FOS_COEFF_NEGLIGIBLE
         end do
 
     end subroutine pair_coefficients_s
@@ -2638,7 +2644,7 @@ contains
         do k = 1_ik, k_max
             a_even = coefficient_f(params, 2_ik * k, a2)
             a_odd = coefficient_f(params, 2_ik * k + 1_ik, a2)
-            if (abs(a_even) < COEFF_NEGLIGIBLE .and. abs(a_odd) < COEFF_NEGLIGIBLE) cycle
+            if (abs(a_even) < FOS_COEFF_NEGLIGIBLE .and. abs(a_odd) < FOS_COEFF_NEGLIGIBLE) cycle
 
             omega_k = real(2_ik * k - 1_ik, rk) * PI_C / 2.0_rk
             psi_k = real(k, rk) * PI_C
@@ -2685,7 +2691,7 @@ contains
 
         c_inv = 1.0_rk / c
         u = (z - bundle%z_shift) * c_inv
-        if (abs(u) >= 1.0_rk - U_TIP_TOL) return
+        if (abs(u) >= 1.0_rk - FOS_U_TIP_TOL) return
 
         call eval_f_s(bundle%params(1:bundle%n_params), u, f_val, fp_val)
 

@@ -6,9 +6,10 @@ program fos_param_breakdown_test
 
     use precision_utilities_mod, only: ik, rk
     use mathematical_and_physical_constants_mod, only: PI_C
-    use fos_parameterization_mod, only: compute_fos_radius_grid_s, &
-            compute_fos_f_and_derivatives_s, compute_rho_z_grid_s, &
-            validate_rho_grid_s, rho_z_grid_t, &
+    use fos_parameterization_mod, only: compute_radius_grid_standalone_s, &
+            compute_shape_standalone_s, compute_rho_z_grid_standalone_s, &
+            compute_star_convexity_optimum_standalone_s, &
+            compute_fos_f_and_derivatives_s, &
             FOS_VALID, FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_BEAK_SINGULARITY
     use fos_test_reference_mod, only: init_quadrature_s, compute_reference_surface_f, &
             evaluate_shape_quality_s, find_neck_in_radii_s, gl_ref_x, gl_ref_w, N_GL_REF
@@ -28,6 +29,18 @@ program fos_param_breakdown_test
     real(kind = rk), parameter :: A4_BEAK_BOUNDARY = 0.999_rk * 0.75_rk   ! f(0) = F_MIN_THRESHOLD
     real(kind = rk), parameter :: A4_RHO_BOUNDARY = 0.75_rk               ! f(0) = 0
 
+    !> Uniform theta nodes of the R(theta) grid, built once.
+    real(kind = rk) :: grid_thetas(N_GRID_SMALL)
+    integer(kind = ik) :: it
+
+    ! Endpoints pinned: under -ffast-math the last product can land one ulp
+    ! above PI_C, which the library rejects as an out-of-domain theta.
+    do it = 1_ik, N_GRID_SMALL
+        grid_thetas(it) = real(it - 1_ik, rk) * PI_C / real(N_GRID_SMALL - 1_ik, rk)
+    end do
+    grid_thetas(1) = 0.0_rk
+    grid_thetas(N_GRID_SMALL) = PI_C
+
     call init_quadrature_s()
     call test_symmetric_family_code_boundaries()
     call test_beak_detector_two_sided()
@@ -37,13 +50,14 @@ program fos_param_breakdown_test
 
 contains
 
-    !> Exact code boundaries on the symmetric (c=2, a4) family. Check order in
-    !! validate_rho_grid_s is rho-check then beak, both before star-convexity,
-    !! so the code at each analytic boundary is deterministic.
+    !> Exact code boundaries on the symmetric (c=2, a4) family. The 2.0 gate
+    !! order is normative — beak (103), interior rho (100), star-convexity
+    !! (101) — and the cylindrical form runs no beak scan at all, so the code
+    !! at each analytic boundary is deterministic on both paths.
     subroutine test_symmetric_family_code_boundaries()
-        real(kind = rk) :: params(7), radii(N_GRID_SMALL), z_shift
-        logical :: is_valid
-        character(len = 256) :: message
+        real(kind = rk) :: params(7), radii(N_GRID_SMALL)
+        real(kind = rk) :: z(N_GRID_SMALL), rho(N_GRID_SMALL), drho(N_GRID_SMALL)
+        real(kind = rk) :: z_shift
         integer(kind = ik) :: code
 
         write(*, '(A)') '=== Symmetric-family code boundaries ==='
@@ -52,35 +66,41 @@ contains
         params = 0.0_rk
         params(1) = 2.0_rk
         params(3) = 0.30_rk
-        call compute_fos_radius_grid_s(params, N_GRID_SMALL, radii, z_shift, is_valid, &
-                message, error_code = code)
+        call compute_radius_grid_standalone_s(params, grid_thetas, N_GRID_SMALL, &
+                radii, code)
         call assert_int_eq(code, FOS_VALID, 'boundary: c=2 a4=0.30 valid')
 
         ! Just past the beak boundary (f(0) ~ 1e-6 > 0, f_min < 1e-3): beak code.
         params(3) = A4_BEAK_BOUNDARY * (1.0_rk + 1.0e-3_rk)
-        call compute_fos_radius_grid_s(params, N_GRID_SMALL, radii, z_shift, is_valid, &
-                message, error_code = code)
+        call compute_radius_grid_standalone_s(params, grid_thetas, N_GRID_SMALL, &
+                radii, code)
         call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
                 'boundary: just past beak threshold -> FOS_ERROR_BEAK_SINGULARITY')
 
-        ! Past f(0) = 0 (grid point at u=0 has rho = 0): rho-negative code.
+        ! Past f(0) = 0 the interior node at u = 0 pinches shut. The R(theta)
+        ! path runs the (denser) beak scan first and reports 103; the
+        ! cylindrical path never runs it and reports the rho verdict, 100.
         params(3) = A4_RHO_BOUNDARY * (1.0_rk + 1.0e-3_rk)
-        call compute_fos_radius_grid_s(params, N_GRID_SMALL, radii, z_shift, is_valid, &
-                message, error_code = code)
+        call compute_radius_grid_standalone_s(params, grid_thetas, N_GRID_SMALL, &
+                radii, code)
+        call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
+                'boundary: f(0) < 0 -> beak gates first on the R(theta) path')
+        call compute_rho_z_grid_standalone_s(params, N_GRID_SMALL, z, rho, drho, &
+                z_shift, code)
         call assert_int_eq(code, FOS_ERROR_RHO_NEGATIVE, &
-                'boundary: f(0) < 0 -> FOS_ERROR_RHO_NEGATIVE')
+                'boundary: f(0) < 0 -> FOS_ERROR_RHO_NEGATIVE (cylindrical)')
     end subroutine test_symmetric_family_code_boundaries
 
-    !> Two-sided beak boundary at the layer that owns the detector:
-    !! validate_rho_grid_s has no star-convexity gate, so both sides of the
-    !! analytic boundary a4* = 0.999 * 0.75 are exactly testable here —
-    !! impossible through compute_fos_radius_grid_s, where the star-convexity
-    !! margin rejects these necked shapes regardless.
+    !> Two-sided beak boundary at the layer that owns the detector. The
+    !! ungated star-convexity diagnostic applies exactly the 1.x
+    !! validate_rho_grid_s gate set — beak and interior rho, no star-convexity
+    !! margin — so both sides of the analytic boundary a4* = 0.999 * 0.75 stay
+    !! testable, which they are not through the R(theta) grid form (the margin
+    !! rejects these necked shapes regardless). The rho-negative side is read
+    !! off the cylindrical form, the one path that never runs the beak scan.
     subroutine test_beak_detector_two_sided()
-        real(kind = rk) :: params(7)
-        type(rho_z_grid_t) :: grid
-        logical :: is_valid
-        character(len = 256) :: message
+        real(kind = rk) :: params(7), z_shift_total, g_opt, z_shift
+        real(kind = rk) :: z(N_RHO_INTERNAL), rho(N_RHO_INTERNAL), drho(N_RHO_INTERNAL)
         integer(kind = ik) :: code
 
         write(*, '(A)') '=== Beak detector: two-sided boundary (unit level) ==='
@@ -90,25 +110,22 @@ contains
 
         ! Just below the boundary: f(0) = 1 - (4/3) a4 ~ 2e-3 > F_MIN_THRESHOLD.
         params(3) = A4_BEAK_BOUNDARY * (1.0_rk - 1.0e-3_rk)
-        call compute_rho_z_grid_s(params, N_RHO_INTERNAL, grid, code, message)
-        call assert_int_eq(code, FOS_VALID, 'unit: grid built below beak boundary')
-        call validate_rho_grid_s(grid, params, is_valid, code, message)
+        call compute_star_convexity_optimum_standalone_s(params, N_RHO_INTERNAL, &
+                z_shift_total, g_opt, code)
         call assert_int_eq(code, FOS_VALID, 'unit: 0.999 a4* passes beak detection')
 
         ! Just above: f(0) ~ 1e-6, in (0, F_MIN_THRESHOLD) -> beak code.
         params(3) = A4_BEAK_BOUNDARY * (1.0_rk + 1.0e-3_rk)
-        call compute_rho_z_grid_s(params, N_RHO_INTERNAL, grid, code, message)
-        call assert_int_eq(code, FOS_VALID, 'unit: grid built above beak boundary')
-        call validate_rho_grid_s(grid, params, is_valid, code, message)
+        call compute_star_convexity_optimum_standalone_s(params, N_RHO_INTERNAL, &
+                z_shift_total, g_opt, code)
         call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
                 'unit: 1.001 a4* -> FOS_ERROR_BEAK_SINGULARITY')
 
-        ! Past f(0) = 0: interior grid point at u = 0 (N_RHO_INTERNAL odd) has
-        ! rho = 0 -> the rho check fires before the beak check.
+        ! Past f(0) = 0: the interior grid point at u = 0 (N_RHO_INTERNAL odd)
+        ! has rho = 0, which the cylindrical form reports on its own.
         params(3) = A4_RHO_BOUNDARY * (1.0_rk + 1.0e-3_rk)
-        call compute_rho_z_grid_s(params, N_RHO_INTERNAL, grid, code, message)
-        call assert_int_eq(code, FOS_VALID, 'unit: grid built past f(0) = 0')
-        call validate_rho_grid_s(grid, params, is_valid, code, message)
+        call compute_rho_z_grid_standalone_s(params, N_RHO_INTERNAL, z, rho, drho, &
+                z_shift, code)
         call assert_int_eq(code, FOS_ERROR_RHO_NEGATIVE, &
                 'unit: f(0) < 0 -> FOS_ERROR_RHO_NEGATIVE')
     end subroutine test_beak_detector_two_sided
@@ -117,10 +134,8 @@ contains
     !! volume pi int max(f,0) du deviates from 4 pi / 3, the module must have
     !! rejected the shape (error fires no later than conservation breaks).
     subroutine test_error_fires_before_volume_breaks()
-        real(kind = rk) :: params(7), radii(N_GRID_SMALL), z_shift
+        real(kind = rk) :: params(7), radii(N_GRID_SMALL)
         real(kind = rk) :: a4, f_val, v_geom, v_err
-        logical :: is_valid
-        character(len = 256) :: message
         character(len = 96) :: label
         integer(kind = ik) :: code, i, k, n_broken, n_rejected
 
@@ -146,15 +161,15 @@ contains
             v_geom = PI_C * v_geom
             v_err = abs(v_geom - 4.0_rk * PI_C / 3.0_rk)
 
-            call compute_fos_radius_grid_s(params, N_GRID_SMALL, radii, z_shift, is_valid, &
-                    message, n_rho_grid = N_RHO_INTERNAL, error_code = code)
+            call compute_radius_grid_standalone_s(params, grid_thetas, &
+                    N_RHO_INTERNAL, radii, code)
 
             if (v_err > TOL_VOLUME) then
                 n_broken = n_broken + 1_ik
                 write(label, '(A,F6.4,A,ES10.3)') 'direction: a4=', a4, ' vol broken by ', v_err
-                call assert_true(.not. is_valid, trim(label) // ' -> must be rejected')
+                call assert_true(code /= FOS_VALID, trim(label) // ' -> must be rejected')
             end if
-            if (.not. is_valid) n_rejected = n_rejected + 1_ik
+            if (code /= FOS_VALID) n_rejected = n_rejected + 1_ik
         end do
 
         ! The scan must actually cross the boundary for the test to mean anything.
@@ -172,11 +187,10 @@ contains
                 [0.8_rk, 1.0_rk, 1.5_rk, 2.0_rk, 2.5_rk, 3.0_rk]
         real(kind = rk), parameter :: A3_VALUES(4) = [0.0_rk, 0.15_rk, 0.30_rk, 0.45_rk]
 
-        real(kind = rk) :: params(7), radii(N_GRID_SMALL), z_shift
+        real(kind = rk) :: params(7), radii(N_GRID_SMALL), z_shift, r_north, r_south
         real(kind = rk) :: a4, s_ref, dv_rel, ds_rel, rt_max
         real(kind = rk) :: neck_radius, neck_depth, elongation
-        logical :: is_valid, has_neck
-        character(len = 256) :: message
+        logical :: has_neck
         character(len = 96) :: label
         integer(kind = ik) :: code, ic, i3, k, n_checked, n_rejected, n_filtered
 
@@ -195,9 +209,15 @@ contains
                     params(2) = A3_VALUES(i3)
                     params(3) = a4
 
-                    call compute_fos_radius_grid_s(params, N_GRID_SMALL, radii, z_shift, &
-                            is_valid, message, n_rho_grid = N_RHO_INTERNAL, error_code = code)
-                    if (.not. is_valid) then
+                    call compute_shape_standalone_s(params, N_RHO_INTERNAL, z_shift, &
+                            r_north, r_south, code)
+                    if (code /= FOS_VALID) then
+                        n_rejected = n_rejected + 1_ik
+                        cycle
+                    end if
+                    call compute_radius_grid_standalone_s(params, grid_thetas, &
+                            N_RHO_INTERNAL, radii, code)
+                    if (code /= FOS_VALID) then
                         n_rejected = n_rejected + 1_ik
                         cycle
                     end if
@@ -213,10 +233,12 @@ contains
                     n_checked = n_checked + 1_ik
 
                     s_ref = compute_reference_surface_f(params)
-                    call evaluate_shape_quality_s(params, z_shift, s_ref, dv_rel, ds_rel, rt_max)
+                    call evaluate_shape_quality_s(params, N_RHO_INTERNAL, z_shift, &
+                            s_ref, dv_rel, ds_rel, rt_max, code)
 
                     write(label, '(A,F4.2,A,F4.2,A,F5.2)') 'scan c=', C_VALUES(ic), &
                             ' a3=', A3_VALUES(i3), ' a4=', a4
+                    call assert_int_eq(code, FOS_VALID, trim(label) // ': quality probe valid')
                     call assert_true(abs(dv_rel) < TOL_VOLUME, trim(label) // ': volume conserved')
                     call assert_true(abs(ds_rel) < TOL_SURFACE_REL, trim(label) // ': surface ok')
                     call assert_true(rt_max < TOL_ROUND_TRIP, trim(label) // ': round trip ok')

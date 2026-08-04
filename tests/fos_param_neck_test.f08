@@ -9,17 +9,20 @@
 program fos_param_neck_test
 
     use precision_utilities_mod, only: ik, rk
-    use fos_parameterization_mod, only: compute_fos_neck_s
-    use test_utils_mod, only: assert_true, assert_abs_close, test_summary
+    use fos_parameterization_mod, only: compute_neck_standalone_s, FOS_VALID
+    use test_utils_mod, only: assert_true, assert_int_eq, assert_abs_close, test_summary
 
     implicit none
 
+    !> The 1.x neck scanner's default resolution, kept so the analytic
+    !! comparison below runs at the resolution the tolerance was set for.
+    integer(kind = ik), parameter :: N_POINTS = 1001_ik
     real(kind = rk), parameter :: TOL_NECK = 1.0e-9_rk
     real(kind = rk), parameter :: NECK_C(5) = [1.0_rk, 1.5_rk, 2.0_rk, 2.5_rk, 3.0_rk]
 
     real(kind = rk) :: params(7), a4, z_neck, rho_neck, rho_exact
     logical :: found
-    integer(kind = ik) :: i, j
+    integer(kind = ik) :: i, j, status
     character(len = 64) :: label
 
     write(*, '(A)') '=== Neck validation (symmetric c x a4 family) ==='
@@ -32,7 +35,9 @@ program fos_param_neck_test
             params(3) = a4
             write(label, '(A,F4.2,A,F4.2)') 'neck c=', NECK_C(i), ' a4=', a4
 
-            call compute_fos_neck_s(params, z_neck, rho_neck, found)
+            call compute_neck_standalone_s(params, N_POINTS, z_neck, rho_neck, &
+                    found, status)
+            call assert_int_eq(status, FOS_VALID, trim(label) // ': status valid')
             call assert_true(found, trim(label) // ': found')
             if (.not. found) cycle
 

@@ -2,8 +2,10 @@
 !! share the R(theta) gate set — `cache_neck_s` and
 !! `cache_star_convexity_optimum_s`.
 !!
-!! Parity anchors are the OLD 1.x routines (`compute_fos_neck_s`,
-!! `compute_fos_star_convexity_optimum_s`), to 1e-11 relative: the cached path
+!! Parity anchors are the tier-1 forms (`compute_neck_standalone_s`,
+!! `compute_star_convexity_optimum_standalone_s`), which run the same kernels
+!! outside the cache, to 1e-11 relative, plus a g(s*) literal frozen from the
+!! deleted 1.x diagnostic (commit 648428c): the cached path
 !! derives u from the trig tables while 1.x computes z*(1/c), so the comparison
 !! is close, not bitwise.
 !!
@@ -21,8 +23,8 @@ program fos_param_extensions_test
     use fos_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
             cache_neck_s, cache_star_convexity_optimum_s, cache_shape_s, &
             cache_rho_z_grid_s, cache_radius_grid_s, cache_recompute_count_f, &
-            compute_fos_neck_s, compute_fos_star_convexity_optimum_s, &
-            compute_fos_shape_s, &
+            compute_neck_standalone_s, compute_star_convexity_optimum_standalone_s, &
+            compute_shape_standalone_s, &
             FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_NOT_STAR_CONVEX, &
             STAR_CONVEXITY_MARGIN
     use shape_core_mod, only: SHAPE_VALID
@@ -31,8 +33,9 @@ program fos_param_extensions_test
 
     implicit none
 
-    !> The 1.x neck scanner defaults to a 1001-point grid; the cache must be
-    !! built at the same resolution for the parity comparison to be meaningful.
+    !> The 1.x neck scanner defaulted to a 1001-point grid; the cache and the
+    !! tier-1 reference are both built at that resolution so every parity
+    !! comparison here compares like with like.
     integer(kind = ik), parameter :: N_POINTS = 1001_ik
     integer(kind = ik), parameter :: N_PARAMS = 7_ik
     integer(kind = ik), parameter :: N_THETA = 4_ik
@@ -46,6 +49,13 @@ program fos_param_extensions_test
 
     real(kind = rk), parameter :: PARAMS7(N_PARAMS) = &
             [1.5_rk, 0.1_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk, 0.002_rk]
+
+    !> The ungated star-convexity optimum the deleted 1.x diagnostic reported
+    !! for PARAMS7 at N_POINTS, frozen from commit 648428c. Both the shift and
+    !! g(s*) are geometric properties of the shape, so they anchor the 2.0
+    !! optimum to a value no 2.0 code path produced.
+    real(kind = rk), parameter :: OPT_SHIFT_PARAMS7_1X = 3.7350130220951994E-001_rk
+    real(kind = rk), parameter :: OPT_GOPT_PARAMS7_1X = -8.183218439306816E-001_rk
 
     !> Odd-heavy asymmetric family: raising c drives g(s*) up through
     !! -STAR_CONVEXITY_MARGIN, which is how the 101 vector is probed.
@@ -63,7 +73,7 @@ program fos_param_extensions_test
     real(kind = rk)    :: z_shift, r_north, r_south, grid_shift
     real(kind = rk)    :: z(N_POINTS), rho(N_POINTS), drho_dz(N_POINTS)
     integer(kind = ik) :: before(8)
-    logical            :: found, ref_found, ref_ok, probed
+    logical            :: found, ref_found
     character(len = 64) :: label
 
     do i = 1_ik, N_THETA
@@ -76,7 +86,7 @@ program fos_param_extensions_test
     !---------------------------------------------------------------------------
     ! Neck parity with the 1.x scanner on the symmetric (c, a4) family
     !---------------------------------------------------------------------------
-    write(*, '(A)') '=== Neck parity with the 1.x scanner ==='
+    write(*, '(A)') '=== Neck parity with the tier-1 scanner ==='
 
     do i = 1_ik, 5_ik
         do j = 0_ik, 12_ik
@@ -86,11 +96,13 @@ program fos_param_extensions_test
             params_neck(3) = a4
             write(label, '(A,F4.2,A,F4.2)') 'neck c=', NECK_C(i), ' a4=', a4
 
-            call compute_fos_neck_s(params_neck, ref_z, ref_rho, ref_found)
+            call compute_neck_standalone_s(params_neck, N_POINTS, ref_z, ref_rho, &
+                    ref_found, code)
+            call assert_int_eq(code, SHAPE_VALID, trim(label) // ': tier-1 status valid')
             call cache_neck_s(cache, params_neck, z_neck, rho_neck, found, status)
 
             call assert_int_eq(status, SHAPE_VALID, trim(label) // ': status valid')
-            call assert_true(found .eqv. ref_found, trim(label) // ': found matches 1.x')
+            call assert_true(found .eqv. ref_found, trim(label) // ': found matches tier-1')
             if (.not. found) cycle
             call assert_close(z_neck, ref_z, TOL_PARITY, trim(label) // ': z_neck parity')
             call assert_close(rho_neck, ref_rho, TOL_PARITY, &
@@ -101,12 +113,15 @@ program fos_param_extensions_test
     !---------------------------------------------------------------------------
     ! Star-convexity optimum parity with the 1.x diagnostic
     !---------------------------------------------------------------------------
-    write(*, '(A)') '=== Star-convexity optimum parity with the 1.x diagnostic ==='
+    write(*, '(A)') '=== Star-convexity optimum parity (tier-1 + frozen 1.x) ==='
 
-    call compute_fos_star_convexity_optimum_s(PARAMS7, N_POINTS, ref_shift_total, &
-            ref_g_opt, ref_ok, code)
-    call assert_true(ref_ok, 'params7 accepted by the 1.x optimum')
-    call assert_int_eq(code, SHAPE_VALID, 'params7 1.x optimum reports valid')
+    call compute_star_convexity_optimum_standalone_s(PARAMS7, N_POINTS, &
+            ref_shift_total, ref_g_opt, code)
+    call assert_int_eq(code, SHAPE_VALID, 'params7 tier-1 optimum reports valid')
+    call assert_close(ref_shift_total, OPT_SHIFT_PARAMS7_1X, TOL_PARITY, &
+            'params7 optimum shift matches the frozen 1.x value')
+    call assert_close(ref_g_opt, OPT_GOPT_PARAMS7_1X, TOL_PARITY, &
+            'params7 optimum g(s*) matches the frozen 1.x value')
 
     call cache_star_convexity_optimum_s(cache, PARAMS7, z_shift_total, g_opt, status)
     call assert_int_eq(status, SHAPE_VALID, 'params7 optimum valid')
@@ -129,20 +144,15 @@ program fos_param_extensions_test
 
     params_beak = 0.0_rk
     params_beak(1) = 2.0_rk
+    ! a4 = 0.7495 is the vector the 1.x beak probe settled on, frozen here.
     params_beak(3) = 0.7495_rk
-    call probe_old_s(params_beak, code)
-    if (code /= FOS_ERROR_BEAK_SINGULARITY) then
-        do i = 0_ik, 400_ik
-            params_beak(3) = 0.60_rk + 5.0e-4_rk * real(i, rk)
-            call probe_old_s(params_beak, code)
-            if (code == FOS_ERROR_BEAK_SINGULARITY) exit
-        end do
-    end if
+    call probe_tier1_s(params_beak, code)
     call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
-            'probe vector is beak-rejected by the 1.x surface')
+            'probe vector is beak-rejected by the tier-1 resolve')
 
-    call compute_fos_neck_s(params_beak, ref_z, ref_rho, ref_found)
-    call assert_true(ref_found, 'beak vector: the 1.x scanner finds a neck')
+    call compute_neck_standalone_s(params_beak, N_POINTS, ref_z, ref_rho, ref_found, code)
+    call assert_int_eq(code, SHAPE_VALID, 'beak vector: tier-1 neck succeeds')
+    call assert_true(ref_found, 'beak vector: the tier-1 scanner finds a neck')
 
     call cache_neck_s(cache, params_beak, z_neck, rho_neck, found, status)
     call assert_int_eq(status, SHAPE_VALID, 'beak vector: neck succeeds (no 103 gate)')
@@ -167,17 +177,12 @@ program fos_param_extensions_test
     !---------------------------------------------------------------------------
     write(*, '(A)') '=== Gating asymmetry: non-star-convex vector ==='
 
+    ! c = 1.3 is the first elongation the 1.x probe rejected with 101, frozen.
     params_star = ODD_HEAVY
-    probed = .false.
-    do i = 0_ik, 60_ik
-        params_star(1) = 1.3_rk + 0.05_rk * real(i, rk)
-        call probe_old_s(params_star, code)
-        if (code == FOS_ERROR_NOT_STAR_CONVEX) then
-            probed = .true.
-            exit
-        end if
-    end do
-    call assert_true(probed, 'probe found a non-star-convex vector on the 1.x surface')
+    params_star(1) = 1.3_rk
+    call probe_tier1_s(params_star, code)
+    call assert_int_eq(code, FOS_ERROR_NOT_STAR_CONVEX, &
+            'probe vector is 101-rejected by the tier-1 resolve')
 
     call cache_neck_s(cache, params_star, z_neck, rho_neck, found, status)
     call assert_int_eq(status, SHAPE_VALID, 'non-star-convex vector: neck succeeds')
@@ -198,9 +203,9 @@ program fos_param_extensions_test
     call assert_true(g_opt > -STAR_CONVEXITY_MARGIN, &
             'non-star-convex vector: g(s*) is above the acceptance margin')
 
-    call compute_fos_star_convexity_optimum_s(params_star, N_POINTS, ref_shift_total, &
-            ref_g_opt, ref_ok, code)
-    call assert_true(ref_ok, 'non-star-convex vector: the 1.x optimum also reports')
+    call compute_star_convexity_optimum_standalone_s(params_star, N_POINTS, &
+            ref_shift_total, ref_g_opt, code)
+    call assert_int_eq(code, SHAPE_VALID, 'non-star-convex vector: tier-1 optimum also reports')
     call assert_close(z_shift_total, ref_shift_total, TOL_PARITY, &
             'non-star-convex vector: z_shift_total parity')
     call assert_close(g_opt, ref_g_opt, TOL_PARITY, &
@@ -249,18 +254,16 @@ contains
         n = int(cache_recompute_count_f(cache, intermediate), ik)
     end function count_f
 
-    !> The 1.x resolve step, for its verdict alone.
-    subroutine probe_old_s(p, old_code)
+    !> The tier-1 resolve at the cache's own resolution, for its verdict alone.
+    subroutine probe_tier1_s(p, tier1_code)
         real(kind = rk), intent(in) :: p(:)
-        integer(kind = ik), intent(out) :: old_code
+        integer(kind = ik), intent(out) :: tier1_code
 
-        logical :: is_valid
-        real(kind = rk) :: old_shift, old_north, old_south
-        character(len = 256) :: probe_message
+        real(kind = rk) :: tier1_shift, tier1_north, tier1_south
 
-        call compute_fos_shape_s(p, N_POINTS, old_shift, old_north, old_south, &
-                is_valid, probe_message, old_code)
+        call compute_shape_standalone_s(p, N_POINTS, tier1_shift, tier1_north, &
+                tier1_south, tier1_code)
 
-    end subroutine probe_old_s
+    end subroutine probe_tier1_s
 
 end program fos_param_extensions_test

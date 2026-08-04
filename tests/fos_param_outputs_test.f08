@@ -2,8 +2,10 @@
 !! at-thetas extension.
 !!
 !! Parity anchor is the OLD 1.x batch evaluator
-!! (`compute_fos_radius_and_derivative_at_thetas_s`, fed the tables' thetas and
-!! the z_shift from `compute_fos_shape_s`). The comparison is a 1e-11 relative
+!! (the tier-1 `compute_radius_and_derivative_standalone_s` at the tables'
+!! thetas, resolving the same shift the tier-1 `compute_shape_standalone_s`
+!! reports; the 1.x shift for PARAMS7 is frozen alongside it as
+!! SHIFT_PARAMS7_1X). The comparison is a 1e-11 relative
 !! tolerance, NOT bitwise: the two Newton solves start from different outer
 !! brackets (1.x doubles from 2*max(r_north, r_south); the cached path uses the
 !! analytic bound built from rho_max), so the bisection paths differ even though
@@ -19,7 +21,7 @@ program fos_param_outputs_test
     use fos_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
             cache_shape_s, cache_radius_grid_s, cache_radius_and_derivative_s, &
             cache_radius_and_derivative_at_thetas_s, cache_recompute_count_f, &
-            compute_fos_shape_s, compute_fos_radius_and_derivative_at_thetas_s, &
+            compute_shape_standalone_s, compute_radius_and_derivative_standalone_s, &
             compute_rho_at_z_s, &
             FOS_ERROR_INVALID_C, FOS_ERROR_BUFFER_MISMATCH, &
             FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_NOT_STAR_CONVEX
@@ -36,6 +38,11 @@ program fos_param_outputs_test
 
     real(kind = rk), parameter :: PARAMS7(N_PARAMS) = &
             [1.5_rk, 0.1_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk, 0.002_rk]
+
+    !> Total z-shift the deleted 1.x `compute_fos_shape_s` resolved for PARAMS7
+    !! at N_POINTS, frozen from commit 648428c — the numeric anchor the tier
+    !! comparison alone cannot supply.
+    real(kind = rk), parameter :: SHIFT_PARAMS7_1X = 6.565141402540683E-002_rk
 
     !> Odd-heavy asymmetric family; raising c drives g(s*) through the
     !! star-convexity margin (same probe family as the resolve suite).
@@ -54,7 +61,7 @@ program fos_param_outputs_test
     real(kind = rk)    :: few_thetas(3), few_radii(3), few_dr(3)
     real(kind = rk)    :: bad_thetas(N_THETA)
     integer(kind = ik) :: before(8)
-    logical            :: found, all_bits_eq
+    logical            :: all_bits_eq
 
     do i = 1_ik, N_THETA
         thetas(i) = real(i - 1_ik, rk) * PI_C / real(N_THETA - 1_ik, rk)
@@ -102,10 +109,13 @@ program fos_param_outputs_test
     !---------------------------------------------------------------------------
     ! Parity with the 1.x batch evaluator
     !---------------------------------------------------------------------------
-    call probe_old_s(PARAMS7, code, ref_shift, ref_north, ref_south)
-    call assert_int_eq(code, SHAPE_VALID, 'params7 accepted by the 1.x surface')
-    call compute_fos_radius_and_derivative_at_thetas_s(PARAMS7, thetas, ref_shift, &
-            ref_radii, ref_dr)
+    call probe_tier1_s(PARAMS7, code, ref_shift, ref_north, ref_south)
+    call assert_int_eq(code, SHAPE_VALID, 'params7 accepted by the tier-1 resolve')
+    call assert_close(ref_shift, SHIFT_PARAMS7_1X, 1.0e-12_rk, &
+            'params7 tier-1 z_shift matches the frozen 1.x value')
+    call compute_radius_and_derivative_standalone_s(PARAMS7, thetas, N_POINTS, &
+            ref_radii, ref_dr, code)
+    call assert_int_eq(code, SHAPE_VALID, 'tier-1 batch evaluation valid')
 
     call cache_radius_grid_s(cache, PARAMS7, radii, status)
     call assert_int_eq(status, SHAPE_VALID, 'radius grid valid')
@@ -196,29 +206,18 @@ program fos_param_outputs_test
     params_beak = 0.0_rk
     params_beak(1) = 2.0_rk
     params_beak(3) = 0.7495_rk
-    call probe_old_s(params_beak, code, ref_shift, ref_north, ref_south)
-    if (code /= FOS_ERROR_BEAK_SINGULARITY) then
-        do i = 0_ik, 400_ik
-            params_beak(3) = 0.60_rk + 5.0e-4_rk * real(i, rk)
-            call probe_old_s(params_beak, code, ref_shift, ref_north, ref_south)
-            if (code == FOS_ERROR_BEAK_SINGULARITY) exit
-        end do
-    end if
+    ! a4 = 0.7495 is the vector the 1.x beak probe settled on, frozen here.
+    call probe_tier1_s(params_beak, code, ref_shift, ref_north, ref_south)
     call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
-            'probe vector is beak-rejected by the 1.x surface')
+            'probe vector is beak-rejected by the tier-1 resolve')
     call check_rejection_s(params_beak, FOS_ERROR_BEAK_SINGULARITY, 'beak vector -> 103')
 
+    ! c = 1.3 is the first elongation the 1.x probe rejected with 101, frozen.
     params_star = ODD_HEAVY
-    found = .false.
-    do i = 0_ik, 60_ik
-        params_star(1) = 1.3_rk + 0.05_rk * real(i, rk)
-        call probe_old_s(params_star, code, ref_shift, ref_north, ref_south)
-        if (code == FOS_ERROR_NOT_STAR_CONVEX) then
-            found = .true.
-            exit
-        end if
-    end do
-    call assert_true(found, 'probe found a non-star-convex vector on the 1.x surface')
+    params_star(1) = 1.3_rk
+    call probe_tier1_s(params_star, code, ref_shift, ref_north, ref_south)
+    call assert_int_eq(code, FOS_ERROR_NOT_STAR_CONVEX, &
+            'probe vector is 101-rejected by the tier-1 resolve')
     call check_rejection_s(params_star, FOS_ERROR_NOT_STAR_CONVEX, &
             'non-star-convex vector -> 101')
 
@@ -255,19 +254,17 @@ contains
         end do
     end function all_zero_f
 
-    !> The 1.x resolve step, for its verdict and its z_shift.
-    subroutine probe_old_s(p, old_code, old_shift, old_north, old_south)
+    !> The tier-1 resolve at the cache's own resolution, for its verdict and
+    !! its z_shift — the cross-tier oracle that replaced the 1.x resolve.
+    subroutine probe_tier1_s(p, tier1_code, tier1_shift, tier1_north, tier1_south)
         real(kind = rk), intent(in) :: p(:)
-        integer(kind = ik), intent(out) :: old_code
-        real(kind = rk), intent(out) :: old_shift, old_north, old_south
+        integer(kind = ik), intent(out) :: tier1_code
+        real(kind = rk), intent(out) :: tier1_shift, tier1_north, tier1_south
 
-        logical :: is_valid
-        character(len = 256) :: probe_message
+        call compute_shape_standalone_s(p, N_POINTS, tier1_shift, tier1_north, &
+                tier1_south, tier1_code)
 
-        call compute_fos_shape_s(p, N_POINTS, old_shift, old_north, old_south, &
-                is_valid, probe_message, old_code)
-
-    end subroutine probe_old_s
+    end subroutine probe_tier1_s
 
     !> A rejected shape yields the same code and a zero-filled output on all
     !! three R(theta) forms.

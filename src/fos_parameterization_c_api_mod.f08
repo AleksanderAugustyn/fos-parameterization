@@ -1,19 +1,33 @@
 !> C-interop API for the FoS parameterization library.
 !!
-!! Standalone functions only — FoS has no shape-independent precompute, so
-!! there is no cache/handle tier. Status codes 100+ match the Fortran FOS_*
-!! parameters and the C FOS_* macros; FOS_ERROR_INVALID_ARGUMENTS (5) exists
-!! only at this layer (bad n_grid / n_z — the Fortran API takes assumed-size
-!! arrays and cannot receive these).
+!! Standalone functions only — this layer still exposes the 1.x `fos_*` symbol
+!! set, now implemented on the 2.0 tier-1 (standalone) forms. Status codes 100+
+!! match the Fortran FOS_* parameters and the C FOS_* macros;
+!! FOS_ERROR_INVALID_ARGUMENTS (5) exists only at this layer (bad n_grid / n_z
+!! — the Fortran API takes assumed-size arrays and cannot receive these).
+!!
+!! Internal rho(z) resolution: the tier-1 forms enforce a floor of
+!! FOS_N_POINTS_FLOOR nodes, so every entry point here raises the caller's
+!! request to `max(FOS_N_POINTS_FLOOR, n)`. 1.x used the caller's value
+!! verbatim; below the floor the resolved z-shift therefore moves slightly.
+!!
+!! `fos_compute_radius_and_derivative_at_thetas` is the one call that takes an
+!! externally resolved z_shift, which no tier-1 form does. It is built directly
+!! on the worker evaluator (`fos_bundle_t` + `newton_radius_s`), with the
+!! Newton bracket bound taken from a rho(z) grid at N_RHO_AT_THETAS nodes.
 module fos_parameterization_c_api_mod
 
     use c_bindings_mod, only: ik_c, rk_c, c_char, c_null_char
     use precision_utilities_mod, only: ik, rk
+    use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: &
-            compute_fos_radius_grid_s, compute_rho_at_z_s, compute_fos_neck_s, &
-            compute_fos_z_shift_f, compute_fos_a2_f, &
-            compute_fos_shape_s, compute_fos_radius_and_derivative_at_thetas_s, &
+            compute_rho_at_z_s, compute_a2_s, compute_z_shift_s, &
+            compute_radius_grid_standalone_s, compute_shape_standalone_s, &
+            compute_rho_z_grid_standalone_s, compute_neck_standalone_s, &
+            status_message, FOS_N_POINTS_FLOOR, &
             FOS_VALID, FOS_ERROR_INVALID_C, C_MIN
+    use fos_parameterization_workers_mod, only: fos_bundle_t, newton_radius_s, &
+            FOS_MAX_K
 
     implicit none
 
@@ -29,6 +43,13 @@ module fos_parameterization_c_api_mod
 
     !> C-API-level status for invalid grid/profile sizes (see module docstring).
     integer(kind = ik), parameter :: FOS_ERROR_INVALID_ARGUMENTS = 5_ik
+
+    !> rho(z) resolution behind `fos_compute_radius_and_derivative_at_thetas`,
+    !! used only for the Newton bracket bound (rho_max).
+    integer(kind = ik), parameter :: N_RHO_AT_THETAS = FOS_N_POINTS_FLOOR
+
+    !> Neck scan resolution — the 1.x scanner's default, kept unchanged.
+    integer(kind = ik), parameter :: NECK_N_POINTS = 1001_ik
 
 contains
 
@@ -69,11 +90,9 @@ contains
         character(kind = c_char), intent(out)       :: message_buf(message_buf_len)
         integer(kind = ik_c) :: status
 
-        real(kind = rk), allocatable :: f_params(:), f_radii(:)
-        real(kind = rk)      :: f_z_shift
-        logical              :: is_valid
-        integer(kind = ik)   :: error_code
-        character(len = 256) :: f_message
+        real(kind = rk), allocatable :: f_params(:), f_radii(:), f_thetas(:)
+        real(kind = rk)      :: f_z_shift, r_north, r_south
+        integer(kind = ik)   :: error_code, n, n_rho, i
 
         radii = 0.0_rk_c
         z_shift = 0.0_rk_c
@@ -84,20 +103,46 @@ contains
             return
         end if
 
-        allocate(f_params(int(n_params, ik)))
-        allocate(f_radii(int(n_grid, ik)), source = 0.0_rk)
-        f_params(:) = real(params(:), rk)
-        f_z_shift = 0.0_rk
-        error_code = FOS_VALID
-        f_message = ''
+        n = int(n_grid, ik)
+        n_rho = max(FOS_N_POINTS_FLOOR, n)
 
-        call compute_fos_radius_grid_s(f_params, int(n_grid, ik), f_radii, f_z_shift, &
-                is_valid, f_message, error_code = error_code)
+        allocate(f_params(int(n_params, ik)))
+        allocate(f_radii(n), source = 0.0_rk)
+        allocate(f_thetas(n))
+        f_params(:) = real(params(:), rk)
+        ! Uniform nodes with the endpoints pinned: under -ffast-math the
+        ! product (n-1)*PI_C/(n-1) can land one ulp ABOVE PI_C, which the
+        ! theta-domain check then rejects with SHAPE_ERROR_INVALID_GRID.
+        do i = 1_ik, n
+            f_thetas(i) = real(i - 1_ik, rk) * PI_C / real(n - 1_ik, rk)
+        end do
+        f_thetas(1) = 0.0_rk
+        f_thetas(n) = PI_C
+
+        ! Resolve first: the z_shift is reported even though the radius form
+        ! resolves again internally (identical inputs, identical answer).
+        call compute_shape_standalone_s(f_params, n_rho, f_z_shift, r_north, &
+                r_south, error_code)
+        if (error_code /= FOS_VALID) then
+            status = int(error_code, ik_c)
+            call marshal_message_to_c(status_message(error_code), message_buf, &
+                    message_buf_len)
+            return
+        end if
+
+        call compute_radius_grid_standalone_s(f_params, f_thetas, n_rho, f_radii, &
+                error_code)
+        if (error_code /= FOS_VALID) then
+            status = int(error_code, ik_c)
+            call marshal_message_to_c(status_message(error_code), message_buf, &
+                    message_buf_len)
+            return
+        end if
 
         radii(:) = real(f_radii(:), rk_c)
         z_shift = real(f_z_shift, rk_c)
-        status = int(error_code, ik_c)
-        call marshal_message_to_c(f_message, message_buf, message_buf_len)
+        status = int(FOS_VALID, ik_c)
+        call marshal_message_to_c('', message_buf, message_buf_len)
     end function fos_compute_radius_grid
 
     !===========================================================================
@@ -120,7 +165,7 @@ contains
 
         real(kind = rk), allocatable :: f_params(:)
         real(kind = rk)    :: c, z_sh, dz, f_z, f_rho, f_drho
-        integer(kind = ik) :: i, n
+        integer(kind = ik) :: i, n, code
 
         z = 0.0_rk_c
         rho = 0.0_rk_c
@@ -150,7 +195,12 @@ contains
         end if
 
         n = int(n_z, ik)
-        z_sh = compute_fos_z_shift_f(f_params)
+        call compute_z_shift_s(f_params, z_sh, code)
+        if (code /= FOS_VALID) then
+            status = int(code, ik_c)
+            call marshal_message_to_c(status_message(code), message_buf, message_buf_len)
+            return
+        end if
         dz = 2.0_rk * c / real(n - 1_ik, rk)
 
         do i = 1_ik, n
@@ -180,8 +230,9 @@ contains
         integer(kind = ik_c) :: status
 
         real(kind = rk), allocatable :: f_params(:)
-        real(kind = rk) :: f_z_neck, f_rho_neck
-        logical         :: l_found
+        real(kind = rk)    :: f_z_neck, f_rho_neck
+        integer(kind = ik) :: code
+        logical            :: l_found
 
         z_neck = 0.0_rk_c
         rho_neck = 0.0_rk_c
@@ -200,7 +251,12 @@ contains
             return
         end if
 
-        call compute_fos_neck_s(f_params, f_z_neck, f_rho_neck, l_found)
+        call compute_neck_standalone_s(f_params, NECK_N_POINTS, f_z_neck, &
+                f_rho_neck, l_found, code)
+        if (code /= FOS_VALID) then
+            status = int(code, ik_c)
+            return
+        end if
 
         z_neck = real(f_z_neck, rk_c)
         rho_neck = real(f_rho_neck, rk_c)
@@ -229,9 +285,7 @@ contains
 
         real(kind = rk), allocatable :: f_params(:)
         real(kind = rk)      :: f_z_shift, f_r_north, f_r_south
-        logical              :: is_valid
         integer(kind = ik)   :: error_code
-        character(len = 256) :: f_message
 
         z_shift = 0.0_rk_c
         r_north = 0.0_rk_c
@@ -246,14 +300,20 @@ contains
         allocate(f_params(int(n_params, ik)))
         f_params(:) = real(params(:), rk)
 
-        call compute_fos_shape_s(f_params, int(n_rho_grid, ik), f_z_shift, &
-                f_r_north, f_r_south, is_valid, f_message, error_code)
+        call compute_shape_standalone_s(f_params, &
+                max(FOS_N_POINTS_FLOOR, int(n_rho_grid, ik)), f_z_shift, &
+                f_r_north, f_r_south, error_code)
 
         z_shift = real(f_z_shift, rk_c)
         r_north = real(f_r_north, rk_c)
         r_south = real(f_r_south, rk_c)
         status  = int(error_code, ik_c)
-        call marshal_message_to_c(f_message, message_buf, message_buf_len)
+        if (error_code == FOS_VALID) then
+            call marshal_message_to_c('', message_buf, message_buf_len)
+        else
+            call marshal_message_to_c(status_message(error_code), message_buf, &
+                    message_buf_len)
+        end if
     end function fos_compute_shape
 
     function fos_compute_radius_and_derivative_at_thetas( &
@@ -270,6 +330,12 @@ contains
         integer(kind = ik_c) :: status
 
         real(kind = rk), allocatable :: f_params(:), f_thetas(:), f_radii(:), f_dr(:)
+        real(kind = rk) :: gz(N_RHO_AT_THETAS), grho(N_RHO_AT_THETAS)
+        real(kind = rk) :: gdrho(N_RHO_AT_THETAS)
+        real(kind = rk) :: grid_shift, rho_max, shift, c
+        type(fos_bundle_t) :: bundle
+        logical, allocatable :: converged(:)
+        integer(kind = ik) :: code, n, i
 
         if (n_thetas < 1_ik_c) then
             status = int(FOS_ERROR_INVALID_ARGUMENTS, ik_c)
@@ -279,13 +345,36 @@ contains
         radii(:)     = 0.0_rk_c
         dr_dtheta(:) = 0.0_rk_c
 
-        allocate(f_params(int(n_params, ik)), f_thetas(int(n_thetas, ik)))
-        allocate(f_radii(int(n_thetas, ik)), f_dr(int(n_thetas, ik)))
+        n = int(n_thetas, ik)
+        allocate(f_params(int(n_params, ik)), f_thetas(n))
+        allocate(f_radii(n), f_dr(n), converged(n))
         f_params(:) = real(params(:), rk)
         f_thetas(:) = real(thetas(:), rk)
+        shift = real(z_shift, rk)
 
-        call compute_fos_radius_and_derivative_at_thetas_s( &
-                f_params, f_thetas, real(z_shift, rk), f_radii, f_dr)
+        ! The caller supplies the shift, so no tier-1 form applies; the Newton
+        ! bracket bound still needs rho_max, which comes from a rho(z) grid.
+        call compute_rho_z_grid_standalone_s(f_params, N_RHO_AT_THETAS, gz, grho, &
+                gdrho, grid_shift, code)
+        if (code /= FOS_VALID) then
+            status = int(code, ik_c)
+            return
+        end if
+
+        rho_max = 0.0_rk
+        do i = 1_ik, N_RHO_AT_THETAS
+            rho_max = max(rho_max, grho(i))
+        end do
+
+        c = f_params(1)
+        bundle%n_params = min(int(n_params, ik), FOS_MAX_K)
+        bundle%params(:) = 0.0_rk
+        bundle%params(1:bundle%n_params) = f_params(1:bundle%n_params)
+        bundle%z_shift = shift
+        bundle%r_hi_bound = 2.0_rk * sqrt(rho_max**2 &
+                + max(c + shift, abs(-c + shift))**2)
+
+        call newton_radius_s(bundle, cos(f_thetas), f_radii, f_dr, converged)
 
         radii(:)     = real(f_radii(:), rk_c)
         dr_dtheta(:) = real(f_dr(:), rk_c)
@@ -302,10 +391,14 @@ contains
         real(kind = rk_c) :: z_sh
 
         real(kind = rk), allocatable :: f_params(:)
+        real(kind = rk)    :: f_z_sh
+        integer(kind = ik) :: code
 
         allocate(f_params(int(n_params, ik)))
         f_params(:) = real(params(:), rk)
-        z_sh = real(compute_fos_z_shift_f(f_params), rk_c)
+        call compute_z_shift_s(f_params, f_z_sh, code)
+        if (code /= FOS_VALID) f_z_sh = 0.0_rk
+        z_sh = real(f_z_sh, rk_c)
     end function fos_z_shift
 
     function fos_a2(params, n_params) result(a2) bind(c, name='fos_a2')
@@ -314,10 +407,14 @@ contains
         real(kind = rk_c) :: a2
 
         real(kind = rk), allocatable :: f_params(:)
+        real(kind = rk)    :: f_a2
+        integer(kind = ik) :: code
 
         allocate(f_params(int(n_params, ik)))
         f_params(:) = real(params(:), rk)
-        a2 = real(compute_fos_a2_f(f_params), rk_c)
+        call compute_a2_s(f_params, f_a2, code)
+        if (code /= FOS_VALID) f_a2 = 0.0_rk
+        a2 = real(f_a2, rk_c)
     end function fos_a2
 
 end module fos_parameterization_c_api_mod

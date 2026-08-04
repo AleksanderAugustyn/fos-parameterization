@@ -1,57 +1,82 @@
-!> Module for Fourier-over-Spheroid (FoS) nuclear shape parameterization.
+!> Public surface of the Fourier-over-Spheroid (FoS) nuclear shape library.
 !!
-!! ## Architecture
+!! This module is the library's front door. It owns no shape algorithm: every
+!! kernel, table, cache and standalone form lives in
+!! `fos_parameterization_workers_mod` and is re-exported here, so a consumer
+!! never has to name the workers module or `shape_core_mod`. The only code
+!! written here is the status-message lookup and three raw evaluators (see
+!! "Raw evaluators" below).
 !!
-!! This module is responsible for:
-!! 1. Computing the FoS shape in cylindrical coordinates (ρ, z)
-!! 2. Validating that ρ ≤ 0 only at the poles (valid shape)
-!! 3. Validating f_min threshold to prevent "beak" singularities
-!! 4. Computing the intrinsic z-shift and baking it into the grid
-!! 5. Checking star-convexity and finding additional z-shift if needed
-!! 6. Converting the ρ(z) representation to R(θ) for the radius grid
+!! ## Three tiers
 !!
-!! Physics policy is NOT this module's job. Rejections here are mathematics
-!! (c > 0, rho > 0) plus this module's own numerical constraints (beak f_min,
-!! star-convexity margin, both required by the R(theta) conversion). Filtering
-!! of mathematically valid but physically meaningless shapes (e.g. necked
-!! shapes at low elongation) belongs to the consumer: see
-!! radius_grid_mod's validate_physics.
+!! 1. **Standalone (tier 1)** — `compute_*_standalone_s`: one call in, one
+!!    answer out. Tables are sized per call, which is what lifts the parameter
+!!    cap to N_max = `FOS_MAX_PARAMS` (50). Nothing is retained; there is
+!!    nothing to free.
+!! 2. **Cached (tier 2)** — `cache_*_s` on a `cache_t`: a per-shape working
+!!    level that recomputes only what the changed parameters invalidated.
+!!    Capped at the engine's `SHAPE_CACHE_MAX_PARAMS`.
+!! 3. **Shared tables** — a `tables_t` built once and bound to any number of
+!!    caches through `cache_init_shared_s`.
 !!
-!! ## Defense in Depth: Beak Singularity Detection
+!! Physics policy is NOT this library's job. Rejections are mathematics
+!! (c > 0, rho > 0) plus the numerical constraints the R(theta) conversion
+!! itself needs (beak `F_MIN_THRESHOLD`, `STAR_CONVEXITY_MARGIN`). Filtering
+!! mathematically valid but physically meaningless shapes belongs to the
+!! consumer.
 !!
-!! The FoS parameterization can develop "beak" cusps when f(u) approaches zero
-!! in the interior. While mathematically valid (f > 0), these shapes cause:
-!! - Derivative singularities: dρ/dz → ∞ as f(u) → 0
-!! - Newton-Raphson convergence failures
-!! - Catastrophic errors in surface/Coulomb integrals
+!! ## Lifetime and thread rules (normative)
 !!
-!! We detect and reject such shapes early by checking f_min > F_MIN_THRESHOLD.
+!! - **Never copy-assign a `cache_t`.** Intrinsic assignment copies the owned
+!!   `tables` pointer shallowly, so the copy double-frees it. One cache has one
+!!   owner and one thread.
+!! - **One cache per thread.** A `cache_t` is mutated by every compute call.
+!!   `tables_t` is read-only after init and may be shared by any number of
+!!   threads' caches.
+!! - **`cache_free_s` is mandatory — there is no finalizer.** A cache that owns
+!!   its tables leaks them if it goes out of scope or is re-initialized unfreed.
+!! - **A shared `tables_t` must be declared `target` and must outlive every
+!!   cache bound to it** (`cache_init_shared_s` stores a pointer, not a copy).
+!!   Free the caches first, then the tables.
 !!
-!! ## Coordinate Systems and Shifts
+!! ## Cached intermediates (normative dependency map)
 !!
-!! The FoS parameterization defines shapes in terms of a parameter u ∈ [-1, 1]:
-!!   - z = c × u (in reduced units where R0 = 1)
-!!   - ρ² = f(u) / c
+!! Parameter slots: p1 = c, p2 = a3, p3 = a4, p4 = a5, p5 = a6, p6 = a7,
+!! p7 = a8, p8 = a9.
 !!
-!! The intrinsic z-shift (z_shift_intrinsic) places the center of mass at the origin.
-!! For R(θ) computation, we need the shape to be star-convex from the origin.
+!! | # | intermediate                          | depends on      |
+!! |---|---------------------------------------|-----------------|
+!! | 1 | a2 (volume constraint)                | p3, p5, p7      |
+!! | 2 | z_shift_intrinsic                     | p1, p2, p4, p6, p8 |
+!! | 3 | f_grid: f, f' at the u nodes          | p2-p8 (NOT c)   |
+!! | 4 | beak verdict: f_min over the scan grid| p2-p8 (NOT c)   |
+!! | 5 | rho_grid: z, rho, drho/dz, rho_max    | p1-p8           |
+!! | 6 | resolve: g(0), optimum, z_shift_total | p1-p8           |
+!! | 7 | radius grid at the init thetas        | p1-p8           |
+!! | 8 | radius and derivative at those thetas | p1-p8           |
 !!
-!! **Key convention:** The z_shift returned by this module represents the total
-!! shift applied to the shape's z-coordinates. Positive z_shift means the shape
-!! is shifted in the +z direction. When checking star-convexity for a shape
-!! shifted by z_shift, we check: (z + z_shift) × dρ/dz - ρ ≤ 0
+!! Producer order is 1 -> 8. Every cached compute presents its parameters to
+!! the engine once, then recomputes only the intermediates its own output
+!! needs, in that order. `cache_recompute_count_f` reports the counters.
 !!
-!! ## Workflow
+!! ## Coordinate systems and shifts
 !!
-!! ```
-!! 1. compute_rho_z_grid_s()     - Create internal ρ(z) grid with n_grid points
-!! 2. validate_rho_grid_s()      - Check ρ > 0 for interior points AND f_min threshold
-!! 3. compute_fos_z_shift_f()    - Calculate intrinsic z_shift
-!! 4. apply_z_shift_to_grid_s()  - Shift grid to place COM at origin
-!! 5. check_star_convexity_s()   - Verify star-convexity, find additional shift if needed
-!! 6. compute_radius_grid_s()    - Convert to R(θ) grid
-!! ```
+!! FoS defines the shape on u = z/c in [-1, 1]: z = c*u in reduced units
+!! (R0 = 1), and rho^2 = f(u)/c. The intrinsic z-shift places the centre of
+!! mass at the origin. The R(theta) conversion additionally needs a star-convex
+!! origin, so the resolve step keeps the COM origin when it is already
+!! well-conditioned and otherwise moves to the star-convexity optimum s*. The
+!! z_shift every output reports is the TOTAL shift applied to the shape's
+!! z-coordinates; positive means shifted toward +z.
 !!
+!! ## Raw evaluators (outside the tier rules)
+!!
+!! `compute_fos_f_and_derivatives_s`, `get_fos_coefficient_f` and
+!! `compute_rho_at_z_s` are raw, unvalidated evaluators kept public for
+!! diagnostics. They are NOT part of the tier surface: no length checking
+!! beyond zero-extension of short vectors, no status argument, and degenerate
+!! input gives the documented fallback value rather than a rejection. The
+!! exact-`n_params` rule of the cached tier does not apply to them.
 module fos_parameterization_mod
 
     use precision_utilities_mod, only: ik, rk
@@ -69,60 +94,36 @@ module fos_parameterization_mod
             FOS_MAX_PARAMS, compute_radius_grid_standalone_s, &
             compute_radius_and_derivative_standalone_s, compute_shape_standalone_s, &
             compute_rho_z_grid_standalone_s, compute_neck_standalone_s, &
-            compute_star_convexity_optimum_standalone_s
+            compute_star_convexity_optimum_standalone_s, &
+            FOS_N_POINTS_FLOOR, FOS_MAX_K, FOS_COEFF_NEGLIGIBLE, FOS_U_TIP_TOL, &
+            C_MIN, F_MIN_THRESHOLD, STAR_CONVEXITY_MARGIN, &
+            FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_NOT_STAR_CONVEX, FOS_ERROR_INVALID_C, &
+            FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_CONVERGENCE, FOS_ERROR_BUFFER_MISMATCH
 
     implicit none
 
     private
 
-    ! Main entry point
-    public :: compute_fos_radius_grid_s
-
-    ! Per-shape resolve step (validity + z_shift + analytic pole radii)
-    public :: compute_fos_shape_s
-
-    ! Batch R(theta) + dR/dtheta evaluation at caller-supplied thetas
-    public :: compute_fos_radius_and_derivative_at_thetas_s
-
-    ! Individual workflow components
-    public :: compute_rho_z_grid_s
-    public :: validate_rho_grid_s
-    public :: check_star_convexity_s
-    public :: compute_fos_star_convexity_optimum_s
-    public :: compute_radius_at_theta_s
-
-    ! Helper functions
-    public :: compute_fos_a2_f
-    public :: get_fos_coefficient_f
-    public :: compute_fos_f_and_derivatives_s
-    public :: compute_fos_z_shift_f
-    public :: compute_rho_at_z_s
-    public :: compute_radius_fos_with_zshift_s
-    public :: compute_fos_neck_s
-
-    ! Shape/evaluation split: scalar shape bundle + elemental R, dR/dtheta core
-    public :: make_fos_shape_f
-    public :: compute_fos_radius_and_derivative_s
-
-    ! Internal rho(z) grid type — public so consumers and tests can drive the
-    ! grid-level workflow (compute_rho_z_grid_s / validate_rho_grid_s /
-    ! check_star_convexity_s) directly.
-    public :: rho_z_grid_t
-
-    ! Parameter-independent trig tables (re-exported from the workers module)
+    !---------------------------------------------------------------------------
+    ! Shared tables — build once, bind to many caches
+    !---------------------------------------------------------------------------
+    !! A `tables_t` is immutable after `tables_init_s` and therefore safe to
+    !! share across threads. A tables object handed to `cache_init_shared_s`
+    !! MUST be declared with the `target` attribute and MUST outlive every cache
+    !! bound to it: the cache stores a pointer, not a copy. Free the caches
+    !! first, then the tables.
     public :: tables_t
     public :: tables_init_s
     public :: tables_free_s
+    public :: FOS_N_POINTS_FLOOR
 
-    ! Status-reporting replacements for the sentinel-returning pure functions
-    ! compute_fos_a2_f / compute_fos_z_shift_f (re-exported from the workers
-    ! module — these two are public 2.0 surface, the other kernels are not)
-    public :: compute_a2_s
-    public :: compute_z_shift_s
-
-    ! Per-shape cached tier (re-exported from the workers module): the cache
-    ! type, its lifecycle, the resolved-shape and cylindrical outputs, and the
-    ! recompute counters the contract's minimality tests read.
+    !---------------------------------------------------------------------------
+    ! Cached tier — one cache, one owner, one thread
+    !---------------------------------------------------------------------------
+    !! Never copy-assign a cache (double-free of the owned tables pointer); one
+    !! cache per thread; `cache_free_s` is mandatory, there is no finalizer.
+    !! `cache_init_shared_s` additionally requires that the caller's tables be
+    !! declared `target` and outlive every cache bound to it.
     public :: cache_t
     public :: cache_init_s
     public :: cache_init_shared_s
@@ -136,9 +137,9 @@ module fos_parameterization_mod
     public :: cache_star_convexity_optimum_s
     public :: cache_recompute_count_f
 
-    ! Standalone (tier-1) forms (re-exported from the workers module): one call
-    ! in, one answer out, no engine and no cache. They size their tables per
-    ! call, which is what lifts their parameter cap to N_max = FOS_MAX_PARAMS.
+    !---------------------------------------------------------------------------
+    ! Standalone (tier-1) forms — no engine, no cache, N_max = FOS_MAX_PARAMS
+    !---------------------------------------------------------------------------
     public :: FOS_MAX_PARAMS
     public :: compute_radius_grid_standalone_s
     public :: compute_radius_and_derivative_standalone_s
@@ -147,47 +148,36 @@ module fos_parameterization_mod
     public :: compute_neck_standalone_s
     public :: compute_star_convexity_optimum_standalone_s
 
-    ! Module constants
-    integer(kind = ik), parameter :: MAX_K = 50_ik
-    real(kind = rk), parameter :: NR_TOLERANCE = 1.0e-12_rk
-    integer(kind = ik), parameter :: NR_MAX_ITER = 50_ik
-    real(kind = rk), parameter :: POLE_THRESH = 1.0_rk - 1.0e-10_rk
-    real(kind = rk), parameter, public :: C_MIN = 1.0e-10_rk
-    real(kind = rk), parameter :: COEFF_NEGLIGIBLE = 1.0e-30_rk
-    ! Tip detection tolerance: grid construction reaches u = ±1 only up to
-    ! roundoff (~1 ulp), and f(±1) = 0 analytically, so drho/dz = f'/(2c*sqrt(cf))
-    ! amplifies that residue to ~1e7 unless u this close to a tip is treated AS
-    ! the tip (rho = 0, drho/dz = 0). No interior evaluation comes within 1e-15.
-    real(kind = rk), parameter :: U_TIP_TOL = 4.0_rk * epsilon(1.0_rk)
+    !---------------------------------------------------------------------------
+    ! Status-reporting scalar helpers
+    !---------------------------------------------------------------------------
+    public :: compute_a2_s
+    public :: compute_z_shift_s
 
     !---------------------------------------------------------------------------
-    ! Defense in Depth: Beak Singularity Threshold
+    ! Raw evaluators — outside the tier rules (see the module header)
     !---------------------------------------------------------------------------
-    !! Minimum f(u) threshold - shapes with f_min below this are rejected.
-    !! This prevents numerical instabilities from "beak" singularities where
-    !! the shape approaches but doesn't quite reach self-intersection.
-    !!
-    !! Physical interpretation: f_min < 1e-3 corresponds to shapes with
-    !! extremely concentrated deformations that nuclear matter cannot support.
-    !!
-    !! Tuning guidance:
-    !!   - 1e-2: Very conservative, rejects moderately deformed shapes
-    !!   - 1e-3: Recommended default, balances safety and coverage
-    !!   - 1e-4: Aggressive, allows shapes closer to the validity boundary
-    real(kind = rk), parameter, public :: F_MIN_THRESHOLD = 1.0e-3_rk
+    public :: get_fos_coefficient_f
+    public :: compute_fos_f_and_derivatives_s
+    public :: compute_rho_at_z_s
 
     !---------------------------------------------------------------------------
-    ! Number of sampling points for f_min search
+    ! Numerical constants a consumer may need to reason about a rejection
     !---------------------------------------------------------------------------
-    integer(kind = ik), parameter :: F_MIN_SAMPLE_POINTS = 1001_ik
+    !! Owned by the workers module (the single owner of every kernel constant);
+    !! re-exported here so the public surface is self-contained.
+    public :: C_MIN
+    public :: F_MIN_THRESHOLD
+    public :: STAR_CONVEXITY_MARGIN
 
     !---------------------------------------------------------------------------
     ! Status codes
     !---------------------------------------------------------------------------
     !! Two disjoint ranges share one integer space. 0-99 are the shared
     !! shape_core codes, re-exported here so a caller never has to use
-    !! shape_core_mod directly; 100+ are FoS-specific. FOS_VALID is an alias of
-    !! SHAPE_VALID, so success compares equal across both libraries.
+    !! shape_core_mod directly; 100+ are FoS-specific and owned by the workers
+    !! module. FOS_VALID is an alias of SHAPE_VALID, so success compares equal
+    !! across both libraries.
     public :: SHAPE_VALID
     public :: SHAPE_ERROR_TOO_MANY_PARAMS
     public :: SHAPE_ERROR_CACHE_NOT_INITIALIZED
@@ -196,73 +186,18 @@ module fos_parameterization_mod
     public :: SHAPE_ERROR_INVALID_INIT
     public :: SHAPE_ERROR_TABLES_NOT_INITIALIZED
 
+    public :: FOS_ERROR_RHO_NEGATIVE
+    public :: FOS_ERROR_NOT_STAR_CONVEX
+    public :: FOS_ERROR_INVALID_C
+    public :: FOS_ERROR_BEAK_SINGULARITY
+    public :: FOS_ERROR_CONVERGENCE
+    public :: FOS_ERROR_BUFFER_MISMATCH
+
     integer(kind = ik), parameter, public :: FOS_VALID = SHAPE_VALID
-    integer(kind = ik), parameter, public :: FOS_ERROR_RHO_NEGATIVE = 100_ik
-    integer(kind = ik), parameter, public :: FOS_ERROR_NOT_STAR_CONVEX = 101_ik
-    integer(kind = ik), parameter, public :: FOS_ERROR_INVALID_C = 102_ik
-    integer(kind = ik), parameter, public :: FOS_ERROR_BEAK_SINGULARITY = 103_ik
-    integer(kind = ik), parameter, public :: FOS_ERROR_CONVERGENCE = 104_ik
-    integer(kind = ik), parameter, public :: FOS_ERROR_BUFFER_MISMATCH = 105_ik
 
     !> Length of every string returned by status_message.
     integer(kind = ik), parameter, public :: STATUS_MESSAGE_LEN = 64_ik
     public :: status_message
-
-    !---------------------------------------------------------------------------
-    ! Star-convexity safety margin
-    !---------------------------------------------------------------------------
-    !! A shape is accepted iff, at its best origin s* = argmin_s g(s),
-    !! g(s*) = max_i[(z_i+s*)·dρ/dz_i - ρ_i] ≤ -margin. The mathematical
-    !! single-valued (representable) boundary is g(s*) = 0, where R(θ) develops a
-    !! vertical wall (|dR/dθ| → ∞); the margin holds shapes off that singularity.
-    !!
-    !! Value empirically retuned 2026-07-05 (0.1 → 0.01) via the RewriteProject
-    !! representability probe (see compute_fos_star_convexity_optimum_s). At
-    !! spectral GL-4096 density the FoS→R(θ) conversion reproduces V/S to well
-    !! within tolerance for EVERY single-valued shape (round-trip ~3e-12, dS ≤
-    !! 1.2e-6 even in the last bin before g=0), so the intrinsic representability
-    !! limit is g=0 and the margin is only a safety buffer off that singularity.
-    !! At 0.01 the production sweep keeps ~400x (volume) / 1e6x (surface) headroom
-    !! under the tolerances; 0.01 is one bin off the g=0 singularity.
-    !! Lowering it required fixing origin selection (see ORIGIN_CONDITION_MARGIN):
-    !! the former s=0 fast path evaluated marginal-at-COM shapes from a steep
-    !! origin, corrupting the volume integral. The energy model's neck-radius
-    !! cutoff selects physical shapes downstream. In reduced units (R0 = 1).
-    real(kind = rk), parameter, public :: STAR_CONVEXITY_MARGIN = 1.0e-2_rk
-
-    !---------------------------------------------------------------------------
-    ! COM-origin conditioning threshold for star-convexity origin selection
-    !---------------------------------------------------------------------------
-    !! The R(θ) origin is the COM (z_shift = 0) when the shape is already
-    !! well-conditioned there — g(0) = max_i[z_i·dρ/dz_i - ρ_i] ≤ -threshold — and
-    !! otherwise the star-convexity optimum s* = argmin_s g(s), which is always at
-    !! least as well-conditioned (g(s*) ≤ g(0)). 0.1 is the empirically-validated
-    !! COM conditioning bound: at g(0) ≤ -0.1 the GL volume/surface integrals
-    !! converge to ~1e-12 from the COM origin. Held fixed (independent of the
-    !! acceptance margin above) so lowering the margin preserves the origin — and
-    !! thus the z_shift — of every previously-accepted shape, while routing the
-    !! newly-admitted marginal shapes to their best-conditioned origin.
-    real(kind = rk), parameter :: ORIGIN_CONDITION_MARGIN = 1.0e-1_rk
-
-    !> Scalar bundle of FoS parameters plus a resolved z-shift. Exists so the
-    !! radius evaluator can be elemental: Fortran requires every elemental
-    !! dummy to be scalar, which an assumed-shape params(:) can never be.
-    type, public :: fos_shape_t
-        integer(kind = ik) :: n_params = 0_ik
-        real(kind = rk)    :: params(MAX_K) = 0.0_rk
-        real(kind = rk)    :: z_shift = 0.0_rk
-    end type fos_shape_t
-
-    ! Internal ρ(z) grid type
-    type :: rho_z_grid_t
-        integer(kind = ik) :: n_points = 0_ik
-        real(kind = rk), allocatable :: z(:)
-        real(kind = rk), allocatable :: rho(:)
-        real(kind = rk), allocatable :: drho_dz(:)
-        real(kind = rk) :: z_min = 0.0_rk
-        real(kind = rk) :: z_max = 0.0_rk
-        logical :: initialized = .false.
-    end type rho_z_grid_t
 
 contains
 
@@ -296,671 +231,23 @@ contains
     end function status_message
 
     !===========================================================================
-    ! MAIN ENTRY POINT
+    ! RAW EVALUATORS
     !===========================================================================
+    ! Unvalidated, status-free, outside the tier rules. See the module header.
 
-    !> Validates FoS shape and computes radius grid for radius_grid_mod.
-    subroutine compute_fos_radius_grid_s(params, n_grid, radii, z_shift, is_valid, message, &
-            n_rho_grid, error_code)
-        real(kind = rk), intent(in) :: params(:)
-        integer(kind = ik), intent(in) :: n_grid
-        real(kind = rk), intent(out) :: radii(n_grid)
-        real(kind = rk), intent(out) :: z_shift
-        logical, intent(out) :: is_valid
-        character(len = *), intent(out) :: message
-        integer(kind = ik), intent(in), optional :: n_rho_grid
-        integer(kind = ik), intent(out), optional :: error_code
-
-        integer(kind = ik) :: n_internal
-        real(kind = rk) :: r_north, r_south
-        integer(kind = ik) :: err_local
-
-        radii = 0.0_rk
-        z_shift = 0.0_rk
-        is_valid = .false.
-        message = ''
-
-        n_internal = n_grid
-        if (present(n_rho_grid)) n_internal = max(100_ik, n_rho_grid)
-
-        ! Steps 1-4 live in compute_fos_shape_s; codes and messages unchanged.
-        call compute_fos_shape_s(params, n_internal, z_shift, r_north, r_south, &
-                is_valid, message, err_local)
-        if (.not. is_valid) then
-            if (present(error_code)) error_code = err_local
-            return
-        end if
-
-        ! Step 5: Compute R(θ) grid using the final z_shift
-        call compute_radius_grid_internal_s(params, n_grid, z_shift, radii)
-
-        is_valid = .true.
-        message = ''
-        if (present(error_code)) error_code = FOS_VALID
-
-    end subroutine compute_fos_radius_grid_s
-
-    !> Per-shape resolve step: validity + total z-shift + analytic pole radii,
-    !! computed once on the internal rho(z) grid — independent of any theta
-    !! node set. Feed the resulting z_shift to
-    !! compute_fos_radius_and_derivative_at_thetas_s for any number of node sets.
+    !> Computes rho and optionally drho/dz at a given z-coordinate.
     !!
-    !! On any failure all outputs are zero-filled and is_valid is .false.
+    !! Raw evaluator: no validation, no status. The z argument is in the SHIFTED
+    !! frame (the frame the R(theta) origin sits in), so the FoS parameter is
+    !! u = (z - z_shift) / c. Degenerate input — an empty vector, c <= C_MIN, or
+    !! |u| at a tip within roundoff — returns the documented fallback rho = 0,
+    !! drho_dz = 0 rather than a rejection.
     !!
-    !! @param[in]  params      FoS parameters: params(1) = c, params(k-1) = a_k for k >= 3
-    !! @param[in]  n_rho_grid  Internal rho(z) grid size, used verbatim
-    !! @param[out] z_shift     Total shift (intrinsic COM + star-convexity search)
-    !! @param[out] r_north     R(0) = c + z_shift (pole extent in the shifted frame)
-    !! @param[out] r_south     R(pi) = |-c + z_shift|
-    !! @param[out] is_valid    .true. iff the shape passed all mathematical checks
-    !! @param[out] message     Empty on success
-    !! @param[out] error_code  FOS_VALID on success
-    subroutine compute_fos_shape_s(params, n_rho_grid, z_shift, r_north, r_south, &
-            is_valid, message, error_code)
-        real(kind = rk),    intent(in)  :: params(:)
-        integer(kind = ik), intent(in)  :: n_rho_grid
-        real(kind = rk),    intent(out) :: z_shift
-        real(kind = rk),    intent(out) :: r_north
-        real(kind = rk),    intent(out) :: r_south
-        logical,            intent(out) :: is_valid
-        character(len = *), intent(out) :: message
-        integer(kind = ik), intent(out) :: error_code
-
-        type(rho_z_grid_t) :: rho_grid
-        real(kind = rk)    :: z_shift_intrinsic
-        logical            :: rho_valid, star_convex
-
-        z_shift    = 0.0_rk
-        r_north    = 0.0_rk
-        r_south    = 0.0_rk
-        is_valid   = .false.
-        message    = ''
-        error_code = FOS_VALID
-
-        ! Step 1: internal rho(z) grid (unshifted, z in [-c, c])
-        call compute_rho_z_grid_s(params, n_rho_grid, rho_grid, error_code, message)
-        if (error_code /= FOS_VALID) then
-            call deallocate_rho_grid(rho_grid)
-            return
-        end if
-
-        ! Step 2: interior rho > 0 AND f_min above the beak threshold
-        call validate_rho_grid_s(rho_grid, params, rho_valid, error_code, message)
-        if (.not. rho_valid) then
-            call deallocate_rho_grid(rho_grid)
-            return
-        end if
-
-        ! Step 3 + 3b: intrinsic COM shift, baked into the grid
-        z_shift_intrinsic = compute_fos_z_shift_f(params)
-        call apply_z_shift_to_grid_s(rho_grid, z_shift_intrinsic)
-
-        ! Step 4: star-convexity (may find an additional shift)
-        call check_star_convexity_s(params, rho_grid, z_shift, star_convex, message)
-        if (.not. star_convex) then
-            error_code = FOS_ERROR_NOT_STAR_CONVEX
-            z_shift    = 0.0_rk
-            call deallocate_rho_grid(rho_grid)
-            return
-        end if
-
-        z_shift = z_shift_intrinsic + z_shift
-
-        ! Analytic pole radii in the shifted frame — the same expressions the
-        ! Newton evaluator's pole branch uses.
-        r_north = params(1) + z_shift
-        r_south = abs(-params(1) + z_shift)
-
-        is_valid   = .true.
-        message    = ''
-        error_code = FOS_VALID
-        call deallocate_rho_grid(rho_grid)
-
-    end subroutine compute_fos_shape_s
-
-    !> Diagnostic: the raw, UNGATED star-convexity optimum for a shape.
-    !!
-    !! Builds the internal rho(z) grid, validates rho/beak, applies the intrinsic
-    !! COM shift, then returns g(s*) = min_s max_i[(z_i+s) drho_dz_i - rho_i] and
-    !! the total shift z_shift_total = z_shift_intrinsic + s*, WITHOUT applying
-    !! STAR_CONVEXITY_MARGIN. The mathematical single-valued (representable)
-    !! boundary is max_t_opt = 0; the production gate accepts max_t_opt <= -margin.
-    !! Exposes the quantity the margin thresholds, for empirical / representability
-    !! studies. Degenerate shapes (rho<=0, beak, invalid c) return ok=.false. with
-    !! the matching error_code.
-    subroutine compute_fos_star_convexity_optimum_s(params, n_rho_grid, z_shift_total, &
-            max_t_opt, ok, error_code)
-        real(kind = rk), intent(in) :: params(:)
-        integer(kind = ik), intent(in) :: n_rho_grid
-        real(kind = rk), intent(out) :: z_shift_total
-        real(kind = rk), intent(out) :: max_t_opt
-        logical, intent(out) :: ok
-        integer(kind = ik), intent(out) :: error_code
-
-        type(rho_z_grid_t) :: rho_grid
-        real(kind = rk) :: z_shift_intrinsic, s_opt
-        logical :: rho_valid
-        character(len = 256) :: message
-
-        z_shift_total = 0.0_rk
-        max_t_opt = huge(1.0_rk)
-        ok = .false.
-        error_code = FOS_VALID
-
-        call compute_rho_z_grid_s(params, n_rho_grid, rho_grid, error_code, message)
-        if (error_code /= FOS_VALID) then
-            call deallocate_rho_grid(rho_grid)
-            return
-        end if
-
-        call validate_rho_grid_s(rho_grid, params, rho_valid, error_code, message)
-        if (.not. rho_valid) then
-            call deallocate_rho_grid(rho_grid)
-            return
-        end if
-
-        z_shift_intrinsic = compute_fos_z_shift_f(params)
-        call apply_z_shift_to_grid_s(rho_grid, z_shift_intrinsic)
-
-        call minimize_star_convexity_s(rho_grid, params(1), s_opt, max_t_opt)
-        z_shift_total = z_shift_intrinsic + s_opt
-        ok = .true.
-        error_code = FOS_VALID
-
-        call deallocate_rho_grid(rho_grid)
-    end subroutine compute_fos_star_convexity_optimum_s
-
-    !> Batch-evaluate R(theta) and dR/dtheta at caller-supplied thetas, for a
-    !! shape whose validity and z_shift were already established by
-    !! compute_fos_shape_s. One scalar shape build, one elemental sweep — the
-    !! N Newton solves are independent and free to vectorize.
-    !!
-    !! Caller contract: size(radii) == size(dr_dthetas) == size(thetas).
-    !! Degenerate params (empty, c <= C_MIN) yield the unit-sphere fallback
-    !! r = 1, dr_dtheta = 0 — same library guarantee as the scalar evaluator.
-    pure subroutine compute_fos_radius_and_derivative_at_thetas_s(params, thetas, &
-            z_shift, radii, dr_dthetas)
-        real(kind = rk), intent(in)  :: params(:)
-        real(kind = rk), intent(in)  :: thetas(:)
-        real(kind = rk), intent(in)  :: z_shift
-        real(kind = rk), intent(out) :: radii(:)
-        real(kind = rk), intent(out) :: dr_dthetas(:)
-
-        type(fos_shape_t) :: shape
-
-        shape = make_fos_shape_f(params, z_shift)
-        call compute_fos_radius_and_derivative_s(shape, cos(thetas), radii, dr_dthetas)
-
-    end subroutine compute_fos_radius_and_derivative_at_thetas_s
-
-    !===========================================================================
-    ! STEP 1: CREATE ρ(z) GRID
-    !===========================================================================
-
-    subroutine compute_rho_z_grid_s(params, n_points, grid, error_code, message)
-        real(kind = rk), intent(in) :: params(:)
-        integer(kind = ik), intent(in) :: n_points
-        type(rho_z_grid_t), intent(out) :: grid
-        integer(kind = ik), intent(out) :: error_code
-        character(len = *), intent(out) :: message
-
-        real(kind = rk) :: c, c_inv, u, dz, f_val, fp_val, sqrt_cf, rho_sq
-        integer(kind = ik) :: i
-
-        error_code = FOS_VALID
-        message = ''
-        grid%initialized = .false.
-
-        if (size(params) < 1) then
-            error_code = FOS_ERROR_INVALID_C
-            message = 'Empty parameter array'
-            return
-        end if
-
-        c = params(1)
-        if (c <= C_MIN) then
-            error_code = FOS_ERROR_INVALID_C
-            write(message, '(A,ES12.4)') 'Elongation c must be positive, got: ', c
-            return
-        end if
-
-        c_inv = 1.0_rk / c
-
-        grid%n_points = n_points
-        allocate(grid%z(n_points), grid%rho(n_points), grid%drho_dz(n_points))
-
-        grid%z_min = -c
-        grid%z_max = c
-        dz = 2.0_rk * c / real(n_points - 1_ik, rk)
-
-        do i = 1_ik, n_points
-            grid%z(i) = -c + real(i - 1_ik, rk) * dz
-            u = grid%z(i) * c_inv
-
-            ! Same tip convention as compute_rho_at_z_s: at |u| = 1 (up to
-            ! roundoff) the shape ends, rho = 0 and drho/dz = 0 by convention.
-            if (abs(u) >= 1.0_rk - U_TIP_TOL) then
-                grid%rho(i) = 0.0_rk
-                grid%drho_dz(i) = 0.0_rk
-                cycle
-            end if
-
-            call compute_fos_f_and_derivatives_s(params, u, f_val, fp_val)
-            rho_sq = f_val * c_inv
-
-            if (rho_sq > 0.0_rk) then
-                grid%rho(i) = sqrt(rho_sq)
-                sqrt_cf = sqrt(c * f_val)
-                grid%drho_dz(i) = fp_val / (2.0_rk * c * sqrt_cf)
-            else
-                grid%rho(i) = 0.0_rk
-                grid%drho_dz(i) = 0.0_rk
-            end if
-        end do
-
-        grid%initialized = .true.
-
-    end subroutine compute_rho_z_grid_s
-
-    !> Applies z-shift to the ρ(z) grid coordinates.
-    !!
-    !! Shifts all z-coordinates: z_new = z_old + z_shift
-    !! Places center of mass at origin when z_shift = z_shift_intrinsic.
-    subroutine apply_z_shift_to_grid_s(grid, z_shift)
-        type(rho_z_grid_t), intent(inout) :: grid
-        real(kind = rk), intent(in) :: z_shift
-
-        if (.not. grid%initialized) return
-
-        grid%z = grid%z + z_shift
-        grid%z_min = grid%z_min + z_shift
-        grid%z_max = grid%z_max + z_shift
-
-    end subroutine apply_z_shift_to_grid_s
-
-    !===========================================================================
-    ! STEP 2: VALIDATE ρ(z) GRID (Enhanced with beak detection)
-    !===========================================================================
-
-    !> Validates the ρ(z) grid for physical consistency.
-    !!
-    !! This enhanced validation includes:
-    !! 1. Interior point check: ρ > 0 for all interior points
-    !! 2. Beak singularity detection: f_min > F_MIN_THRESHOLD
-    !!
-    !! The beak detection prevents numerical catastrophes from shapes that are
-    !! mathematically valid but have f(u) approaching zero, causing derivative
-    !! singularities that corrupt surface and Coulomb integrals.
-    subroutine validate_rho_grid_s(grid, params, is_valid, error_code, message)
-        type(rho_z_grid_t), intent(in) :: grid
-        real(kind = rk), intent(in) :: params(:)
-        logical, intent(out) :: is_valid
-        integer(kind = ik), intent(out) :: error_code
-        character(len = *), intent(out) :: message
-
-        integer(kind = ik) :: i
-        real(kind = rk), parameter :: RHO_TOLERANCE = 1.0e-12_rk
-        real(kind = rk) :: f_min, u, f_val, u_at_f_min
-
-        is_valid = .true.
-        error_code = FOS_VALID
-        message = ''
-
-        if (.not. grid%initialized) then
-            is_valid = .false.
-            error_code = FOS_ERROR_RHO_NEGATIVE
-            message = 'rho(z) grid not initialized'
-            return
-        end if
-
-        !-----------------------------------------------------------------------
-        ! Check 1: Interior points must have ρ > 0
-        !-----------------------------------------------------------------------
-        do i = 2_ik, grid%n_points - 1_ik
-            if (grid%rho(i) <= RHO_TOLERANCE) then
-                is_valid = .false.
-                error_code = FOS_ERROR_RHO_NEGATIVE
-                write(message, '(A,ES12.4,A,ES12.4)') &
-                        'Invalid shape: rho <= 0 at z = ', grid%z(i), ', rho = ', grid%rho(i)
-                return
-            end if
-        end do
-
-        !-----------------------------------------------------------------------
-        ! Check 2: Beak singularity detection via f_min threshold
-        !-----------------------------------------------------------------------
-        ! Sample f(u) at many points to find the minimum value.
-        ! Even if the grid rho values are positive, f(u) approaching zero
-        ! causes derivative singularities that corrupt calculations.
-        f_min = huge(1.0_rk)
-        u_at_f_min = 0.0_rk
-
-        do i = 1_ik, F_MIN_SAMPLE_POINTS
-            u = -1.0_rk + 2.0_rk * real(i - 1_ik, rk) / real(F_MIN_SAMPLE_POINTS - 1_ik, rk)
-            ! Avoid exact poles where f=0 is expected
-            u = max(-0.999_rk, min(0.999_rk, u))
-
-            call compute_fos_f_and_derivatives_s(params, u, f_val)
-
-            if (f_val < f_min) then
-                f_min = f_val
-                u_at_f_min = u
-            end if
-        end do
-
-        if (f_min < F_MIN_THRESHOLD) then
-            is_valid = .false.
-            error_code = FOS_ERROR_BEAK_SINGULARITY
-            write(message, '(A,ES10.3,A,ES10.3,A,F6.3)') &
-                    'Shape too close to beak singularity: f_min = ', f_min, &
-                    ' < threshold = ', F_MIN_THRESHOLD, &
-                    ' at u = ', u_at_f_min
-            return
-        end if
-
-    end subroutine validate_rho_grid_s
-
-    !===========================================================================
-    ! STEP 4: CHECK STAR-CONVEXITY
-    !===========================================================================
-
-    !> Checks if shape is star-convex from origin and finds valid shift if not.
-    !!
-    !! A shape is star-convex from the origin if every surface point can be
-    !! connected to the origin by a straight line that doesn't intersect the
-    !! surface elsewhere. For a shape already shifted (grid z-coordinates
-    !! shifted), we check with z_shift=0 first, then search for additional shift.
-    !!
-    !! Returns z_shift as the ADDITIONAL shift needed (beyond what's already
-    !! baked into the grid). If star-convex at z_shift=0, returns z_shift=0.
-    subroutine check_star_convexity_s(params, rho_grid, z_shift, is_star_convex, message)
-        real(kind = rk), intent(in) :: params(:)
-        type(rho_z_grid_t), intent(in) :: rho_grid
-        real(kind = rk), intent(out) :: z_shift
-        logical, intent(out) :: is_star_convex
-        character(len = *), intent(out) :: message
-
-        real(kind = rk) :: g0, s_opt, g_opt
-
-        z_shift = 0.0_rk
-        is_star_convex = .false.
-        message = ''
-
-        ! Accept iff the shape is star-convex at its best origin s* — g(s*) is the
-        ! deepest achievable value, so this is the true representability test. Then
-        ! choose the R(θ) origin: keep the COM origin (z_shift = 0) when it is
-        ! already well-conditioned, otherwise use s*, which is always at least as
-        ! well-conditioned (g(s*) ≤ g(0)). Evaluating a marginal-at-COM shape from
-        ! its steep COM origin, rather than s*, is what corrupts the volume integral.
-        g0 = max_star_convexity_value_f(rho_grid, 0.0_rk)
-        call minimize_star_convexity_s(rho_grid, params(1), s_opt, g_opt)
-
-        if (g_opt > -STAR_CONVEXITY_MARGIN) then
-            message = 'Shape is not star-convex and no valid z-shift found'
-            z_shift = 0.0_rk
-            return
-        end if
-
-        is_star_convex = .true.
-        if (g0 <= -ORIGIN_CONDITION_MARGIN) then
-            z_shift = 0.0_rk
-        else
-            z_shift = s_opt
-        end if
-
-    end subroutine check_star_convexity_s
-
-    !> Maximum star-convexity test value over interior points for a given shift.
-    !!
-    !! g(s) = max_i [ (z_i + s) * drho_dz_i - rho_i ]. This is a pointwise max of
-    !! affine functions of s, hence convex in s. The shape is star-convex at shift
-    !! s iff g(s) <= -STAR_CONVEXITY_MARGIN (gated in check_star_convexity_s).
-    pure function max_star_convexity_value_f(grid, z_shift) result(g)
-        type(rho_z_grid_t), intent(in) :: grid
-        real(kind = rk), intent(in) :: z_shift
-        real(kind = rk) :: g
-
-        integer(kind = ik) :: i
-        real(kind = rk) :: test_val
-
-        if (.not. grid%initialized) then
-            g = huge(1.0_rk)
-            return
-        end if
-
-        g = -huge(1.0_rk)
-        do i = 2_ik, grid%n_points - 1_ik
-            test_val = (grid%z(i) + z_shift) * grid%drho_dz(i) - grid%rho(i)
-            if (test_val > g) g = test_val
-        end do
-    end function max_star_convexity_value_f
-
-    !> Golden-section minimization of g(s) = max_i[(z_i + s) drho_dz_i - rho_i]
-    !! over the additional shift s. g is convex piecewise-linear in s (pointwise
-    !! max of affine functions), so golden-section returns the exact global
-    !! minimum. The bracket [-2c, 2c] contains any origin that can be star-convex.
-    !! Returns the argmin s_opt and the minimum value g_opt; the caller applies
-    !! the STAR_CONVEXITY_MARGIN gate.
-    pure subroutine minimize_star_convexity_s(grid, c, s_opt, g_opt)
-        type(rho_z_grid_t), intent(in) :: grid
-        real(kind = rk), intent(in) :: c
-        real(kind = rk), intent(out) :: s_opt
-        real(kind = rk), intent(out) :: g_opt
-
-        ! (sqrt(5) - 1) / 2; SHIFT_TOL and bracket are in reduced units (R0 = 1).
-        real(kind = rk), parameter :: GOLDEN = 0.6180339887498949_rk
-        real(kind = rk), parameter :: SHIFT_TOL = 1.0e-6_rk
-        integer(kind = ik), parameter :: MAX_ITER = 200_ik
-
-        real(kind = rk) :: a, b, x1, x2, f1, f2
-        integer(kind = ik) :: it
-
-        a = -2.0_rk * c
-        b = 2.0_rk * c
-        x1 = b - GOLDEN * (b - a)
-        x2 = a + GOLDEN * (b - a)
-        f1 = max_star_convexity_value_f(grid, x1)
-        f2 = max_star_convexity_value_f(grid, x2)
-
-        do it = 1_ik, MAX_ITER
-            if (b - a <= SHIFT_TOL) exit
-            if (f1 < f2) then
-                b = x2
-                x2 = x1
-                f2 = f1
-                x1 = b - GOLDEN * (b - a)
-                f1 = max_star_convexity_value_f(grid, x1)
-            else
-                a = x1
-                x1 = x2
-                f1 = f2
-                x2 = a + GOLDEN * (b - a)
-                f2 = max_star_convexity_value_f(grid, x2)
-            end if
-        end do
-
-        s_opt = 0.5_rk * (a + b)
-        g_opt = max_star_convexity_value_f(grid, s_opt)
-    end subroutine minimize_star_convexity_s
-
-    !> Finds the z-position of the neck (minimum ρ between two maxima).
-    subroutine find_neck_from_grid_s(grid, z_neck, found)
-        type(rho_z_grid_t), intent(in) :: grid
-        real(kind = rk), intent(out) :: z_neck
-        logical, intent(out) :: found
-
-        integer(kind = ik) :: i, n_maxima, max1_idx, max2_idx
-        integer(kind = ik) :: left_idx, right_idx, neck_idx, j
-        real(kind = rk) :: max1_rho, max2_rho, min_rho
-
-        z_neck = 0.0_rk
-        found = .false.
-        if (.not. grid%initialized) return
-
-        n_maxima = 0_ik
-        max1_idx = 0_ik
-        max2_idx = 0_ik
-        max1_rho = -1.0_rk
-        max2_rho = -1.0_rk
-
-        do i = 2_ik, grid%n_points - 1_ik
-            if (grid%rho(i) > grid%rho(i - 1) .and. grid%rho(i) > grid%rho(i + 1)) then
-                n_maxima = n_maxima + 1_ik
-                if (grid%rho(i) > max1_rho) then
-                    max2_rho = max1_rho
-                    max2_idx = max1_idx
-                    max1_rho = grid%rho(i)
-                    max1_idx = i
-                else if (grid%rho(i) > max2_rho) then
-                    max2_rho = grid%rho(i)
-                    max2_idx = i
-                end if
-            end if
-        end do
-
-        if (n_maxima < 2_ik .or. max1_idx == 0_ik .or. max2_idx == 0_ik) return
-
-        if (max1_idx < max2_idx) then
-            left_idx = max1_idx
-            right_idx = max2_idx
-        else
-            left_idx = max2_idx
-            right_idx = max1_idx
-        end if
-
-        min_rho = huge(1.0_rk)
-        neck_idx = left_idx
-
-        do j = left_idx, right_idx
-            if (grid%rho(j) < min_rho) then
-                min_rho = grid%rho(j)
-                neck_idx = j
-            end if
-        end do
-
-        z_neck = grid%z(neck_idx)
-        found = .true.
-
-    end subroutine find_neck_from_grid_s
-
-    !> Finds the neck (interior minimum of ρ between two maxima) of a FoS shape.
-    !!
-    !! A coarse grid scan brackets the neck, then Newton iteration on f'(u) = 0
-    !! refines it to machine precision (the neck is a minimum of f, so f'' > 0
-    !! there). Used to define the scission line: scission when rho_neck → 0.
-    !!
-    !! @param[in]  params    FoS parameters [c, a3, a4, ...]
-    !! @param[out] z_neck    Neck z-position in the intrinsic frame (COM at origin)
-    !! @param[out] rho_neck  Neck radius in reduced units (R0 = 1)
-    !! @param[out] found     .false. if the shape has no neck or the grid is invalid
-    !! @param[in]  n_grid    Optional scan resolution (default 1001)
-    subroutine compute_fos_neck_s(params, z_neck, rho_neck, found, n_grid)
-        real(kind = rk), intent(in) :: params(:)
-        real(kind = rk), intent(out) :: z_neck
-        real(kind = rk), intent(out) :: rho_neck
-        logical, intent(out) :: found
-        integer(kind = ik), intent(in), optional :: n_grid
-
-        integer(kind = ik), parameter :: NECK_NEWTON_MAX_ITER = 50_ik
-        real(kind = rk), parameter :: NECK_NEWTON_TOL = 1.0e-14_rk
-
-        type(rho_z_grid_t) :: grid
-        integer(kind = ik) :: n_points, err, iter
-        character(len = 256) :: message
-        real(kind = rk) :: c, u, u_lo, u_hi, du, step
-        real(kind = rk) :: f_val, fp_val, fpp_val, z_neck_grid
-
-        z_neck = 0.0_rk
-        rho_neck = 0.0_rk
-        found = .false.
-
-        n_points = 1001_ik
-        if (present(n_grid)) n_points = max(101_ik, n_grid)
-
-        call compute_rho_z_grid_s(params, n_points, grid, err, message)
-        if (err /= FOS_VALID) then
-            call deallocate_rho_grid(grid)
-            return
-        end if
-
-        ! Grid scan on the unshifted grid (z ∈ [-c, c])
-        call find_neck_from_grid_s(grid, z_neck_grid, found)
-        call deallocate_rho_grid(grid)
-        if (.not. found) return
-
-        ! Newton refinement of the f-minimum, bracketed to one grid spacing
-        ! around the scan result so it cannot escape to a different extremum.
-        c = params(1)
-        du = 2.0_rk / real(n_points - 1_ik, rk)
-        u = z_neck_grid / c
-        u_lo = max(-1.0_rk, u - du)
-        u_hi = min(1.0_rk, u + du)
-
-        do iter = 1_ik, NECK_NEWTON_MAX_ITER
-            call compute_fos_f_and_derivatives_s(params, u, f_val, fp_val, fpp_val)
-            if (fpp_val <= 0.0_rk) exit
-            step = fp_val / fpp_val
-            u = min(u_hi, max(u_lo, u - step))
-            if (abs(step) < NECK_NEWTON_TOL) exit
-        end do
-
-        call compute_fos_f_and_derivatives_s(params, u, f_val)
-        rho_neck = sqrt(max(f_val, 0.0_rk) / c)
-        z_neck = c * u + compute_fos_z_shift_f(params)
-
-    end subroutine compute_fos_neck_s
-
-    !===========================================================================
-    ! STEP 5: COMPUTE R(θ) GRID
-    !===========================================================================
-
-    subroutine compute_radius_grid_internal_s(params, n_grid, z_shift, radii)
-        real(kind = rk), intent(in) :: params(:)
-        integer(kind = ik), intent(in) :: n_grid
-        real(kind = rk), intent(in) :: z_shift
-        real(kind = rk), intent(out) :: radii(n_grid)
-
-        integer(kind = ik) :: i
-        real(kind = rk) :: h, theta, x, r
-
-        h = PI_C / real(n_grid - 1_ik, rk)
-
-        do i = 1_ik, n_grid
-            theta = real(i - 1_ik, rk) * h
-            x = cos(theta)
-            call compute_radius_fos_with_zshift_s(params, x, z_shift, r)
-            radii(i) = r
-        end do
-
-    end subroutine compute_radius_grid_internal_s
-
-    subroutine compute_radius_at_theta_s(params, theta, z_shift, r)
-        real(kind = rk), intent(in) :: params(:)
-        real(kind = rk), intent(in) :: theta
-        real(kind = rk), intent(in) :: z_shift
-        real(kind = rk), intent(out) :: r
-
-        call compute_radius_fos_with_zshift_s(params, cos(theta), z_shift, r)
-
-    end subroutine compute_radius_at_theta_s
-
-    !===========================================================================
-    ! HELPER FUNCTIONS
-    !===========================================================================
-
-    subroutine deallocate_rho_grid(grid)
-        type(rho_z_grid_t), intent(inout) :: grid
-        if (allocated(grid%z)) deallocate(grid%z)
-        if (allocated(grid%rho)) deallocate(grid%rho)
-        if (allocated(grid%drho_dz)) deallocate(grid%drho_dz)
-        grid%initialized = .false.
-        grid%n_points = 0_ik
-    end subroutine deallocate_rho_grid
-
-    !> Computes ρ and optionally dρ/dz at a given z-coordinate.
-    !!
-    !! The z argument is in the shifted frame (where origin is for R(θ)).
-    !! To get the FoS parameter u: u = (z - z_shift) / c
+    !! @param[in]  params   FoS parameters: params(1) = c, params(k-1) = a_k, k >= 3
+    !! @param[in]  z        Axial coordinate in the shifted frame
+    !! @param[in]  z_shift  Shift baked into that frame
+    !! @param[out] rho      Cylindrical radius, 0 outside the body
+    !! @param[out] drho_dz  Optional slope, 0 where rho is 0
     pure subroutine compute_rho_at_z_s(params, z, z_shift, rho, drho_dz)
         real(kind = rk), intent(in) :: params(:)
         real(kind = rk), intent(in) :: z
@@ -979,7 +266,7 @@ contains
 
         c_inv = 1.0_rk / c
         u = (z - z_shift) * c_inv
-        if (abs(u) >= 1.0_rk - U_TIP_TOL) return
+        if (abs(u) >= 1.0_rk - FOS_U_TIP_TOL) return
 
         if (present(drho_dz)) then
             call compute_fos_f_and_derivatives_s(params, u, f_val, fp_val)
@@ -995,12 +282,9 @@ contains
 
     end subroutine compute_rho_at_z_s
 
-    !===========================================================================
-    ! CORE FoS FUNCTIONS
-    !===========================================================================
-
-    !> Computes a2 from the volume constraint formula.
-    pure function compute_fos_a2_f(params) result(a2)
+    !> a2 from the volume constraint. Private helper of get_fos_coefficient_f;
+    !! the status-reporting public form is `compute_a2_s`.
+    pure function fos_a2_f(params) result(a2)
         real(kind = rk), intent(in) :: params(:)
         real(kind = rk) :: a2
         integer(kind = ik) :: n, idx, n_params
@@ -1009,18 +293,26 @@ contains
         a2 = 0.0_rk
         n_params = size(params, kind = ik)
 
-        do n = 2_ik, MAX_K
+        do n = 2_ik, FOS_MAX_K
             idx = 2_ik * n - 1_ik
             if (idx > n_params) exit
             a_2n = params(idx)
-            if (abs(a_2n) < COEFF_NEGLIGIBLE) cycle
+            if (abs(a_2n) < FOS_COEFF_NEGLIGIBLE) cycle
             sign_factor = merge(1.0_rk, -1.0_rk, mod(n, 2_ik) == 0_ik)
             a2 = a2 + sign_factor * a_2n / real(2_ik * n - 1_ik, rk)
         end do
 
-    end function compute_fos_a2_f
+    end function fos_a2_f
 
-    !> Gets FoS coefficient a_k from parameter array.
+    !> Coefficient a_k of the FoS expansion, read out of a parameter vector.
+    !!
+    !! Raw evaluator: a_1 is 0 by definition, a_2 comes from the volume
+    !! constraint, a_k for k >= 3 lives at params(k - 1), and an index past the
+    !! end of the vector reads as 0 (zero-extension, never an error).
+    !!
+    !! @param[in] params  FoS parameters
+    !! @param[in] k       Coefficient index
+    !! @return            a_k
     pure function get_fos_coefficient_f(params, k) result(a_k)
         real(kind = rk), intent(in) :: params(:)
         integer(kind = ik), intent(in) :: k
@@ -1030,7 +322,7 @@ contains
         if (k < 2_ik) then
             a_k = 0.0_rk
         else if (k == 2_ik) then
-            a_k = compute_fos_a2_f(params)
+            a_k = fos_a2_f(params)
         else
             idx = k - 1_ik
             if (idx <= size(params, kind = ik)) then
@@ -1042,7 +334,17 @@ contains
 
     end function get_fos_coefficient_f
 
-    !> Computes f(u) and its derivatives.
+    !> Computes f(u) and its derivatives at an arbitrary u.
+    !!
+    !! Raw evaluator: live trig, no tables, no validation. The tabled kernel
+    !! `compute_f_grid_s` reproduces it node-for-node on the u-grid; this form
+    !! is what the Newton solver and any diagnostic use off-grid.
+    !!
+    !! @param[in]  params  FoS parameters (zero-extended past its end)
+    !! @param[in]  u       Reduced axial coordinate in [-1, 1]
+    !! @param[out] f       f(u) = 1 - u^2 - sum_k [a_2k cos(w_k u) + a_2k+1 sin(psi_k u)]
+    !! @param[out] fp      Optional df/du
+    !! @param[out] fpp     Optional d2f/du2
     pure subroutine compute_fos_f_and_derivatives_s(params, u, f, fp, fpp)
         real(kind = rk), intent(in) :: params(:)
         real(kind = rk), intent(in) :: u
@@ -1058,7 +360,7 @@ contains
         need_fp = present(fp)
         need_fpp = present(fpp)
         n_params = size(params, kind = ik)
-        k_max = min((n_params + 2_ik) / 2_ik + 1_ik, MAX_K)
+        k_max = min((n_params + 2_ik) / 2_ik + 1_ik, FOS_MAX_K)
 
         sum_f = 0.0_rk
         sum_fp = 0.0_rk
@@ -1067,7 +369,8 @@ contains
         do k = 1_ik, k_max
             a_even = get_fos_coefficient_f(params, 2_ik * k)
             a_odd = get_fos_coefficient_f(params, 2_ik * k + 1_ik)
-            if (abs(a_even) < COEFF_NEGLIGIBLE .and. abs(a_odd) < COEFF_NEGLIGIBLE) cycle
+            if (abs(a_even) < FOS_COEFF_NEGLIGIBLE .and. &
+                    abs(a_odd) < FOS_COEFF_NEGLIGIBLE) cycle
 
             omega_k = real(2_ik * k - 1_ik, rk) * PI_C / 2.0_rk
             psi_k = real(k, rk) * PI_C
@@ -1093,197 +396,5 @@ contains
         if (need_fpp) fpp = -2.0_rk - sum_fpp
 
     end subroutine compute_fos_f_and_derivatives_s
-
-    !> Computes the intrinsic z-shift to place COM at origin.
-    pure function compute_fos_z_shift_f(params) result(z_sh)
-        real(kind = rk), intent(in) :: params(:)
-        real(kind = rk) :: z_sh
-        real(kind = rk) :: c, sum_term, a_odd, sign_factor
-        integer(kind = ik) :: n
-
-        z_sh = 0.0_rk
-        if (size(params) < 1) return
-        c = params(1)
-        if (c <= C_MIN) return
-
-        sum_term = 0.0_rk
-        do n = 1_ik, MAX_K
-            a_odd = get_fos_coefficient_f(params, 2_ik * n + 1_ik)
-            if (abs(a_odd) < COEFF_NEGLIGIBLE) cycle
-            sign_factor = merge(-1.0_rk, 1.0_rk, mod(n, 2_ik) == 0_ik)
-            sum_term = sum_term + sign_factor * a_odd / real(n, rk)
-        end do
-
-        z_sh = (3.0_rk / (2.0_rk * PI_C)) * c * sum_term
-
-    end function compute_fos_z_shift_f
-
-    !> Computes R(θ) at x = cos(θ). Thin wrapper over the elemental core
-    !! compute_fos_radius_and_derivative_s — same Newton path, derivative
-    !! discarded. Kept for its established callers.
-    pure subroutine compute_radius_fos_with_zshift_s(params, x, z_shift, r)
-        real(kind = rk), intent(in) :: params(:)
-        real(kind = rk), intent(in), value :: x
-        real(kind = rk), intent(in), value :: z_shift
-        real(kind = rk), intent(out) :: r
-
-        type(fos_shape_t) :: shape
-        real(kind = rk)   :: dr_unused
-
-        shape = make_fos_shape_f(params, z_shift)
-        call compute_fos_radius_and_derivative_s(shape, x, r, dr_unused)
-
-    end subroutine compute_radius_fos_with_zshift_s
-
-    !> Bundle a params vector and resolved z_shift into the scalar shape type.
-    !!
-    !! Entries beyond MAX_K are dropped: radius evaluation reads coefficients
-    !! only up to k = MAX_K (compute_fos_f_and_derivatives_s caps there, so
-    !! params indices above MAX_K - 1 are never touched), so truncation cannot
-    !! change any evaluated radius. z_shift arrives already resolved — it may
-    !! depend on higher entries, which is why compute_fos_shape_s takes the
-    !! full vector, not this type.
-    pure function make_fos_shape_f(params, z_shift) result(shape)
-        real(kind = rk), intent(in) :: params(:)
-        real(kind = rk), intent(in) :: z_shift
-        type(fos_shape_t) :: shape
-
-        integer(kind = ik) :: n
-
-        n = min(size(params, kind = ik), MAX_K)
-        shape%n_params    = n
-        shape%params(:)   = 0.0_rk
-        shape%params(1:n) = params(1:n)
-        shape%z_shift     = z_shift
-    end function make_fos_shape_f
-
-    !> Elemental core: R(theta) and dR/dtheta at x = cos(theta), theta in [0, pi],
-    !! for a resolved shape.
-    !!
-    !! Solves F(r) = r×sin(θ) - ρ(r×cos(θ)) = 0 with bisection-safeguarded
-    !! Newton-Raphson. For a star-convex shape the ray crosses the surface
-    !! exactly once, with F < 0 inside the body and F > 0 outside, so a
-    !! sign-change bracket [r_lo, r_hi] always exists. Newton steps that would
-    !! leave the bracket are replaced by bisection, which guarantees convergence
-    !! even for steep polar lobes where plain Newton enters a limit cycle
-    !! (stepping outside the body collapses the derivative to sin(θ) and the
-    !! resulting jump overshoots).
-    !!
-    !! The derivative is implicit differentiation at the root:
-    !!   dR/dtheta = -(r cos + drho_dz r sin) / (sin - drho_dz cos)
-    !! Pole branches and the degenerate unit-sphere fallback return dr_dtheta = 0
-    !! (smooth axisymmetric surface has zero slope in R(theta) at the poles).
-    elemental subroutine compute_fos_radius_and_derivative_s(shape, x, r, dr_dtheta)
-        type(fos_shape_t), intent(in)  :: shape
-        real(kind = rk),   intent(in)  :: x
-        real(kind = rk),   intent(out) :: r
-        real(kind = rk),   intent(out) :: dr_dtheta
-
-        real(kind = rk) :: c, sin_theta, cos_theta
-        real(kind = rk) :: z_max, z_min, r_north, r_south
-        real(kind = rk) :: rho, drho_dz, z
-        real(kind = rk) :: r_lo, r_hi, r_curr, r_new, delta_r, F_val, dF_dr
-        integer(kind = ik) :: iter
-
-        dr_dtheta = 0.0_rk
-
-        if (shape%n_params < 1_ik) then
-            r = 1.0_rk
-            return
-        end if
-
-        c = shape%params(1)
-        if (c <= C_MIN) then
-            r = 1.0_rk
-            return
-        end if
-
-        cos_theta = x
-        sin_theta = sqrt(max(1.0_rk - x**2, 0.0_rk))
-
-        ! In shifted frame, shape spans z ∈ [-c + z_shift, c + z_shift]
-        z_max = c + shape%z_shift
-        z_min = -c + shape%z_shift
-        r_north = z_max
-        r_south = abs(z_min)
-
-        ! Handle poles analytically
-        if (x > POLE_THRESH) then
-            r = r_north
-            return
-        end if
-
-        if (x < -POLE_THRESH) then
-            r = r_south
-            return
-        end if
-
-        ! Bracket the root: F(r_lo) < 0 (origin inside the body),
-        ! F(r_hi) > 0 (beyond the surface). Expand r_hi if needed (very
-        ! oblate shapes have equatorial radii exceeding the polar extents).
-        r_lo = 1.0e-10_rk
-        r_hi = 2.0_rk * max(r_north, r_south)
-        do iter = 1_ik, 8_ik
-            z = r_hi * cos_theta
-            call compute_rho_at_z_s(shape%params(1:shape%n_params), z, shape%z_shift, rho)
-            if (r_hi * sin_theta - rho > 0.0_rk) exit
-            r_hi = 2.0_rk * r_hi
-        end do
-
-        ! Initial guess
-        r_curr = 0.5_rk * ((1.0_rk + x) * r_north + (1.0_rk - x) * r_south)
-        r_curr = min(max(r_curr, 0.01_rk), r_hi)
-
-        ! Safeguarded Newton: solve F(r) = r×sin(θ) - ρ(r×cos(θ)) = 0
-        do iter = 1_ik, NR_MAX_ITER
-            z = r_curr * cos_theta
-            call compute_rho_at_z_s(shape%params(1:shape%n_params), z, shape%z_shift, rho, drho_dz)
-
-            F_val = r_curr * sin_theta - rho
-            dF_dr = sin_theta - drho_dz * cos_theta
-
-            ! Maintain the sign-change bracket
-            if (F_val < 0.0_rk) then
-                r_lo = r_curr
-            else
-                r_hi = r_curr
-            end if
-
-            ! Residual-based convergence: |F| is the geometric distance between
-            ! the trial point and the surface, which is what callers care about.
-            if (abs(F_val) < NR_TOLERANCE * max(1.0_rk, r_curr)) exit
-
-            if (abs(dF_dr) > 1.0e-14_rk) then
-                delta_r = F_val / dF_dr
-                r_new = r_curr - delta_r
-            else
-                r_new = r_lo - 1.0_rk  ! force bisection
-            end if
-
-            ! Newton step leaving the bracket -> bisect instead
-            if (r_new <= r_lo .or. r_new >= r_hi) then
-                r_new = 0.5_rk * (r_lo + r_hi)
-            end if
-            r_curr = r_new
-        end do
-
-        r = r_curr
-
-        ! Recompute rho and drho_dz at the final r so the implicit-differentiation
-        ! inputs match the returned radius exactly. This also covers the
-        ! max-iterations exit, where the loop-carried values lag one iterate.
-        z = r * cos_theta
-        call compute_rho_at_z_s(shape%params(1:shape%n_params), z, shape%z_shift, &
-                rho, drho_dz)
-        dF_dr = sin_theta - drho_dz * cos_theta
-        if (abs(dF_dr) > 1.0e-14_rk) then
-            dr_dtheta = -(r * cos_theta + drho_dz * r * sin_theta) / dF_dr
-        else
-            ! Vertical tangent — excluded for star-convex shapes by the
-            ! conversion margin; return 0 rather than a garbage slope.
-            dr_dtheta = 0.0_rk
-        end if
-
-    end subroutine compute_fos_radius_and_derivative_s
 
 end module fos_parameterization_mod

@@ -4,9 +4,9 @@ program fos_param_helpers_test
 
     use precision_utilities_mod, only: ik, rk
     use fos_parameterization_mod, only: compute_fos_f_and_derivatives_s, &
-            compute_fos_a2_f, compute_fos_z_shift_f, get_fos_coefficient_f
+            compute_a2_s, compute_z_shift_s, get_fos_coefficient_f, FOS_VALID
     use fos_test_reference_mod, only: init_quadrature_s, gl_ref_x, gl_ref_w, N_GL_REF
-    use test_utils_mod, only: assert_abs_close, test_summary
+    use test_utils_mod, only: assert_abs_close, assert_int_eq, test_summary
 
     implicit none
 
@@ -19,8 +19,8 @@ program fos_param_helpers_test
                     3.20_rk, 0.55_rk, 0.70_rk, -0.05_rk, 0.05_rk, -0.02_rk, 0.02_rk], &
             [7, 5])
 
-    real(kind = rk) :: params(7), f_val, integral_f, integral_uf, com, z_sh
-    integer(kind = ik) :: i, j
+    real(kind = rk) :: params(7), f_val, integral_f, integral_uf, com, z_sh, a2
+    integer(kind = ik) :: i, j, status
     character(len = 64) :: label
 
     call init_quadrature_s()
@@ -38,7 +38,7 @@ program fos_param_helpers_test
             integral_uf = integral_uf + gl_ref_w(i) * gl_ref_x(i) * f_val
         end do
 
-        ! a2 volume identity: with a2 from compute_fos_a2_f, int f du = 4/3,
+        ! a2 volume identity: with a2 from the volume constraint, int f du = 4/3,
         ! which makes V = pi int rho^2 dz = pi int f du = 4 pi / 3.
         write(label, '(A,I0)') 'a2 identity: param set ', j
         call assert_abs_close(integral_f, 4.0_rk / 3.0_rk, 1.0e-12_rk, trim(label))
@@ -47,8 +47,9 @@ program fos_param_helpers_test
         !   pi int z rho^2 dz / V = (3 c / 4) int u f(u) du
         ! and the intrinsic shift must move the COM to the origin: z_sh = -COM_z.
         com = 0.75_rk * params(1) * integral_uf
-        z_sh = compute_fos_z_shift_f(params)
+        call compute_z_shift_s(params, z_sh, status)
         write(label, '(A,I0)') 'z_shift = -COM: param set ', j
+        call assert_int_eq(status, FOS_VALID, trim(label) // ' (status)')
         call assert_abs_close(z_sh, -com, 1.0e-12_rk, trim(label))
     end do
 
@@ -60,7 +61,9 @@ program fos_param_helpers_test
             'indexing: a4 = params(3)')
     call assert_abs_close(get_fos_coefficient_f(params, 8_ik), 0.07_rk, 0.0_rk, &
             'indexing: a8 = params(7)')
-    call assert_abs_close(get_fos_coefficient_f(params, 2_ik), compute_fos_a2_f(params), &
+    call compute_a2_s(params, a2, status)
+    call assert_int_eq(status, FOS_VALID, 'indexing: a2 status valid')
+    call assert_abs_close(get_fos_coefficient_f(params, 2_ik), a2, &
             0.0_rk, 'indexing: a2 from volume constraint')
     call assert_abs_close(get_fos_coefficient_f(params, 1_ik), 0.0_rk, 0.0_rk, &
             'indexing: a1 = 0')

@@ -36,7 +36,7 @@ program fos_param_standalone_test
             cache_shape_s, cache_rho_z_grid_s, cache_radius_grid_s, &
             cache_radius_and_derivative_s, cache_neck_s, &
             cache_star_convexity_optimum_s, &
-            rho_z_grid_t, compute_rho_z_grid_s, &
+            compute_rho_at_z_s, &
             FOS_ERROR_INVALID_C
     use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS
     use test_utils_mod, only: assert_true, assert_int_eq, assert_abs_close, &
@@ -74,8 +74,7 @@ program fos_param_standalone_test
     real(kind = rk), parameter :: TOL_PARITY = 1.0e-11_rk
 
     type(cache_t)      :: cache
-    type(rho_z_grid_t) :: ref_grid
-    integer(kind = ik) :: status, cstatus, code, i
+    integer(kind = ik) :: status, cstatus, i
     real(kind = rk)    :: thetas(N_THETA)
     real(kind = rk)    :: params50(50), params51(51), params_bad_c(1)
     real(kind = rk)    :: radii(N_THETA), dr(N_THETA)
@@ -89,9 +88,8 @@ program fos_param_standalone_test
     real(kind = rk)    :: g_opt, z_shift_total, cg_opt, cz_shift_total
     real(kind = rk)    :: params_high(N_HIGH), params_flat(N_HIGH)
     real(kind = rk)    :: rho_high(N_POINTS), rho_flat(N_POINTS)
-    real(kind = rk)    :: max_move, max_dev
+    real(kind = rk)    :: max_move, max_dev, ref_c, ref_dz, ref_rho
     logical            :: found, cfound
-    character(len = 256) :: message
 
     do i = 1_ik, N_THETA
         thetas(i) = real(i - 1_ik, rk) * PI_C / real(N_THETA - 1_ik, rk)
@@ -268,19 +266,23 @@ program fos_param_standalone_test
     call assert_true(max_move > 1.0e-3_rk, &
             'a_21 (Fourier order 10) moves the rho(z) grid')
 
-    ! Stronger than "something changed": the tabled sum must agree with the 1.x
+    ! Stronger than "something changed": the tabled sum must agree with the raw
     ! live evaluator, which carries the same min((n+2)/2+1, 50) orders and is
     ! order-complete for 20 parameters. This pins the VALUE of the high-order
-    ! term, not merely its presence.
-    call compute_rho_z_grid_s(params_high, N_POINTS, ref_grid, code, message)
-    call assert_int_eq(code, SHAPE_VALID, 'a_21 vector: 1.x live grid valid')
+    ! term, not merely its presence. `compute_rho_at_z_s` on the grid formula
+    ! (z_i = -c + (i-1) dz, unshifted) is node-for-node what the deleted 1.x
+    ! grid builder did.
+    ref_c = params_high(1)
+    ref_dz = 2.0_rk * ref_c / real(N_POINTS - 1_ik, rk)
 
     max_dev = 0.0_rk
     do i = 1_ik, N_POINTS
-        max_dev = max(max_dev, abs(rho_high(i) - ref_grid%rho(i)))
+        call compute_rho_at_z_s(params_high, &
+                -ref_c + real(i - 1_ik, rk) * ref_dz, 0.0_rk, ref_rho)
+        max_dev = max(max_dev, abs(rho_high(i) - ref_rho))
     end do
     call assert_abs_close(max_dev, 0.0_rk, TOL_PARITY, &
-            'tier-1 rho(z) matches the order-complete 1.x evaluator')
+            'tier-1 rho(z) matches the order-complete live evaluator')
 
     call test_summary()
 
