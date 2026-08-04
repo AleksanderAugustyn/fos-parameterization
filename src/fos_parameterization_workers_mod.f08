@@ -62,6 +62,7 @@ module fos_parameterization_workers_mod
     public :: compute_f_grid_s
     public :: beak_scan_f_min_s
     public :: scale_rho_grid_s
+    public :: resolve_origin_s
     public :: newton_radius_s
 
     ! Cache lifecycle, cached outputs, and engine introspection
@@ -69,6 +70,7 @@ module fos_parameterization_workers_mod
     public :: cache_init_s
     public :: cache_init_shared_s
     public :: cache_free_s
+    public :: cache_shape_s
     public :: cache_rho_z_grid_s
     public :: cache_recompute_count_f
 
@@ -132,6 +134,28 @@ module fos_parameterization_workers_mod
     real(kind = rk), parameter :: R_LO_FLOOR = 1.0e-10_rk
     real(kind = rk), parameter :: DF_DR_FLOOR = 1.0e-14_rk
 
+    !> Star-convexity acceptance margin: a shape is representable as R(theta)
+    !! from its best origin s* iff g(s*) <= -STAR_CONVEXITY_MARGIN. The
+    !! mathematical boundary is g(s*) = 0, where R(theta) develops a vertical
+    !! wall; the margin holds shapes off that singularity. In reduced units
+    !! (R0 = 1). Duplicated (see the migration note above).
+    real(kind = rk), parameter, public :: STAR_CONVEXITY_MARGIN = 1.0e-2_rk
+
+    !> COM-origin conditioning threshold: the R(theta) origin stays at the COM
+    !! (additional shift 0) when g(0) <= -ORIGIN_CONDITION_MARGIN, otherwise it
+    !! moves to s*, which is always at least as well-conditioned. Held fixed and
+    !! independent of the acceptance margin above, so lowering that margin
+    !! preserves the origin of every previously-accepted shape. Duplicated (see
+    !! the migration note above).
+    real(kind = rk), parameter :: ORIGIN_CONDITION_MARGIN = 1.0e-1_rk
+
+    !> Golden-section constants for the origin search: (sqrt(5) - 1) / 2, the
+    !! bracket half-width factor (the bracket is [-2c, 2c]), the stopping width,
+    !! and the iteration cap. Values duplicated from the 1.x minimizer.
+    real(kind = rk), parameter :: GOLDEN = 0.6180339887498949_rk
+    real(kind = rk), parameter :: SHIFT_TOL = 1.0e-6_rk
+    integer(kind = ik), parameter :: SHIFT_MAX_ITER = 200_ik
+
     !> Degenerate or missing elongation. Duplicated from fos_parameterization_mod
     !! (see the migration note above).
     integer(kind = ik), parameter, public :: FOS_ERROR_INVALID_C = 102_ik
@@ -142,6 +166,13 @@ module fos_parameterization_workers_mod
     !> Output array whose size differs from the cache's init-time resolution.
     !! Duplicated (see the migration note above).
     integer(kind = ik), parameter, public :: FOS_ERROR_BUFFER_MISMATCH = 105_ik
+
+    !> Shape not star-convex from any origin. Duplicated (see the migration
+    !! note above).
+    integer(kind = ik), parameter, public :: FOS_ERROR_NOT_STAR_CONVEX = 101_ik
+
+    !> f_min below the beak threshold. Duplicated (see the migration note above).
+    integer(kind = ik), parameter, public :: FOS_ERROR_BEAK_SINGULARITY = 103_ik
 
     !---------------------------------------------------------------------------
     ! Cached intermediates
@@ -172,6 +203,12 @@ module fos_parameterization_workers_mod
     !! stamped by this path.
     integer(kind = ik), parameter :: NEEDS_RHO_Z_GRID(4) = &
             [I_A2, I_Z_SHIFT, I_F_GRID, I_RHO_GRID]
+
+    !> Needs-list of the resolved shape: everything up to and including the
+    !! origin search. The beak verdict (#4) IS part of it — the resolve exists
+    !! only to serve the R(theta) conversion, which a beak singularity breaks.
+    integer(kind = ik), parameter :: NEEDS_SHAPE(6) = &
+            [I_A2, I_Z_SHIFT, I_F_GRID, I_BEAK, I_RHO_GRID, I_RESOLVE]
 
     !> Parameter-independent trigonometric tables for FoS shape evaluation.
     type, public :: tables_t
@@ -658,6 +695,151 @@ contains
     end subroutine scale_rho_grid_s
 
     !===========================================================================
+    ! ORIGIN RESOLVE (STAR-CONVEXITY)
+    !===========================================================================
+
+    !> Resolves the R(theta) origin of a COM-shifted rho(z) grid.
+    !!
+    !! g(s) = max_i[(z_i + s) drho_dz_i - rho_i] over the interior nodes is the
+    !! star-convexity test value at additional shift s: the shape is
+    !! single-valued in R(theta) about that origin iff g(s) <= 0, and this
+    !! library accepts it iff g(s) <= -STAR_CONVEXITY_MARGIN. g is a pointwise
+    !! max of affine functions of s, hence convex, so the golden-section search
+    !! over [-2c, 2c] returns the global minimum.
+    !!
+    !! The verdict and the origin are two separate decisions, exactly as in 1.x:
+    !!   - accept iff g(s*) <= -STAR_CONVEXITY_MARGIN — the deepest achievable
+    !!     value is the true representability test;
+    !!   - then keep the COM origin (additional shift 0) iff it is already
+    !!     well-conditioned, g(0) <= -ORIGIN_CONDITION_MARGIN, else move to s*.
+    !!     Evaluating a marginal-at-COM shape from its steep COM origin is what
+    !!     corrupts the volume integral.
+    !! There is no lazy path: g(0) is computed AND the minimizer always runs.
+    !!
+    !! Infallible: the caller gates on `star_ok`. `z` arrives already COM-shifted
+    !! (scale_rho_grid_s baked z_shift_intrinsic in), so s is measured from the
+    !! COM frame and the total shift is z_shift_intrinsic + s.
+    !!
+    !! Preconditions (caller's, unchecked): the three arrays are the same length
+    !! and hold a resolved rho(z) grid; c > C_MIN.
+    !!
+    !! @param[in]  z                  Axial coordinate, COM-shifted
+    !! @param[in]  rho                Cylindrical radius
+    !! @param[in]  drho_dz            Slope
+    !! @param[in]  c                  Elongation, params(1)
+    !! @param[in]  z_shift_intrinsic  COM shift already baked into z
+    !! @param[out] g0                 g at the COM origin
+    !! @param[out] s_opt              argmin_s g(s)
+    !! @param[out] g_opt              g(s_opt)
+    !! @param[out] star_ok            .true. iff g_opt <= -STAR_CONVEXITY_MARGIN
+    !! @param[out] z_shift_total      Intrinsic shift plus the chosen origin
+    !! @param[out] r_north            R(0) = c + z_shift_total
+    !! @param[out] r_south            R(pi) = |-c + z_shift_total|
+    pure subroutine resolve_origin_s(z, rho, drho_dz, c, z_shift_intrinsic, &
+            g0, s_opt, g_opt, star_ok, z_shift_total, r_north, r_south)
+
+        real(kind = rk), intent(in) :: z(:)
+        real(kind = rk), intent(in) :: rho(:)
+        real(kind = rk), intent(in) :: drho_dz(:)
+        real(kind = rk), intent(in) :: c
+        real(kind = rk), intent(in) :: z_shift_intrinsic
+        real(kind = rk), intent(out) :: g0
+        real(kind = rk), intent(out) :: s_opt
+        real(kind = rk), intent(out) :: g_opt
+        logical, intent(out) :: star_ok
+        real(kind = rk), intent(out) :: z_shift_total
+        real(kind = rk), intent(out) :: r_north
+        real(kind = rk), intent(out) :: r_south
+
+        real(kind = rk) :: s_origin
+
+        g0 = star_convexity_max_f(z, rho, drho_dz, 0.0_rk)
+        call minimize_star_convexity_s(z, rho, drho_dz, c, s_opt, g_opt)
+
+        star_ok = g_opt <= -STAR_CONVEXITY_MARGIN
+
+        if (g0 <= -ORIGIN_CONDITION_MARGIN) then
+            s_origin = 0.0_rk
+        else
+            s_origin = s_opt
+        end if
+
+        z_shift_total = z_shift_intrinsic + s_origin
+        r_north = c + z_shift_total
+        r_south = abs(-c + z_shift_total)
+
+    end subroutine resolve_origin_s
+
+    !> g(s) = max_i[(z_i + s) drho_dz_i - rho_i] over the INTERIOR nodes.
+    !!
+    !! The tips carry the rho = 0, drho/dz = 0 convention and would otherwise
+    !! contribute a spurious 0; the 1.x scan skips them the same way.
+    pure function star_convexity_max_f(z, rho, drho_dz, s) result(g)
+
+        real(kind = rk), intent(in) :: z(:)
+        real(kind = rk), intent(in) :: rho(:)
+        real(kind = rk), intent(in) :: drho_dz(:)
+        real(kind = rk), intent(in) :: s
+        real(kind = rk) :: g
+
+        integer(kind = ik) :: i, n
+        real(kind = rk) :: test_val
+
+        n = size(z, kind = ik)
+
+        g = -huge(1.0_rk)
+        do i = 2_ik, n - 1_ik
+            test_val = (z(i) + s) * drho_dz(i) - rho(i)
+            if (test_val > g) g = test_val
+        end do
+
+    end function star_convexity_max_f
+
+    !> Golden-section minimization of g(s) over the bracket [-2c, 2c], which
+    !! contains any origin that can be star-convex. g is convex piecewise-linear
+    !! in s, so the search returns the exact global minimum.
+    pure subroutine minimize_star_convexity_s(z, rho, drho_dz, c, s_opt, g_opt)
+
+        real(kind = rk), intent(in) :: z(:)
+        real(kind = rk), intent(in) :: rho(:)
+        real(kind = rk), intent(in) :: drho_dz(:)
+        real(kind = rk), intent(in) :: c
+        real(kind = rk), intent(out) :: s_opt
+        real(kind = rk), intent(out) :: g_opt
+
+        real(kind = rk) :: a, b, x1, x2, f1, f2
+        integer(kind = ik) :: it
+
+        a = -2.0_rk * c
+        b = 2.0_rk * c
+        x1 = b - GOLDEN * (b - a)
+        x2 = a + GOLDEN * (b - a)
+        f1 = star_convexity_max_f(z, rho, drho_dz, x1)
+        f2 = star_convexity_max_f(z, rho, drho_dz, x2)
+
+        do it = 1_ik, SHIFT_MAX_ITER
+            if (b - a <= SHIFT_TOL) exit
+            if (f1 < f2) then
+                b = x2
+                x2 = x1
+                f2 = f1
+                x1 = b - GOLDEN * (b - a)
+                f1 = star_convexity_max_f(z, rho, drho_dz, x1)
+            else
+                a = x1
+                x1 = x2
+                f1 = f2
+                x2 = a + GOLDEN * (b - a)
+                f2 = star_convexity_max_f(z, rho, drho_dz, x2)
+            end if
+        end do
+
+        s_opt = 0.5_rk * (a + b)
+        g_opt = star_convexity_max_f(z, rho, drho_dz, s_opt)
+
+    end subroutine minimize_star_convexity_s
+
+    !===========================================================================
     ! NEWTON RADIUS CORE
     !===========================================================================
 
@@ -986,6 +1168,68 @@ contains
     ! CACHED COMPUTES
     !===========================================================================
 
+    !> Resolved shape: total z-shift and the analytic pole radii.
+    !!
+    !! Runs the whole resolve pipeline (#1-#6) and applies the three shape
+    !! gates, in producer order: beak singularity (103), interior rho <= 0
+    !! (100), star-convexity margin (101). Wrong parameter count (4) and
+    !! degenerate c (102) are rejected first, inside `ensure_list_s`.
+    !!
+    !! NOTE on 103 vs 100: an interior rho <= 0 means f <= 0 there, which the
+    !! denser beak scan also sees, so a shape that 1.x rejected with 100 is
+    !! rejected here with 103. The cylindrical output, which never runs #4,
+    !! still reports 100 for it.
+    !!
+    !! Every failure zero-fills all three outputs and returns the engine to
+    !! cold, so the next call runs from scratch.
+    !!
+    !! @param[in,out] cache    Initialized cache
+    !! @param[in]     params   Parameter vector, length == the cache's n_params
+    !! @param[out]    z_shift  Total shift: intrinsic COM shift + chosen origin
+    !! @param[out]    r_north  R(0) = c + z_shift
+    !! @param[out]    r_south  R(pi) = |-c + z_shift|
+    !! @param[out]    status   SHAPE_VALID on success, else the rejecting code
+    subroutine cache_shape_s(cache, params, z_shift, r_north, r_south, status)
+
+        type(cache_t), intent(inout) :: cache
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(out) :: z_shift
+        real(kind = rk), intent(out) :: r_north
+        real(kind = rk), intent(out) :: r_south
+        integer(kind = ik), intent(out) :: status
+
+        ! Zeroed here once: every rejection below returns without touching them.
+        z_shift = 0.0_rk
+        r_north = 0.0_rk
+        r_south = 0.0_rk
+
+        call ensure_list_s(cache, params, NEEDS_SHAPE, status)
+        if (status /= SHAPE_VALID) return
+
+        if (.not. cache%beak_ok) then
+            status = FOS_ERROR_BEAK_SINGULARITY
+            call shape_engine_invalidate_all_s(cache%engine)
+            return
+        end if
+
+        if (.not. cache%rho_positive) then
+            status = FOS_ERROR_RHO_NEGATIVE
+            call shape_engine_invalidate_all_s(cache%engine)
+            return
+        end if
+
+        if (.not. cache%star_ok) then
+            status = FOS_ERROR_NOT_STAR_CONVEX
+            call shape_engine_invalidate_all_s(cache%engine)
+            return
+        end if
+
+        z_shift = cache%z_shift_total
+        r_north = cache%r_north
+        r_south = cache%r_south
+
+    end subroutine cache_shape_s
+
     !> Cylindrical rho(z) profile in the COM frame.
     !!
     !! Gates: wrong parameter count (4), degenerate c (102), interior rho <= 0
@@ -1127,15 +1371,25 @@ contains
             call compute_z_shift_s(params, cache%z_shift_intrinsic, status)
         case (I_F_GRID)
             call compute_f_grid_s(cache%tables, params, cache%f_grid, cache%fp_grid)
+        case (I_BEAK)
+            ! Stores the verdict only; the consuming output owns the 103 gate.
+            call beak_scan_f_min_s(cache%tables, params, cache%f_min, cache%beak_ok)
         case (I_RHO_GRID)
             call scale_rho_grid_s(cache%tables, params(1), cache%z_shift_intrinsic, &
                     cache%f_grid, cache%fp_grid, cache%z, cache%rho, cache%drho_dz, &
                     cache%rho_max, cache%rho_positive)
+        case (I_RESOLVE)
+            ! Infallible by construction; the consuming output owns the 101 gate.
+            call resolve_origin_s(cache%z, cache%rho, cache%drho_dz, params(1), &
+                    cache%z_shift_intrinsic, cache%g0, cache%s_opt, cache%g_opt, &
+                    cache%star_ok, cache%z_shift_total, cache%r_north, cache%r_south)
         case default
-            ! Intermediates 4 and 6-8 arrive with the outputs that consume them.
-            ! Unreachable today: every needs-list in this module is a literal,
-            ! and none of them names an index without an arm above.
-            continue
+            ! Intermediates 7-8 arrive with the outputs that consume them
+            ! (Tasks 7-8). Unreachable today: every needs-list in this module is
+            ! a named literal, and none of them contains an index without an arm
+            ! above. Failing loudly is deliberate — a silent success here would
+            ! stamp an UNCOMPUTED intermediate valid and hand out stale data.
+            status = SHAPE_ERROR_INVALID_INIT
         end select
 
     end subroutine compute_intermediate_s

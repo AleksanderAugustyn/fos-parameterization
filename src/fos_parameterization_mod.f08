@@ -63,7 +63,7 @@ module fos_parameterization_mod
     use fos_parameterization_workers_mod, only: tables_t, tables_init_s, tables_free_s, &
             compute_a2_s, compute_z_shift_s, &
             cache_t, cache_init_s, cache_init_shared_s, cache_free_s, &
-            cache_rho_z_grid_s, cache_recompute_count_f
+            cache_shape_s, cache_rho_z_grid_s, cache_recompute_count_f
 
     implicit none
 
@@ -115,12 +115,13 @@ module fos_parameterization_mod
     public :: compute_z_shift_s
 
     ! Per-shape cached tier (re-exported from the workers module): the cache
-    ! type, its lifecycle, the cylindrical output, and the recompute counters
-    ! the contract's minimality tests read.
+    ! type, its lifecycle, the resolved-shape and cylindrical outputs, and the
+    ! recompute counters the contract's minimality tests read.
     public :: cache_t
     public :: cache_init_s
     public :: cache_init_shared_s
     public :: cache_free_s
+    public :: cache_shape_s
     public :: cache_rho_z_grid_s
     public :: cache_recompute_count_f
 
