@@ -18,8 +18,14 @@
 !! part of the property.
 !!
 !! Rejections are a normal outcome of a PES box and are counted, not failed. The
-!! histogram and the throughput are PRINTED for the validation record; neither
-!! is asserted, so no CI threshold can go flaky. Asserted: zero bitwise
+!! histogram and the two throughputs are PRINTED for the validation record; none
+!! of them is asserted, so no CI threshold can go flaky. The throughputs are
+!! measured on separate clocks and mean different things: "incremental" times
+!! the warm compute alone (one shape per grid point, on a cache that already
+!! holds the previous point's intermediates — the rate a PES scan sees), "cold"
+!! times the fresh cache's whole life (table build + compute + free, dominated
+!! by the table build). Each counts one shape per grid point, so neither is the
+!! sweep's total wall time — every point is resolved twice. Asserted: zero bitwise
 !! mismatches, zero status mismatches, no misuse status (1-6) anywhere, and a
 !! nonzero valid count (a sweep that rejected everything would pass the bitwise
 !! property vacuously).
@@ -109,11 +115,11 @@ contains
         type(cache_t)       :: warm, cold
         real(kind = rk)     :: params(N_DIMS), step(N_DIMS)
         real(kind = rk)     :: r_warm(N_THETA), r_cold(N_THETA)
-        real(kind = rk)     :: wall_seconds, rate_hz
+        real(kind = rk)     :: warm_seconds, cold_seconds
         integer(kind = ik)  :: idx(N_DIMS), d, b, t, status_warm, status_cold
         integer(kind = ik)  :: status, n_cold_init_fail
         integer(kind = ikl) :: n_total, hist(N_CODES + 1_ik)
-        integer(kind = ikl) :: tick_start, tick_end, tick_rate
+        integer(kind = ikl) :: warm_ticks, cold_ticks, t0, t1, tick_rate
 
         do d = 1_ik, N_DIMS
             if (n(d) > 1_ik) then
@@ -134,23 +140,41 @@ contains
 
         hist(:) = 0_ikl
         n_cold_init_fail = 0_ik
+        warm_ticks = 0_ikl
+        cold_ticks = 0_ikl
         idx(:) = 1_ik
-        call system_clock(count = tick_start, count_rate = tick_rate)
+        call system_clock(count_rate = tick_rate)
 
         do
             do d = 1_ik, N_DIMS
                 params(d) = lo(d) + real(idx(d) - 1_ik, rk) * step(d)
             end do
 
+            ! Timed segment 1: the incremental path only — one compute on a
+            ! cache that already holds the previous point's intermediates. This
+            ! is the rate a PES scan actually sees.
+            call system_clock(count = t0)
             call cache_radius_grid_s(warm, params, r_warm, status_warm)
+            call system_clock(count = t1)
+            warm_ticks = warm_ticks + (t1 - t0)
 
+            ! Timed segment 2: the cold reference — table build, one compute and
+            ! the free, which is what a caller pays who builds a cache per shape.
+            ! Kept separate because the table build dominates it.
+            call system_clock(count = t0)
             call cache_init_s(cold, N_DIMS, N_POINTS, thetas, status)
             if (status /= SHAPE_VALID) then
+                call system_clock(count = t1)
+                cold_ticks = cold_ticks + (t1 - t0)
                 n_cold_init_fail = n_cold_init_fail + 1_ik
             else
                 call cache_radius_grid_s(cold, params, r_cold, status_cold)
                 call cache_free_s(cold)
+                call system_clock(count = t1)
+                cold_ticks = cold_ticks + (t1 - t0)
 
+                ! Comparison is outside both timed segments: the assertions are
+                ! the gate's work, not the library's.
                 call assert_int_eq(status_warm, status_cold, &
                         label // ': incremental status == cold status')
                 do t = 1_ik, N_THETA
@@ -176,15 +200,10 @@ contains
             if (d < 1_ik) exit
         end do
 
-        call system_clock(count = tick_end)
         call cache_free_s(warm)
 
-        wall_seconds = real(tick_end - tick_start, rk) / real(tick_rate, rk)
-        if (wall_seconds > 0.0_rk) then
-            rate_hz = real(n_total, rk) / wall_seconds
-        else
-            rate_hz = 0.0_rk
-        end if
+        warm_seconds = real(warm_ticks, rk) / real(tick_rate, rk)
+        cold_seconds = real(cold_ticks, rk) / real(tick_rate, rk)
 
         write(*, '(A)') repeat('-', 68)
         write(*, '(A,A)')  'PES sweep pass: ', label
@@ -196,8 +215,14 @@ contains
                     '  (', 100.0_rk * real(hist(b), rk) / real(n_total, rk), ' %)'
         end do
         write(*, '(A,I0)')    '  unexpected statuses : ', hist(N_CODES + 1_ik)
-        write(*, '(A,F12.3)') '  wall seconds        : ', wall_seconds
-        write(*, '(A,F14.1)') '  shapes / second     : ', rate_hz
+        ! Both rates count ONE shape per grid point, over the segment named.
+        ! Every point is resolved twice (warm and cold), so neither figure is
+        ! the sweep's total wall time; they are two different per-shape costs.
+        write(*, '(A,F12.3)') '  incremental seconds : ', warm_seconds
+        write(*, '(A,F14.1)') '  incremental shapes/s: ', rate_f(n_total, warm_seconds)
+        write(*, '(A,F12.3)') '  cold seconds        : ', cold_seconds
+        write(*, '(A,F14.1)') '  cold shapes/s (incl. cache init + free): ', &
+                rate_f(n_total, cold_seconds)
 
         ! Asserted outcomes. The histogram above is a record, not a gate; these
         ! four are the gate.
@@ -207,6 +232,25 @@ contains
         call assert_true(hist(1) > 0_ikl, label // ': at least one valid shape')
 
     end subroutine run_pass_s
+
+    !> Shapes per second, 0 when the segment was too short for the clock.
+    !!
+    !! @param[in] n_shapes  Shapes resolved in the segment
+    !! @param[in] seconds   Segment duration
+    !! @return              Rate in Hz
+    pure function rate_f(n_shapes, seconds) result(rate_hz)
+
+        integer(kind = ikl), intent(in) :: n_shapes
+        real(kind = rk),     intent(in) :: seconds
+        real(kind = rk) :: rate_hz
+
+        if (seconds > 0.0_rk) then
+            rate_hz = real(n_shapes, rk) / seconds
+        else
+            rate_hz = 0.0_rk
+        end if
+
+    end function rate_f
 
     !> Histogram bucket for a status code; N_CODES + 1 for anything unlisted.
     !!
