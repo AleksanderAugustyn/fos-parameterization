@@ -65,7 +65,11 @@ module fos_parameterization_mod
             cache_t, cache_init_s, cache_init_shared_s, cache_free_s, &
             cache_shape_s, cache_rho_z_grid_s, cache_radius_grid_s, &
             cache_radius_and_derivative_s, cache_radius_and_derivative_at_thetas_s, &
-            cache_neck_s, cache_star_convexity_optimum_s, cache_recompute_count_f
+            cache_neck_s, cache_star_convexity_optimum_s, cache_recompute_count_f, &
+            FOS_MAX_PARAMS, compute_radius_grid_standalone_s, &
+            compute_radius_and_derivative_standalone_s, compute_shape_standalone_s, &
+            compute_rho_z_grid_standalone_s, compute_neck_standalone_s, &
+            compute_star_convexity_optimum_standalone_s
 
     implicit none
 
@@ -131,6 +135,17 @@ module fos_parameterization_mod
     public :: cache_neck_s
     public :: cache_star_convexity_optimum_s
     public :: cache_recompute_count_f
+
+    ! Standalone (tier-1) forms (re-exported from the workers module): one call
+    ! in, one answer out, no engine and no cache. They size their tables per
+    ! call, which is what lifts their parameter cap to N_max = FOS_MAX_PARAMS.
+    public :: FOS_MAX_PARAMS
+    public :: compute_radius_grid_standalone_s
+    public :: compute_radius_and_derivative_standalone_s
+    public :: compute_shape_standalone_s
+    public :: compute_rho_z_grid_standalone_s
+    public :: compute_neck_standalone_s
+    public :: compute_star_convexity_optimum_standalone_s
 
     ! Module constants
     integer(kind = ik), parameter :: MAX_K = 50_ik

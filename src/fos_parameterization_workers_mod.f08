@@ -79,6 +79,14 @@ module fos_parameterization_workers_mod
     public :: cache_star_convexity_optimum_s
     public :: cache_recompute_count_f
 
+    ! Standalone (tier-1) forms: one call in, one answer out, nothing retained
+    public :: compute_radius_grid_standalone_s
+    public :: compute_radius_and_derivative_standalone_s
+    public :: compute_shape_standalone_s
+    public :: compute_rho_z_grid_standalone_s
+    public :: compute_neck_standalone_s
+    public :: compute_star_convexity_optimum_standalone_s
+
     !---------------------------------------------------------------------------
     ! Table-construction parameters
     !---------------------------------------------------------------------------
@@ -109,6 +117,15 @@ module fos_parameterization_workers_mod
 
     !> Largest Fourier coefficient index the evaluator reads.
     integer(kind = ik), parameter, public :: FOS_MAX_K = 50_ik
+
+    !> N_max: the longest parameter vector the standalone (tier-1) forms accept.
+    !! Equal to FOS_MAX_K = 50 by construction — the evaluator reads no
+    !! coefficient past a_50 and `fos_bundle_t` carries exactly that many slots,
+    !! so a longer vector could not be evaluated even if it were accepted. The
+    !! cached tier stops much earlier, at SHAPE_CACHE_MAX_PARAMS, because its
+    !! tables are sized once at init; tier-1 sizes its tables per call and so
+    !! goes all the way to N_max.
+    integer(kind = ik), parameter, public :: FOS_MAX_PARAMS = FOS_MAX_K
 
     !> Coefficient pairs below this magnitude contribute nothing and are skipped
     !! — skipping is load-bearing for bitwise parity with the 1.x evaluator.
@@ -333,6 +350,44 @@ module fos_parameterization_workers_mod
         real(kind = rk), allocatable :: radii_d(:)        !! #8, n_theta
         real(kind = rk), allocatable :: dr_dtheta(:)      !! #8, n_theta
     end type cache_t
+
+    !> Per-call working state of the standalone (tier-1) tier: local tables plus
+    !! the same intermediates `cache_t` stores, minus the engine — nothing here
+    !! survives the call that built it, so there is nothing to track.
+    !!
+    !! Never public, never returned: the calling form copies out what it needs
+    !! and the state dies with it. Every allocatable component (the tables'
+    !! included) is released automatically when that form returns, which is why
+    !! the standalone tier needs no free routine.
+    type :: sa_state_t
+        type(tables_t) :: tables
+
+        real(kind = rk) :: a2 = 0.0_rk                    !! #1
+        real(kind = rk) :: z_shift_intrinsic = 0.0_rk     !! #2
+
+        real(kind = rk), allocatable :: f_grid(:)         !! #3, n_points
+        real(kind = rk), allocatable :: fp_grid(:)        !! #3, n_points
+
+        real(kind = rk) :: f_min = 0.0_rk                 !! #4
+        logical :: beak_ok = .false.                      !! #4 verdict
+
+        real(kind = rk), allocatable :: z(:)              !! #5, n_points
+        real(kind = rk), allocatable :: rho(:)            !! #5, n_points
+        real(kind = rk), allocatable :: drho_dz(:)        !! #5, n_points
+        real(kind = rk) :: rho_max = 0.0_rk               !! #5
+        logical :: rho_positive = .false.                 !! #5 verdict
+
+        real(kind = rk) :: g0 = 0.0_rk                    !! #6
+        real(kind = rk) :: s_opt = 0.0_rk                 !! #6
+        real(kind = rk) :: g_opt = 0.0_rk                 !! #6
+        real(kind = rk) :: z_shift_total = 0.0_rk         !! #6
+        real(kind = rk) :: r_north = 0.0_rk               !! #6
+        real(kind = rk) :: r_south = 0.0_rk               !! #6
+        logical :: star_ok = .false.                      !! #6 verdict
+    end type sa_state_t
+
+    !> The empty theta set of the four theta-less standalone forms.
+    real(kind = rk), parameter :: NO_THETAS(0) = [real(kind = rk) ::]
 
 contains
 
@@ -806,6 +861,12 @@ contains
     !!
     !! The tips carry the rho = 0, drho/dz = 0 convention and would otherwise
     !! contribute a spurious 0; the 1.x scan skips them the same way.
+    !!
+    !! Precondition (caller's, unchecked): size(z) >= 3. A shorter grid has no
+    !! interior node, and the empty max returns -huge — which every caller would
+    !! read as a wildly star-convex shape. Unreachable in this library: both
+    !! tiers route their grid through `build_tables_s`, which floors n_points at
+    !! FOS_N_POINTS_FLOOR = 100.
     pure function star_convexity_max_f(z, rho, drho_dz, s) result(g)
 
         real(kind = rk), intent(in) :: z(:)
@@ -1603,6 +1664,469 @@ contains
         g_opt = cache%g_opt
 
     end subroutine cache_star_convexity_optimum_s
+
+    !===========================================================================
+    ! STANDALONE (TIER-1) FORMS
+    !===========================================================================
+    ! One call in, one answer out. No engine, no cache, no tables handed to the
+    ! caller: `standalone_run_s` builds a local `tables_t`, drives the SAME
+    ! kernels in the SAME cold order as the cached tier's ensure path, and
+    ! everything is released when the form returns.
+    !
+    ! That shared order is the whole mechanism behind the normative bitwise
+    ! rule: at matching (n_points, thetas) a standalone call and a COLD cached
+    ! call must agree to the last bit, because they are the same arithmetic in
+    ! the same sequence.
+    !===========================================================================
+
+    !> R(theta) at caller-supplied theta nodes, standalone.
+    !!
+    !! Gate order matches `cache_radius_grid_s`: the parameter-vector gates (1,
+    !! 102), the grid (invalid grid, covering both `n_points` and the theta
+    !! range), the shape gates (103, 100, 101), the buffer size (105), then the
+    !! Newton solve (104).
+    !!
+    !! Every failure zero-fills the ENTIRE actual extent of `radii`.
+    !!
+    !! @param[in]  params    FoS parameters, 1 to FOS_MAX_PARAMS entries
+    !! @param[in]  thetas    Polar angles in [0, pi]
+    !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
+    !! @param[out] radii     R(theta), size(thetas) long
+    !! @param[out] status    SHAPE_VALID on success, else the rejecting code
+    subroutine compute_radius_grid_standalone_s(params, thetas, n_points, radii, status)
+
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(in) :: thetas(:)
+        integer(kind = ik), intent(in) :: n_points
+        real(kind = rk), intent(out) :: radii(:)
+        integer(kind = ik), intent(out) :: status
+
+        type(sa_state_t) :: st
+        type(fos_bundle_t) :: bundle
+        real(kind = rk), allocatable :: dr_scratch(:)
+        integer(kind = ik) :: n
+
+        call standalone_run_s(params, thetas, n_points, .true., st, status)
+        if (status /= SHAPE_VALID) then
+            radii = 0.0_rk
+            return
+        end if
+
+        call sa_gate_s(st, .true., status)
+        if (status /= SHAPE_VALID) then
+            radii = 0.0_rk
+            return
+        end if
+
+        n = st%tables%n_theta
+        if (size(radii, kind = ik) /= n) then
+            status = FOS_ERROR_BUFFER_MISMATCH
+            radii = 0.0_rk
+            return
+        end if
+
+        ! An empty theta set is a well-formed (empty) answer, and `tables%thetas`
+        ! is unallocated then — there is nothing to pass to the solver.
+        if (n < 1_ik) return
+
+        ! The derivative lands in a write-only sink: the shared solver always
+        ! produces one, and this form does not report it.
+        allocate(dr_scratch(n))
+        bundle = fos_bundle_f(params, st%z_shift_total, st%rho_max)
+        call solve_thetas_s(bundle, st%tables%thetas, radii, dr_scratch, status)
+
+        if (status /= SHAPE_VALID) radii = 0.0_rk
+
+    end subroutine compute_radius_grid_standalone_s
+
+    !> R(theta) and dR/dtheta at caller-supplied theta nodes, standalone.
+    !!
+    !! Same gates and the same failure semantics as
+    !! `compute_radius_grid_standalone_s`, and the same solve — so the radii of
+    !! the two forms agree bitwise on identical input.
+    !!
+    !! @param[in]  params     FoS parameters, 1 to FOS_MAX_PARAMS entries
+    !! @param[in]  thetas     Polar angles in [0, pi]
+    !! @param[in]  n_points   u-grid resolution, >= FOS_N_POINTS_FLOOR
+    !! @param[out] radii      R(theta), size(thetas) long
+    !! @param[out] dr_dtheta  dR/dtheta, size(thetas) long
+    !! @param[out] status     SHAPE_VALID on success, else the rejecting code
+    subroutine compute_radius_and_derivative_standalone_s(params, thetas, &
+            n_points, radii, dr_dtheta, status)
+
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(in) :: thetas(:)
+        integer(kind = ik), intent(in) :: n_points
+        real(kind = rk), intent(out) :: radii(:)
+        real(kind = rk), intent(out) :: dr_dtheta(:)
+        integer(kind = ik), intent(out) :: status
+
+        type(sa_state_t) :: st
+        type(fos_bundle_t) :: bundle
+        integer(kind = ik) :: n
+
+        call standalone_run_s(params, thetas, n_points, .true., st, status)
+        if (status /= SHAPE_VALID) then
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        call sa_gate_s(st, .true., status)
+        if (status /= SHAPE_VALID) then
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        n = st%tables%n_theta
+        if (size(radii, kind = ik) /= n .or. size(dr_dtheta, kind = ik) /= n) then
+            status = FOS_ERROR_BUFFER_MISMATCH
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        if (n < 1_ik) return
+
+        bundle = fos_bundle_f(params, st%z_shift_total, st%rho_max)
+        call solve_thetas_s(bundle, st%tables%thetas, radii, dr_dtheta, status)
+
+        if (status /= SHAPE_VALID) call zero_fill_pair_s(radii, dr_dtheta)
+
+    end subroutine compute_radius_and_derivative_standalone_s
+
+    !> Resolved shape — total z-shift and the analytic pole radii — standalone.
+    !!
+    !! Gates: the parameter-vector gates (1, 102), the grid, then the three
+    !! shape gates in producer order (103, 100, 101). Needs no theta nodes.
+    !!
+    !! @param[in]  params    FoS parameters, 1 to FOS_MAX_PARAMS entries
+    !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
+    !! @param[out] z_shift   Total shift: intrinsic COM shift + chosen origin
+    !! @param[out] r_north   R(0) = c + z_shift
+    !! @param[out] r_south   R(pi) = |-c + z_shift|
+    !! @param[out] status    SHAPE_VALID on success, else the rejecting code
+    subroutine compute_shape_standalone_s(params, n_points, z_shift, r_north, &
+            r_south, status)
+
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: n_points
+        real(kind = rk), intent(out) :: z_shift
+        real(kind = rk), intent(out) :: r_north
+        real(kind = rk), intent(out) :: r_south
+        integer(kind = ik), intent(out) :: status
+
+        type(sa_state_t) :: st
+
+        z_shift = 0.0_rk
+        r_north = 0.0_rk
+        r_south = 0.0_rk
+
+        call standalone_run_s(params, NO_THETAS, n_points, .true., st, status)
+        if (status /= SHAPE_VALID) return
+
+        call sa_gate_s(st, .true., status)
+        if (status /= SHAPE_VALID) return
+
+        z_shift = st%z_shift_total
+        r_north = st%r_north
+        r_south = st%r_south
+
+    end subroutine compute_shape_standalone_s
+
+    !> Cylindrical rho(z) profile in the COM frame, standalone.
+    !!
+    !! Gates: the parameter-vector gates (1, 102), the grid, the buffer sizes
+    !! (105), then interior rho <= 0 (100). Beak and star-convexity do NOT gate
+    !! here, exactly as in `cache_rho_z_grid_s` — the beak scan is not even run.
+    !!
+    !! Every failure zero-fills the ENTIRE actual extent of every output.
+    !!
+    !! @param[in]  params    FoS parameters, 1 to FOS_MAX_PARAMS entries
+    !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
+    !! @param[out] z         Axial coordinate, n_points long
+    !! @param[out] rho       Cylindrical radius, n_points long
+    !! @param[out] drho_dz   Slope, n_points long
+    !! @param[out] z_shift   Intrinsic COM shift baked into z
+    !! @param[out] status    SHAPE_VALID on success, else the rejecting code
+    subroutine compute_rho_z_grid_standalone_s(params, n_points, z, rho, &
+            drho_dz, z_shift, status)
+
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: n_points
+        real(kind = rk), intent(out) :: z(:)
+        real(kind = rk), intent(out) :: rho(:)
+        real(kind = rk), intent(out) :: drho_dz(:)
+        real(kind = rk), intent(out) :: z_shift
+        integer(kind = ik), intent(out) :: status
+
+        type(sa_state_t) :: st
+        integer(kind = ik) :: i, n
+
+        z_shift = 0.0_rk
+
+        call standalone_run_s(params, NO_THETAS, n_points, .false., st, status)
+        if (status /= SHAPE_VALID) then
+            call zero_fill_grid_s(z, rho, drho_dz)
+            return
+        end if
+
+        n = st%tables%n_points
+        if (size(z, kind = ik) /= n .or. size(rho, kind = ik) /= n &
+                .or. size(drho_dz, kind = ik) /= n) then
+            status = FOS_ERROR_BUFFER_MISMATCH
+            call zero_fill_grid_s(z, rho, drho_dz)
+            return
+        end if
+
+        if (.not. st%rho_positive) then
+            status = FOS_ERROR_RHO_NEGATIVE
+            call zero_fill_grid_s(z, rho, drho_dz)
+            return
+        end if
+
+        do i = 1_ik, n
+            z(i) = st%z(i)
+            rho(i) = st%rho(i)
+            drho_dz(i) = st%drho_dz(i)
+        end do
+        z_shift = st%z_shift_intrinsic
+
+    end subroutine compute_rho_z_grid_standalone_s
+
+    !> Neck of the cylindrical profile, standalone.
+    !!
+    !! Gates: the parameter-vector gates (1, 102), the grid, then interior
+    !! rho <= 0 (100). Beak (103) and star-convexity (101) do NOT gate — the
+    !! neck is a property of the rho(z) profile, and scission-adjacent shapes are
+    !! exactly the ones the R(theta) gates reject. Same scan-then-Newton
+    !! refinement as `cache_neck_s`.
+    !!
+    !! `found` is .false. with status SHAPE_VALID for a profile with fewer than
+    !! two rho maxima: having no neck is an answer, not an error.
+    !!
+    !! @param[in]  params    FoS parameters, 1 to FOS_MAX_PARAMS entries
+    !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
+    !! @param[out] z_neck    Neck z-position in the COM frame
+    !! @param[out] rho_neck  Neck radius, reduced units (R0 = 1)
+    !! @param[out] found     .true. iff the profile has a neck
+    !! @param[out] status    SHAPE_VALID on success, else the rejecting code
+    subroutine compute_neck_standalone_s(params, n_points, z_neck, rho_neck, &
+            found, status)
+
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: n_points
+        real(kind = rk), intent(out) :: z_neck
+        real(kind = rk), intent(out) :: rho_neck
+        logical, intent(out) :: found
+        integer(kind = ik), intent(out) :: status
+
+        type(sa_state_t) :: st
+        integer(kind = ik) :: neck_idx, iter, n
+        real(kind = rk) :: c, u, u_lo, u_hi, du, step
+        real(kind = rk) :: f_val, fp_val, fpp_val
+
+        z_neck = 0.0_rk
+        rho_neck = 0.0_rk
+        found = .false.
+
+        call standalone_run_s(params, NO_THETAS, n_points, .false., st, status)
+        if (status /= SHAPE_VALID) return
+
+        if (.not. st%rho_positive) then
+            status = FOS_ERROR_RHO_NEGATIVE
+            return
+        end if
+
+        call find_neck_index_s(st%rho, neck_idx, found)
+        if (.not. found) return
+
+        c = params(1)
+        n = st%tables%n_points
+        du = 2.0_rk / real(n - 1_ik, rk)
+        u = st%tables%u(neck_idx)
+        u_lo = max(-1.0_rk, u - du)
+        u_hi = min(1.0_rk, u + du)
+
+        do iter = 1_ik, NECK_NEWTON_MAX_ITER
+            call eval_f_s(params, u, f_val, fp_val, fpp_val)
+            if (fpp_val <= 0.0_rk) exit
+            step = fp_val / fpp_val
+            u = min(u_hi, max(u_lo, u - step))
+            if (abs(step) < NECK_NEWTON_TOL) exit
+        end do
+
+        call eval_f_s(params, u, f_val, fp_val)
+        rho_neck = sqrt(max(f_val, 0.0_rk) / c)
+        z_neck = c * u + st%z_shift_intrinsic
+
+    end subroutine compute_neck_standalone_s
+
+    !> Ungated star-convexity optimum, standalone.
+    !!
+    !! Returns g(s*) and the total shift z_shift_intrinsic + s* WITHOUT applying
+    !! STAR_CONVEXITY_MARGIN, so a shape the R(theta) path rejects with 101 is
+    !! still reported on. Gates: the parameter-vector gates (1, 102), the grid,
+    !! beak (103), interior rho <= 0 (100) — the resolve gate set minus 101, in
+    !! the same order as `cache_star_convexity_optimum_s`.
+    !!
+    !! @param[in]  params         FoS parameters, 1 to FOS_MAX_PARAMS entries
+    !! @param[in]  n_points       u-grid resolution, >= FOS_N_POINTS_FLOOR
+    !! @param[out] z_shift_total  Intrinsic COM shift plus the optimum s*
+    !! @param[out] g_opt          g(s*), the star-convexity test value there
+    !! @param[out] status         SHAPE_VALID on success, else the rejecting code
+    subroutine compute_star_convexity_optimum_standalone_s(params, n_points, &
+            z_shift_total, g_opt, status)
+
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: n_points
+        real(kind = rk), intent(out) :: z_shift_total
+        real(kind = rk), intent(out) :: g_opt
+        integer(kind = ik), intent(out) :: status
+
+        type(sa_state_t) :: st
+
+        z_shift_total = 0.0_rk
+        g_opt = 0.0_rk
+
+        call standalone_run_s(params, NO_THETAS, n_points, .true., st, status)
+        if (status /= SHAPE_VALID) return
+
+        call sa_gate_s(st, .false., status)
+        if (status /= SHAPE_VALID) return
+
+        z_shift_total = st%z_shift_intrinsic + st%s_opt
+        g_opt = st%g_opt
+
+    end subroutine compute_star_convexity_optimum_standalone_s
+
+    !> The standalone tier's single worker: validate, build local tables, run
+    !! the kernels in cold order.
+    !!
+    !! ## k_max is sized per call — that is the point of tier-1
+    !!
+    !! `k_max = min((size(params) + 2)/2 + 1, FOS_MAX_K)` is the same formula the
+    !! live evaluator `eval_f_s` uses, so a 50-parameter vector gets the 27
+    !! Fourier orders it needs instead of the cached tier's fixed 6. This is what
+    !! lifts the tier-1 cap from SHAPE_CACHE_MAX_PARAMS to N_max = 50.
+    !!
+    !! It does NOT break the bitwise rule at the overlap. The formula is
+    !! deliberately conservative — a vector of n parameters carries coefficients
+    !! only up to a_(n+1), i.e. through order floor((n+1)/2) — and every order
+    !! above that has both coefficients zero, so `pair_coefficients_s` marks it
+    !! inactive and both `compute_f_grid_s` and `beak_scan_f_min_s` skip it under
+    !! the COEFF_NEGLIGIBLE rule. Two tables differing only in trailing inactive
+    !! orders therefore sum the SAME terms in the SAME order. At n <= 8, where a
+    !! cold cache exists to compare against, this k_max (2 to 6) and the cache's
+    !! fixed FOS_TABLES_K_MAX = 6 are interchangeable bit for bit.
+    !!
+    !! `size(params) >= 1` also makes k_max >= 2, so `build_tables_s` — which
+    !! does not validate k_max — is never handed a degenerate order count.
+    !!
+    !! @param[in]  params    Incoming parameter vector
+    !! @param[in]  thetas    Polar angles in [0, pi]; empty for the theta-less forms
+    !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
+    !! @param[in]  resolve   .true. to also run the beak scan (#4) and the origin
+    !!                       resolve (#6); .false. stops at the rho(z) grid (#5)
+    !! @param[out] st        Per-call state, valid only when status is SHAPE_VALID
+    !! @param[out] status    SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS,
+    !!                       FOS_ERROR_INVALID_C or SHAPE_ERROR_INVALID_GRID
+    subroutine standalone_run_s(params, thetas, n_points, resolve, st, status)
+
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(in) :: thetas(:)
+        integer(kind = ik), intent(in) :: n_points
+        logical, intent(in) :: resolve
+        type(sa_state_t), intent(out) :: st
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik) :: n, k_max
+
+        n = size(params, kind = ik)
+
+        ! Gate order mirrors `ensure_list_s`: the vector's length is judged
+        ! before any code reads params(1).
+        if (n > FOS_MAX_PARAMS) then
+            status = SHAPE_ERROR_TOO_MANY_PARAMS
+            return
+        end if
+
+        if (n < 1_ik) then
+            status = FOS_ERROR_INVALID_C
+            return
+        end if
+
+        if (params(1) <= C_MIN) then
+            status = FOS_ERROR_INVALID_C
+            return
+        end if
+
+        k_max = min((n + 2_ik) / 2_ik + 1_ik, FOS_MAX_K)
+
+        call build_tables_s(st%tables, n_points, thetas, k_max, status)
+        if (status /= SHAPE_VALID) return
+
+        allocate(st%f_grid(n_points), st%fp_grid(n_points))
+        allocate(st%z(n_points), st%rho(n_points), st%drho_dz(n_points))
+
+        ! The same kernels the cached tier's ensure path drives, in the same
+        ! cold order: #1, #2, #3, [#4], #5, [#6]. The two optional steps are
+        ! exactly the ones NEEDS_RHO_Z_GRID omits.
+        call compute_a2_s(params, st%a2, status)
+        if (status /= SHAPE_VALID) return
+
+        call compute_z_shift_s(params, st%z_shift_intrinsic, status)
+        if (status /= SHAPE_VALID) return
+
+        call compute_f_grid_s(st%tables, params, st%f_grid, st%fp_grid)
+
+        if (resolve) then
+            call beak_scan_f_min_s(st%tables, params, st%f_min, st%beak_ok)
+        end if
+
+        call scale_rho_grid_s(st%tables, params(1), st%z_shift_intrinsic, &
+                st%f_grid, st%fp_grid, st%z, st%rho, st%drho_dz, &
+                st%rho_max, st%rho_positive)
+
+        if (resolve) then
+            call resolve_origin_s(st%z, st%rho, st%drho_dz, params(1), &
+                    st%z_shift_intrinsic, st%g0, st%s_opt, st%g_opt, &
+                    st%star_ok, st%z_shift_total, st%r_north, st%r_south)
+        end if
+
+        status = SHAPE_VALID
+
+    end subroutine standalone_run_s
+
+    !> The standalone twin of `ensure_gated_s`: the shape gates in the normative
+    !! producer order, with star-convexity optional.
+    !!
+    !! Precondition (caller's, unchecked): `st` comes from a `standalone_run_s`
+    !! call that returned SHAPE_VALID with `resolve = .true.` — a state built
+    !! without the beak scan and the resolve carries no verdicts to gate on.
+    !!
+    !! @param[in]  st         Resolved per-call state
+    !! @param[in]  gate_star  .true. to reject on the star-convexity margin
+    !! @param[out] status     SHAPE_VALID, or the rejecting code
+    pure subroutine sa_gate_s(st, gate_star, status)
+
+        type(sa_state_t), intent(in) :: st
+        logical, intent(in) :: gate_star
+        integer(kind = ik), intent(out) :: status
+
+        status = SHAPE_VALID
+
+        if (.not. st%beak_ok) then
+            status = FOS_ERROR_BEAK_SINGULARITY
+            return
+        end if
+
+        if (.not. st%rho_positive) then
+            status = FOS_ERROR_RHO_NEGATIVE
+            return
+        end if
+
+        if (gate_star .and. .not. st%star_ok) status = FOS_ERROR_NOT_STAR_CONVEX
+
+    end subroutine sa_gate_s
 
     !===========================================================================
     ! ENGINE DRIVER (the module's single engine touchpoint)
