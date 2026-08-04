@@ -141,4 +141,11 @@ set_target_properties(fos_param_golden_capture PROPERTIES
 add_executable(fos_param_c_api_smoke_test tests/c_api_smoke_test.cpp)
 target_link_libraries(fos_param_c_api_smoke_test PRIVATE fos_parameterization_cxx)
 add_test(NAME c_api_smoke COMMAND fos_param_c_api_smoke_test)
+
+# Thread model: one shared tables handle, one cache per thread.
+find_package(Threads REQUIRED)
+add_executable(fos_param_thread_stress_test tests/thread_stress_test.cpp)
+target_link_libraries(fos_param_thread_stress_test PRIVATE
+        fos_parameterization_cxx Threads::Threads)
+add_test(NAME thread_stress COMMAND fos_param_thread_stress_test)
 endif ()
