@@ -60,7 +60,8 @@ module fos_parameterization_mod
             SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID, &
             SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
             SHAPE_ERROR_TABLES_NOT_INITIALIZED
-    use fos_parameterization_workers_mod, only: tables_t, tables_init_s, tables_free_s
+    use fos_parameterization_workers_mod, only: tables_t, tables_init_s, tables_free_s, &
+            compute_a2_s, compute_z_shift_s
 
     implicit none
 
@@ -104,6 +105,12 @@ module fos_parameterization_mod
     public :: tables_t
     public :: tables_init_s
     public :: tables_free_s
+
+    ! Status-reporting replacements for the sentinel-returning pure functions
+    ! compute_fos_a2_f / compute_fos_z_shift_f (re-exported from the workers
+    ! module — these two are public 2.0 surface, the other kernels are not)
+    public :: compute_a2_s
+    public :: compute_z_shift_s
 
     ! Module constants
     integer(kind = ik), parameter :: MAX_K = 50_ik
