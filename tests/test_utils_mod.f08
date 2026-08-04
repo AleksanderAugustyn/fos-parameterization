@@ -1,13 +1,14 @@
 !> Minimal assertion helpers for the fos-parameterization test suites.
 module test_utils_mod
 
-    use precision_utilities_mod, only: ik, rk
+    use precision_utilities_mod, only: ik, ikl, rk
 
     implicit none
 
     private
 
-    public :: assert_true, assert_int_eq, assert_close, assert_abs_close, test_summary
+    public :: assert_true, assert_int_eq, assert_close, assert_abs_close, &
+            assert_bits_eq, test_summary
 
     integer(kind = ik) :: n_pass = 0_ik
     integer(kind = ik) :: n_fail = 0_ik
@@ -60,6 +61,23 @@ contains
                     ' — got ', got, ', want ', want, ', |diff| = ', abs(got - want)
         end if
     end subroutine assert_abs_close
+
+    !> IEEE754 bit equality — the zero-tolerance assert of the contract's
+    !! bitwise family. `==` on reals is banned by -Wcompare-reals, and a value
+    !! compare would in any case call +0.0 and -0.0 equal; only the bit patterns
+    !! answer the question the contract asks.
+    !!
+    !! `volatile` on the two locals is load-bearing: under Release's -ffast-math
+    !! (-fno-signed-zeros) the compiler may elide a store of -0.0 over a location
+    !! it knows holds +0.0, so the pattern under test would never reach memory.
+    subroutine assert_bits_eq(a, b, label)
+        real(kind = rk),    intent(in) :: a, b
+        character(len = *), intent(in) :: label
+        real(kind = rk), volatile :: av, bv
+        av = a
+        bv = b
+        call assert_true(transfer(av, 0_ikl) == transfer(bv, 0_ikl), label)
+    end subroutine assert_bits_eq
 
     subroutine test_summary()
         write(*, '(A,I0,A,I0,A)') 'Tests: ', n_pass, ' passed, ', n_fail, ' failed.'
