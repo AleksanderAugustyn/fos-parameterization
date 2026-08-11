@@ -388,6 +388,56 @@ program fos_param_standalone_test
                 'diag conv: 101/103 both bypassed')
     end block
 
+    !---------------------------------------------------------------------------
+    ! newton_radius_s robustness: pole boundary layer and limit cycle
+    !---------------------------------------------------------------------------
+    ! Two convergence defects found by the 2026-08-11 geometry sweep (Tier B,
+    ! GL-4096 nodes, no physics filter): production-accepted shapes whose
+    ! R(theta) conversion returned FOS_ERROR_CONVERGENCE.
+    write(*, '(A)') '=== newton_radius_s: sweep-found convergence regressions ==='
+
+    block
+        real(kind = rk) :: params7(7), th(1), r1(1), dr1(1)
+        integer(kind = ik) :: st_nr
+
+        ! Class A: theta at the extreme GL-4096 node next to the south pole.
+        ! The ray meets the surface ~2e-8 above the tip, inside the
+        ! rho ~ sqrt(z - z_tip) layer where dF/dr ~ 1e4: one ulp of r moves F
+        ! by more than NR_TOLERANCE, so the residual test alone is
+        ! unsatisfiable. The bracket-collapse acceptance must converge it.
+        params7 = [0.75_rk, 0.0_rk, 0.5_rk, -0.1_rk, -0.05_rk, 0.0_rk, 0.0_rk]
+        th(1) = 3.1410056096372800_rk   ! pi - 5.87e-4, GL-4096 extreme node
+        call compute_radius_and_derivative_standalone_s(params7, th, 1001_ik, &
+                r1, dr1, st_nr)
+        call assert_int_eq(st_nr, SHAPE_VALID, &
+                'newton: pole boundary layer converges (class A)')
+        call assert_true(abs(r1(1) - 0.732095174676755_rk) < 1.0e-9_rk, &
+                'newton: pole-layer radius matches bisection reference')
+
+        ! Class B: mid-latitude attracting 2-cycle. Deeply star-convex shape
+        ! (g_opt = -0.30), clean single crossing, but Newton drifts into a
+        ! period-2 orbit strictly inside the bracket, so the
+        ! leaves-the-bracket bisection safeguard never fires. The
+        ! pure-bisection fallback past NR_NEWTON_PHASE must converge it.
+        ! Both nodes from the sweep's failing set: 0.6770 became bit-stable,
+        ! 0.6785 drifts toward the cycle without ever repeating exactly.
+        params7 = [1.15_rk, 0.55_rk, 0.15_rk, -0.15_rk, -0.15_rk, 0.0_rk, 0.0_rk]
+        th(1) = 0.676978141_rk
+        call compute_radius_and_derivative_standalone_s(params7, th, 1001_ik, &
+                r1, dr1, st_nr)
+        call assert_int_eq(st_nr, SHAPE_VALID, &
+                'newton: interior limit cycle broken (class B, bit-stable)')
+        call assert_true(r1(1) > 0.85_rk .and. r1(1) < 0.95_rk, &
+                'newton: cycle-broken radius near the true root ~0.91')
+        th(1) = 0.678511934_rk
+        call compute_radius_and_derivative_standalone_s(params7, th, 1001_ik, &
+                r1, dr1, st_nr)
+        call assert_int_eq(st_nr, SHAPE_VALID, &
+                'newton: interior limit cycle broken (class B, drifting)')
+        call assert_true(r1(1) > 0.85_rk .and. r1(1) < 0.95_rk, &
+                'newton: drifting-cycle radius near the true root ~0.91')
+    end block
+
     call test_summary()
 
 contains

@@ -149,7 +149,24 @@ module fos_parameterization_workers_mod
 
     !> Newton residual tolerance, scaled by max(1, r).
     real(kind = rk), parameter :: NR_TOLERANCE = 1.0e-12_rk
-    integer(kind = ik), parameter :: NR_MAX_ITER = 50_ik
+
+    !> Newton-phase length and total iteration cap. Iterations 1 to
+    !! NR_NEWTON_PHASE run the historical safeguarded-Newton update untouched
+    !! (50 was the old hard cap, so every node that converged before this
+    !! change still walks a bit-identical iterate path). A node still open
+    !! after that is treated as Newton-resistant — e.g. an attracting
+    !! period-2 orbit strictly inside the bracket, invisible to the
+    !! leaves-the-bracket safeguard — and the remaining iterations bisect
+    !! unconditionally: ~70 halvings collapse any bracket (r_hi_bound <= ~9)
+    !! below the NR_BRACKET_ULPS acceptance width.
+    integer(kind = ik), parameter :: NR_NEWTON_PHASE = 50_ik
+    integer(kind = ik), parameter :: NR_MAX_ITER = 120_ik
+
+    !> Bracket width, in ulps of the larger endpoint, at or below which the
+    !! root is pinned to machine precision and the node is accepted even if
+    !! the residual test is unsatisfiable (pole boundary layer: dF/dr ~ 1e4
+    !! makes one ulp of r move F by more than NR_TOLERANCE).
+    real(kind = rk), parameter :: NR_BRACKET_ULPS = 2.0_rk
 
     !> |cos(theta)| above which the radius is taken from the analytic pole.
     real(kind = rk), parameter :: POLE_THRESH = 1.0_rk - 1.0e-10_rk
@@ -1046,6 +1063,20 @@ contains
     !! Newton steps leaving the bracket are replaced by bisection, which keeps
     !! steep polar lobes out of a limit cycle.
     !!
+    !! Two further safeguards (2026-08-11 geometry sweep, GL-4096 nodes):
+    !!   - Bracket-collapse acceptance: within ~ulp(r_south)/r of a pole the
+    !!     surface slope makes dF/dr * ulp(r) exceed NR_TOLERANCE, so NO
+    !!     representable r passes the residual test. Once the sign-change
+    !!     bracket is NR_BRACKET_ULPS wide the root is pinned to machine
+    !!     precision and the node is accepted on that evidence instead.
+    !!   - Bisection fallback: Newton can enter an attracting period-2 orbit
+    !!     strictly inside the bracket (the sweep found one), where the
+    !!     leaves-the-bracket safeguard is blind. Past NR_NEWTON_PHASE
+    !!     iterations every step bisects, which converges unconditionally on
+    !!     the sign-change bracket. Nodes that converge never see either
+    !!     safeguard: the residual exit fires within the Newton phase, whose
+    !!     update rule is unchanged.
+    !!
     !! The derivative is implicit differentiation at the root:
     !!   dR/dtheta = -(r cos + drho_dz r sin) / (sin - drho_dz cos)
     !! Poles are analytic (converged, dR/dtheta = 0). Degenerate bundles are the
@@ -1072,6 +1103,7 @@ contains
         real(kind = rk) :: z_max, z_min, r_north, r_south
         real(kind = rk) :: rho, drho_dz, z
         real(kind = rk) :: r_lo, r_hi, r_curr, r_new, delta_r, F_val, dF_dr
+        logical :: bracket_collapsed
         integer(kind = ik) :: iter
 
         dr_dtheta = 0.0_rk
@@ -1109,6 +1141,8 @@ contains
         r_curr = 0.5_rk * ((1.0_rk + x) * r_north + (1.0_rk - x) * r_south)
         r_curr = min(max(r_curr, 0.01_rk), r_hi)
 
+        bracket_collapsed = .false.
+
         do iter = 1_ik, NR_MAX_ITER
             z = r_curr * cos_theta
             call bundle_rho_s(bundle, z, rho, drho_dz)
@@ -1127,17 +1161,33 @@ contains
             ! the trial point and the surface, which is what callers care about.
             if (abs(F_val) < NR_TOLERANCE * max(1.0_rk, r_curr)) exit
 
-            if (abs(dF_dr) > DF_DR_FLOOR) then
-                delta_r = F_val / dF_dr
-                r_new = r_curr - delta_r
-            else
-                r_new = r_lo - 1.0_rk  ! force bisection
+            ! Bracket collapsed to machine precision: the root is pinned even
+            ! though the residual floor dF/dr * ulp(r) sits above NR_TOLERANCE
+            ! (pole boundary layer). Accept on the bracket evidence.
+            if (r_hi - r_lo <= NR_BRACKET_ULPS &
+                    * spacing(max(abs(r_lo), abs(r_hi)))) then
+                bracket_collapsed = .true.
+                exit
             end if
 
-            ! Newton step leaving the bracket -> bisect instead
-            if (r_new <= r_lo .or. r_new >= r_hi) then
+            if (iter <= NR_NEWTON_PHASE) then
+                if (abs(dF_dr) > DF_DR_FLOOR) then
+                    delta_r = F_val / dF_dr
+                    r_new = r_curr - delta_r
+                else
+                    r_new = r_lo - 1.0_rk  ! force bisection
+                end if
+
+                ! Newton step leaving the bracket -> bisect instead
+                if (r_new <= r_lo .or. r_new >= r_hi) then
+                    r_new = 0.5_rk * (r_lo + r_hi)
+                end if
+            else
+                ! Newton-resistant node (e.g. attracting 2-cycle inside the
+                ! bracket): bisect unconditionally from here on.
                 r_new = 0.5_rk * (r_lo + r_hi)
             end if
+
             r_curr = r_new
         end do
 
@@ -1151,7 +1201,8 @@ contains
         call bundle_rho_s(bundle, z, rho, drho_dz)
 
         F_val = r * sin_theta - rho
-        converged = abs(F_val) < NR_TOLERANCE * max(1.0_rk, r)
+        converged = abs(F_val) < NR_TOLERANCE * max(1.0_rk, r) &
+                .or. bracket_collapsed
 
         dF_dr = sin_theta - drho_dz * cos_theta
         if (abs(dF_dr) > DF_DR_FLOOR) then
