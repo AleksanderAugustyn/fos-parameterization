@@ -170,15 +170,43 @@ end module fos_sweep_support_mod
 program fos_param_geometry_sweep_test
 
     use precision_utilities_mod, only: ik, rk
+    use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: compute_shape_standalone_s, &
+            compute_radius_and_derivative_standalone_s, &
             FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_NOT_STAR_CONVEX, &
             FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY
     use shape_core_mod, only: SHAPE_VALID
     use fos_sweep_support_mod, only: sweep_config_t, parse_args_s, &
             print_config_s, grid_params_f, N_POINTS_SWEEP
+    use fos_test_reference_mod, only: init_quadrature_s, &
+            compute_reference_surface_f, evaluate_shape_quality_s, &
+            find_neck_in_radii_s
     use test_utils_mod, only: assert_true, assert_int_eq, test_summary
 
     implicit none
+
+    !> Tier B tolerances (absolute), re-baselined 2026-08-11 on the coarse
+    !! grid against the GL-4096 measurand.
+    !!
+    !! Round-trip is the conversion-correctness pin: measured worst 5.2e-12,
+    !! asserted 1e-10 (tightened from the inherited 1e-9). V/S are
+    !! measurand-quality metrics: their worst cases (measured 6.5e-6 and
+    !! 6.2e-3 at c=0.75-0.85, a3=0.55, a4=0.75, f_min ~ 3.9e-3) are GL-4096
+    !! QUADRATURE error on beak-marginal near-pinch shapes, not conversion
+    !! error — at the same worst point dV/V converges 6.5e-6 -> 5.0e-8 ->
+    !! 1.2e-9 for N = 4096/8192/16384 while the round-trip stays ~5e-12.
+    !! Provisional until the F_MIN_THRESHOLD decision (Task 7/8) settles which
+    !! marginal shapes stay accepted; re-tighten after the constant moves.
+    real(kind = rk), parameter :: TOL_VOLUME_B = 1.0e-4_rk
+    real(kind = rk), parameter :: TOL_SURFACE_REL = 5.0e-2_rk
+    real(kind = rk), parameter :: TOL_ROUND_TRIP = 1.0e-10_rk
+
+    !> Neck-context thresholds, mirroring wmmm's Level 2c physics filter
+    !! (NECK_MIN_DEPTH, NECK_MIN_ELONGATION). Context for the printed report
+    !! ONLY — deliberately NOT a gate on the worst-case statistics: fos-param's
+    !! accuracy guarantee covers every shape it accepts.
+    real(kind = rk), parameter :: NECK_DEPTH_MIRROR = 0.25_rk
+    real(kind = rk), parameter :: NECK_ELONGATION_MIRROR = 1.2_rk
 
     !> Tier A verdict counts on the default coarse grid, captured 2026-08-11
     !! (Task 3 first run). Index: 0 = valid, 1..4 = codes 100..103, 5 = other.
@@ -205,6 +233,11 @@ program fos_param_geometry_sweep_test
         call assert_int_eq(tally(5), GOLDEN_TALLY(5), 'tier A golden: other')
     else
         write(*, '(A)') 'Non-default grid: golden tally asserts skipped.'
+    end if
+
+    if (.not. cfg%skip_tier_b) then
+        call init_quadrature_s()
+        call run_tier_b_s(cfg)
     end if
 
     call test_summary()
@@ -268,5 +301,137 @@ contains
         tally_out = tally
 
     end subroutine run_tier_a_s
+
+    !> Tier B: conversion accuracy on every production-accepted shape.
+    !!
+    !! Per accepted point: cylindrical reference surface, then the GL-4096
+    !! V/S/round-trip metrics through the production conversion. Worst cases
+    !! are tracked over ALL accepted shapes — no physics filter (deliberate
+    !! departure from wmmm): fos-param's guarantee covers every shape it
+    !! accepts, and filtering would hide a conversion defect exactly where
+    !! wmmm's replacement energy test won't look.
+    subroutine run_tier_b_s(cfg)
+
+        type(sweep_config_t), intent(in) :: cfg
+
+        integer(kind = ik), parameter :: N_NECK_GRID = 101_ik
+
+        integer(kind = ik) :: i_c, i3, i4, i5, i6, status, q_status, n_status, i
+        real(kind = rk) :: params(7), z_shift, r_north, r_south
+        real(kind = rk) :: s_ref, dv_rel, ds_rel, rt_max
+        real(kind = rk) :: worst_dv, worst_ds, worst_rt
+        real(kind = rk) :: worst_dv_params(5), worst_ds_params(5), worst_rt_params(5)
+        integer(kind = ik) :: n_valid, n_neck, n_eval_fail
+        real(kind = rk) :: thetas_neck(N_NECK_GRID)
+        real(kind = rk) :: radii_neck(N_NECK_GRID), dr_neck(N_NECK_GRID)
+        logical :: has_neck
+        real(kind = rk) :: neck_radius, neck_depth
+        integer(kind = ik) :: t_start, t_end, t_rate
+
+        write(*, '(A)') '=== Tier B: conversion accuracy sweep ==='
+
+        do i = 1_ik, N_NECK_GRID
+            thetas_neck(i) = real(i - 1_ik, rk) * PI_C / real(N_NECK_GRID - 1_ik, rk)
+        end do
+        thetas_neck(N_NECK_GRID) = PI_C
+
+        worst_dv = 0.0_rk
+        worst_ds = 0.0_rk
+        worst_rt = 0.0_rk
+        worst_dv_params = 0.0_rk
+        worst_ds_params = 0.0_rk
+        worst_rt_params = 0.0_rk
+        n_valid = 0_ik
+        n_neck = 0_ik
+        n_eval_fail = 0_ik
+
+        call system_clock(t_start, t_rate)
+
+        ! The unsynchronized reads of worst_* in the trigger condition are a
+        ! benign race: worst_* grows monotonically and a stale (smaller) value
+        ! only causes a redundant critical-section entry, never a missed update.
+        !$omp parallel do collapse(3) schedule(dynamic) default(shared) &
+        !$omp& private(i_c, i3, i4, i5, i6, params, z_shift, r_north, r_south, &
+        !$omp&         status, q_status, n_status, s_ref, dv_rel, ds_rel, rt_max, &
+        !$omp&         radii_neck, dr_neck, has_neck, neck_radius, neck_depth) &
+        !$omp& reduction(+:n_valid, n_neck, n_eval_fail)
+        do i_c = 1_ik, cfg%n_c
+            do i3 = 1_ik, cfg%n_a3
+                do i4 = 1_ik, cfg%n_a4
+                    do i5 = 1_ik, cfg%n_a5
+                        do i6 = 1_ik, cfg%n_a6
+                            params = grid_params_f(cfg, i_c, i3, i4, i5, i6)
+                            call compute_shape_standalone_s(params, N_POINTS_SWEEP, &
+                                    z_shift, r_north, r_south, status)
+                            if (status /= SHAPE_VALID) cycle
+                            n_valid = n_valid + 1_ik
+
+                            s_ref = compute_reference_surface_f(params)
+                            call evaluate_shape_quality_s(params, N_POINTS_SWEEP, &
+                                    z_shift, s_ref, dv_rel, ds_rel, rt_max, q_status)
+                            ! A production-accepted shape that fails to evaluate
+                            ! returns huge() metrics: counted, and the worst
+                            ! trackers trip the tolerance asserts loudly.
+                            if (q_status /= SHAPE_VALID) n_eval_fail = n_eval_fail + 1_ik
+
+                            call compute_radius_and_derivative_standalone_s(params, &
+                                    thetas_neck, N_POINTS_SWEEP, radii_neck, dr_neck, &
+                                    n_status)
+                            if (n_status == SHAPE_VALID) then
+                                call find_neck_in_radii_s(radii_neck, has_neck, &
+                                        neck_radius, neck_depth)
+                                if (has_neck .and. neck_depth > NECK_DEPTH_MIRROR &
+                                        .and. 0.5_rk * (radii_neck(1) &
+                                        + radii_neck(N_NECK_GRID)) &
+                                        < NECK_ELONGATION_MIRROR) then
+                                    n_neck = n_neck + 1_ik
+                                end if
+                            end if
+
+                            if (abs(dv_rel) > worst_dv .or. abs(ds_rel) > worst_ds &
+                                    .or. rt_max > worst_rt) then
+                                !$omp critical (tier_b_worst)
+                                if (abs(dv_rel) > worst_dv) then
+                                    worst_dv = abs(dv_rel)
+                                    worst_dv_params = params(1:5)
+                                end if
+                                if (abs(ds_rel) > worst_ds) then
+                                    worst_ds = abs(ds_rel)
+                                    worst_ds_params = params(1:5)
+                                end if
+                                if (rt_max > worst_rt) then
+                                    worst_rt = rt_max
+                                    worst_rt_params = params(1:5)
+                                end if
+                                !$omp end critical (tier_b_worst)
+                            end if
+                        end do
+                    end do
+                end do
+            end do
+        end do
+        !$omp end parallel do
+
+        call system_clock(t_end)
+
+        write(*, '(A,I0)') '  accepted shapes evaluated: ', n_valid
+        write(*, '(A,I0)') '  pronounced neck at low elongation (context): ', n_neck
+        write(*, '(A,I0)') '  evaluation failures on accepted shapes: ', n_eval_fail
+        write(*, '(A,ES10.3,A,5F8.3)') '  max |dV/V|:     ', worst_dv, &
+                '  at c,a3,a4,a5,a6 =', worst_dv_params
+        write(*, '(A,ES10.3,A,5F8.3)') '  max |dS/S|:     ', worst_ds, &
+                '  at c,a3,a4,a5,a6 =', worst_ds_params
+        write(*, '(A,ES10.3,A,5F8.3)') '  max round-trip: ', worst_rt, &
+                '  at c,a3,a4,a5,a6 =', worst_rt_params
+        write(*, '(A,F10.2,A)') '  Tier B wall time: ', &
+                real(t_end - t_start, rk) / real(t_rate, rk), ' s'
+
+        call assert_true(n_valid > 0_ik, 'tier B: at least one accepted shape')
+        call assert_int_eq(n_eval_fail, 0_ik, 'tier B: every accepted shape evaluates')
+        call assert_true(worst_dv <= TOL_VOLUME_B, 'tier B: |dV/V| within tolerance')
+        call assert_true(worst_ds <= TOL_SURFACE_REL, 'tier B: |dS/S| within tolerance')
+        call assert_true(worst_rt <= TOL_ROUND_TRIP, 'tier B: round-trip within tolerance')
+
+    end subroutine run_tier_b_s
 
 end program fos_param_geometry_sweep_test
