@@ -173,15 +173,19 @@ program fos_param_geometry_sweep_test
     use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: compute_shape_standalone_s, &
             compute_radius_and_derivative_standalone_s, &
+            compute_f_min_standalone_s, compute_conversion_diagnostic_standalone_s, &
+            compute_star_convexity_optimum_standalone_s, &
+            F_MIN_THRESHOLD, STAR_CONVEXITY_MARGIN, &
             FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_NOT_STAR_CONVEX, &
-            FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY
+            FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_CONVERGENCE
     use shape_core_mod, only: SHAPE_VALID
     use fos_sweep_support_mod, only: sweep_config_t, parse_args_s, &
             print_config_s, grid_params_f, N_POINTS_SWEEP
     use fos_test_reference_mod, only: init_quadrature_s, &
             compute_reference_surface_f, evaluate_shape_quality_s, &
-            find_neck_in_radii_s
-    use test_utils_mod, only: assert_true, assert_int_eq, test_summary
+            evaluate_shape_quality_diag_s, find_neck_in_radii_s
+    use test_utils_mod, only: assert_true, assert_int_eq, assert_bits_eq, &
+            test_summary
 
     implicit none
 
@@ -235,10 +239,9 @@ program fos_param_geometry_sweep_test
         write(*, '(A)') 'Non-default grid: golden tally asserts skipped.'
     end if
 
-    if (.not. cfg%skip_tier_b) then
-        call init_quadrature_s()
-        call run_tier_b_s(cfg)
-    end if
+    if (.not. cfg%skip_tier_b .or. cfg%probe) call init_quadrature_s()
+    if (.not. cfg%skip_tier_b) call run_tier_b_s(cfg)
+    if (cfg%probe) call run_probe_s(cfg)
 
     call test_summary()
 
@@ -433,5 +436,259 @@ contains
         call assert_true(worst_rt <= TOL_ROUND_TRIP, 'tier B: round-trip within tolerance')
 
     end subroutine run_tier_b_s
+
+    !> Representability probe (--probe): July-parity g(s*) bins plus f_min
+    !! bins split by branch (polar = boundary-clamped scan minimum, neck =
+    !! interior), all measured through the beak- and star-ungated diagnostic
+    !! conversion. REPORTS only — the cliff readout asserts nothing; the
+    !! threshold decision is the Task 7 user checkpoint.
+    subroutine run_probe_s(cfg)
+
+        type(sweep_config_t), intent(in) :: cfg
+
+        ! July-parity g bins: [-0.15, 0.02) in 0.01 steps; shapes with
+        ! g(s*) < 0.01 are included (thin over-limit band), g < -0.15 clamps
+        ! into bin 1.
+        integer(kind = ik), parameter :: N_G_BINS = 17_ik
+        real(kind = rk), parameter :: G_BIN_LO = -0.15_rk
+        real(kind = rk), parameter :: G_BIN_W = 0.01_rk
+        !> July-parity resolve resolution for the g values.
+        integer(kind = ik), parameter :: N_RHO_JULY = 7201_ik
+        ! f_min bins: 6/decade over [1e-6, 1e-1] (bins 1..30) + underflow (0).
+        integer(kind = ik), parameter :: N_F_BINS = 30_ik
+
+        integer(kind = ik) :: g_count(N_G_BINS), g_fail(N_G_BINS)
+        real(kind = rk) :: g_dv(N_G_BINS), g_ds(N_G_BINS), g_rt(N_G_BINS)
+        real(kind = rk) :: g_rp(N_G_BINS), g_rpp(N_G_BINS)
+        integer(kind = ik) :: f_count(0:N_F_BINS, 2), f_fail(0:N_F_BINS, 2)
+        real(kind = rk) :: f_dv(0:N_F_BINS, 2), f_ds(0:N_F_BINS, 2)
+        real(kind = rk) :: f_rt(0:N_F_BINS, 2), f_rp(0:N_F_BINS, 2)
+        real(kind = rk) :: f_rpp(0:N_F_BINS, 2)
+
+        integer(kind = ik) :: i_c, i3, i4, i5, i6, stf, stg, stq, gb, fb, br, b
+        real(kind = rk) :: params(7), f_min, u_min, g7, zt7
+        real(kind = rk) :: s_ref, dv_rel, ds_rel, rt_max, rp_max, rpp_max
+        real(kind = rk) :: zs_d, g_d, g_spot, zt_spot
+        real(kind = rk) :: th1(1), r1(1), dr1(1)
+        logical :: interior_min, beak_pass
+        integer(kind = ik) :: t_start, t_end, t_rate
+
+        write(*, '(A)') '=== Representability probe ==='
+
+        ! Spot check: for a beak-passing shape the July-parity star optimum
+        ! and the diagnostic resolve must report the SAME g(s*) bitwise (both
+        ! run the identical resolve at N_RHO_JULY).
+        params = [1.5_rk, 0.1_rk, 0.1_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+        call compute_star_convexity_optimum_standalone_s(params, N_RHO_JULY, &
+                zt_spot, g_spot, stg)
+        call assert_int_eq(stg, SHAPE_VALID, 'probe: spot-check star optimum valid')
+        th1(1) = 0.5_rk * PI_C
+        call compute_conversion_diagnostic_standalone_s(params, th1, N_RHO_JULY, &
+                r1, dr1, zs_d, g_d, stq)
+        call assert_int_eq(stq, SHAPE_VALID, 'probe: spot-check diagnostic valid')
+        call assert_bits_eq(g_spot, g_d, 'probe: g(s*) bitwise across both paths')
+
+        g_count = 0_ik
+        g_fail = 0_ik
+        g_dv = 0.0_rk
+        g_ds = 0.0_rk
+        g_rt = 0.0_rk
+        g_rp = 0.0_rk
+        g_rpp = 0.0_rk
+        f_count = 0_ik
+        f_fail = 0_ik
+        f_dv = 0.0_rk
+        f_ds = 0.0_rk
+        f_rt = 0.0_rk
+        f_rp = 0.0_rk
+        f_rpp = 0.0_rk
+
+        call system_clock(t_start, t_rate)
+
+        !$omp parallel do collapse(3) schedule(dynamic) default(shared) &
+        !$omp& private(i_c, i3, i4, i5, i6, params, f_min, u_min, interior_min, &
+        !$omp&         stf, stg, stq, gb, fb, br, g7, zt7, s_ref, dv_rel, ds_rel, &
+        !$omp&         rt_max, rp_max, rpp_max, zs_d, g_d, th1, r1, dr1, beak_pass) &
+        !$omp& reduction(+:g_count, g_fail, f_count, f_fail) &
+        !$omp& reduction(max:g_dv, g_ds, g_rt, g_rp, g_rpp, f_dv, f_ds, f_rt, f_rp, f_rpp)
+        do i_c = 1_ik, cfg%n_c
+            do i3 = 1_ik, cfg%n_a3
+                do i4 = 1_ik, cfg%n_a4
+                    do i5 = 1_ik, cfg%n_a5
+                        do i6 = 1_ik, cfg%n_a6
+                            params = grid_params_f(cfg, i_c, i3, i4, i5, i6)
+
+                            call compute_f_min_standalone_s(params, f_min, u_min, &
+                                    interior_min, stf)
+                            if (stf /= SHAPE_VALID) cycle
+                            beak_pass = f_min > F_MIN_THRESHOLD
+
+                            ! g(s*) at July parity. The star-optimum form is
+                            ! beak-gated, so it only serves beak-passing
+                            ! shapes; the rest resolve through the diagnostic
+                            ! path (g is set before the theta solve, so a 104
+                            ! there still reports a valid g).
+                            if (beak_pass) then
+                                call compute_star_convexity_optimum_standalone_s( &
+                                        params, N_RHO_JULY, zt7, g7, stg)
+                                if (stg /= SHAPE_VALID) cycle  ! rho-rejected
+                            else
+                                th1(1) = 0.5_rk * PI_C
+                                call compute_conversion_diagnostic_standalone_s( &
+                                        params, th1, N_RHO_JULY, r1, dr1, zt7, g7, stg)
+                                if (stg /= SHAPE_VALID &
+                                        .and. stg /= FOS_ERROR_CONVERGENCE) cycle
+                            end if
+
+                            if (g7 >= G_BIN_LO + real(N_G_BINS - 1_ik, rk) * G_BIN_W) cycle
+
+                            s_ref = compute_reference_surface_f(params)
+                            call evaluate_shape_quality_diag_s(params, N_POINTS_SWEEP, &
+                                    s_ref, dv_rel, ds_rel, rt_max, rp_max, rpp_max, &
+                                    zs_d, g_d, stq)
+                            if (stq /= SHAPE_VALID &
+                                    .and. stq /= FOS_ERROR_CONVERGENCE) cycle
+
+                            gb = int(floor((g7 - G_BIN_LO) / G_BIN_W), ik) + 1_ik
+                            gb = min(max(gb, 1_ik), N_G_BINS)
+                            g_count(gb) = g_count(gb) + 1_ik
+                            if (stq == FOS_ERROR_CONVERGENCE) then
+                                g_fail(gb) = g_fail(gb) + 1_ik
+                            else
+                                g_dv(gb) = max(g_dv(gb), abs(dv_rel))
+                                g_ds(gb) = max(g_ds(gb), abs(ds_rel))
+                                g_rt(gb) = max(g_rt(gb), rt_max)
+                                g_rp(gb) = max(g_rp(gb), rp_max)
+                                g_rpp(gb) = max(g_rpp(gb), rpp_max)
+                            end if
+
+                            ! f_min bins: rho- and star-passing shapes only.
+                            if (g7 <= -STAR_CONVEXITY_MARGIN) then
+                                fb = f_bin_f(f_min)
+                                br = 1_ik              ! polar (boundary clamp)
+                                if (interior_min) br = 2_ik   ! neck (interior)
+                                f_count(fb, br) = f_count(fb, br) + 1_ik
+                                if (stq == FOS_ERROR_CONVERGENCE) then
+                                    f_fail(fb, br) = f_fail(fb, br) + 1_ik
+                                else
+                                    f_dv(fb, br) = max(f_dv(fb, br), abs(dv_rel))
+                                    f_ds(fb, br) = max(f_ds(fb, br), abs(ds_rel))
+                                    f_rt(fb, br) = max(f_rt(fb, br), rt_max)
+                                    f_rp(fb, br) = max(f_rp(fb, br), rp_max)
+                                    f_rpp(fb, br) = max(f_rpp(fb, br), rpp_max)
+                                end if
+                            end if
+                        end do
+                    end do
+                end do
+            end do
+        end do
+        !$omp end parallel do
+
+        call system_clock(t_end)
+
+        write(*, '(A)') 'g(s*) bins (July parity, diagnostic conversion):'
+        write(*, '(A)') '   g_lo      count   fail  worst|dV/V|  worst|dS/S|' // &
+                '  worst rt     worst R''     worst R'''''
+        do b = 1_ik, N_G_BINS
+            if (g_count(b) == 0_ik) cycle
+            write(*, '(F8.3,I10,I7,5ES13.4)') G_BIN_LO + real(b - 1_ik, rk) * G_BIN_W, &
+                    g_count(b), g_fail(b), g_dv(b), g_ds(b), g_rt(b), g_rp(b), g_rpp(b)
+        end do
+
+        write(*, '(A)') 'f_min bins (6/decade, branch: P = polar clamp, N = interior neck):'
+        write(*, '(A)') '   f_min_lo   br     count   fail  worst|dV/V|  worst|dS/S|' // &
+                '  worst rt     worst R''     worst R'''''
+        do b = 0_ik, N_F_BINS
+            do br = 1_ik, 2_ik
+                if (f_count(b, br) == 0_ik) cycle
+                write(*, '(ES11.3,A4,I10,I7,5ES13.4)') f_edge_f(b), &
+                        merge('   P', '   N', br == 1_ik), f_count(b, br), &
+                        f_fail(b, br), f_dv(b, br), f_ds(b, br), f_rt(b, br), &
+                        f_rp(b, br), f_rpp(b, br)
+            end do
+        end do
+
+        call print_cliff_s('Task-4 baselined tolerances', &
+                TOL_VOLUME_B, TOL_SURFACE_REL, TOL_ROUND_TRIP, f_count, f_fail, &
+                f_dv, f_ds, f_rt)
+        call print_cliff_s('wmmm-inherited tolerances', &
+                2.0e-9_rk, 1.0e-3_rk, 1.0e-9_rk, f_count, f_fail, f_dv, f_ds, f_rt)
+
+        write(*, '(A,F10.2,A)') '  Probe wall time: ', &
+                real(t_end - t_start, rk) / real(t_rate, rk), ' s'
+
+    end subroutine run_probe_s
+
+    !> Log-spaced bin index: 0 = underflow (< 1e-6), 1..30 over [1e-6, 1e-1],
+    !! overflow clamps into bin 30 (6 bins per decade).
+    pure function f_bin_f(f) result(bin)
+
+        real(kind = rk), intent(in) :: f
+        integer(kind = ik) :: bin
+
+        if (f < 1.0e-6_rk) then
+            bin = 0_ik
+        else
+            bin = int(floor(6.0_rk * (log10(f) + 6.0_rk)), ik) + 1_ik
+            bin = min(bin, 30_ik)
+        end if
+
+    end function f_bin_f
+
+    !> Lower edge of f bin b (b = 0 prints the underflow marker 0).
+    pure function f_edge_f(b) result(edge)
+
+        integer(kind = ik), intent(in) :: b
+        real(kind = rk) :: edge
+
+        if (b == 0_ik) then
+            edge = 0.0_rk
+        else
+            edge = 1.0e-6_rk * 10.0_rk**(real(b - 1_ik, rk) / 6.0_rk)
+        end if
+
+    end function f_edge_f
+
+    !> Descending-f_min cliff readout per branch against a tolerance triple:
+    !! the first bin (from high f_min down) whose worst metrics leave
+    !! tolerance or that records conversion failures.
+    subroutine print_cliff_s(label, tol_v, tol_s, tol_r, f_count, f_fail, &
+            f_dv, f_ds, f_rt)
+
+        character(len = *), intent(in) :: label
+        real(kind = rk), intent(in) :: tol_v, tol_s, tol_r
+        integer(kind = ik), intent(in) :: f_count(0:, :), f_fail(0:, :)
+        real(kind = rk), intent(in) :: f_dv(0:, :), f_ds(0:, :), f_rt(0:, :)
+
+        character(len = 5), parameter :: BR_NAME(2) = ['polar', 'neck ']
+        integer(kind = ik) :: bb, brr, cliff, n_bins
+
+        n_bins = ubound(f_count, 1)
+        write(*, '(A,A,A,3ES10.2,A)') 'cliff readout [', label, '] (dv,ds,rt <= ', &
+                tol_v, tol_s, tol_r, '):'
+        do brr = 1_ik, 2_ik
+            cliff = -1_ik
+            do bb = n_bins, 0_ik, -1_ik
+                if (f_count(bb, brr) == 0_ik) cycle
+                if (f_fail(bb, brr) > 0_ik .or. f_dv(bb, brr) > tol_v &
+                        .or. f_ds(bb, brr) > tol_s .or. f_rt(bb, brr) > tol_r) then
+                    cliff = bb
+                    exit
+                end if
+            end do
+            if (cliff < 0_ik) then
+                write(*, '(A,A,A)') '  cliff(', trim(BR_NAME(brr)), &
+                        '): none — all populated bins within tolerance'
+            else
+                write(*, '(A,A,A,ES11.3,A,ES11.3,A)') '  cliff(', &
+                        trim(BR_NAME(brr)), '): f_min in [', f_edge_f(cliff), &
+                        ', ', f_edge_f(cliff + 1_ik), ')'
+                write(*, '(A,ES11.3)') '  proposed threshold (one bin above): ', &
+                        f_edge_f(cliff + 1_ik)
+            end if
+        end do
+
+    end subroutine print_cliff_s
 
 end program fos_param_geometry_sweep_test

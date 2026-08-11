@@ -12,6 +12,7 @@ module fos_test_reference_mod
     use mathematical_utilities_mod, only: compute_gauss_legendre_quadrature_s
     use fos_parameterization_mod, only: compute_rho_at_z_s, &
             compute_fos_f_and_derivatives_s, compute_radius_and_derivative_standalone_s, &
+            compute_conversion_diagnostic_standalone_s, &
             SHAPE_VALID
 
     implicit none
@@ -21,6 +22,7 @@ module fos_test_reference_mod
     public :: init_quadrature_s
     public :: compute_reference_surface_f
     public :: evaluate_shape_quality_s
+    public :: evaluate_shape_quality_diag_s
     public :: spheroid_surface_area_f
     public :: find_neck_in_radii_s
     public :: N_GL_THETA, N_GL_REF, V_SPHERE
@@ -142,6 +144,112 @@ contains
         dv_rel = vol / V_SPHERE - 1.0_rk
         ds_rel = surf / s_ref - 1.0_rk
     end subroutine evaluate_shape_quality_s
+
+    !> Diagnostic twin of `evaluate_shape_quality_s`: same GL V/S/round-trip
+    !! integrals, but through the beak- and star-ungated conversion
+    !! (`compute_conversion_diagnostic_standalone_s`), so beak-rejected and
+    !! over-margin shapes can be measured. Two additions:
+    !!   - `z_shift`/`g_opt` are OUTPUTS (the diagnostic call resolves them);
+    !!     z_shift feeds the cylindrical side exactly as the production twin
+    !!     uses its input.
+    !!   - One extra conversion on a uniform 1001-point theta grid yields
+    !!     rp_max = max|dR/dtheta| and rpp_max = max|d2R/dtheta2| by centered
+    !!     differences on dR/dtheta (interior points only) — the polar-branch
+    !!     (R') and neck-branch (R'') blow-up metrics of the beak derivation.
+    !! On any rejection every metric keeps the huge() convention.
+    subroutine evaluate_shape_quality_diag_s(params, n_points, s_ref, &
+            dv_rel, ds_rel, rt_max, rp_max, rpp_max, z_shift, g_opt, status)
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: n_points
+        real(kind = rk), intent(in) :: s_ref
+        real(kind = rk), intent(out) :: dv_rel
+        real(kind = rk), intent(out) :: ds_rel
+        real(kind = rk), intent(out) :: rt_max
+        real(kind = rk), intent(out) :: rp_max
+        real(kind = rk), intent(out) :: rpp_max
+        real(kind = rk), intent(out) :: z_shift
+        real(kind = rk), intent(out) :: g_opt
+        integer(kind = ik), intent(out) :: status
+
+        integer(kind = ik), parameter :: N_UNIFORM = 1001_ik
+
+        integer(kind = ik) :: i, status_u
+        real(kind = rk) :: x, sin_theta, r, z, rho, drho_dz
+        real(kind = rk) :: denom, dr_dtheta, vol, surf, dtheta
+        real(kind = rk) :: thetas(N_GL_THETA), radii(N_GL_THETA), dr_sink(N_GL_THETA)
+        real(kind = rk) :: thetas_u(N_UNIFORM), radii_u(N_UNIFORM), dr_u(N_UNIFORM)
+        real(kind = rk) :: z_shift_u, g_opt_u
+
+        dv_rel = huge(1.0_rk)
+        ds_rel = huge(1.0_rk)
+        rt_max = huge(1.0_rk)
+        rp_max = huge(1.0_rk)
+        rpp_max = huge(1.0_rk)
+        z_shift = 0.0_rk
+        g_opt = 0.0_rk
+
+        do i = 1_ik, N_GL_THETA
+            thetas(i) = acos(gl_theta_x(i))
+        end do
+
+        call compute_conversion_diagnostic_standalone_s(params, thetas, n_points, &
+                radii, dr_sink, z_shift, g_opt, status)
+        if (status /= SHAPE_VALID) return
+
+        vol = 0.0_rk
+        surf = 0.0_rk
+        rt_max = 0.0_rk
+
+        do i = 1_ik, N_GL_THETA
+            x = gl_theta_x(i)
+            sin_theta = sqrt(max(1.0_rk - x**2, 0.0_rk))
+            r = radii(i)
+            vol = vol + gl_theta_w(i) * r**3
+
+            z = r * x
+            call compute_rho_at_z_s(params, z, z_shift, rho, drho_dz)
+            rt_max = max(rt_max, abs(r * sin_theta - rho))
+
+            denom = drho_dz * x - sin_theta
+            if (abs(denom) > 1.0e-12_rk) then
+                dr_dtheta = (r * x + drho_dz * r * sin_theta) / denom
+            else
+                dr_dtheta = 0.0_rk
+            end if
+            surf = surf + gl_theta_w(i) * r * sqrt(r**2 + dr_dtheta**2)
+        end do
+
+        vol = vol * 2.0_rk * PI_C / 3.0_rk
+        surf = surf * 2.0_rk * PI_C
+        dv_rel = vol / V_SPHERE - 1.0_rk
+        ds_rel = surf / s_ref - 1.0_rk
+
+        ! R'/R'' metrics on the uniform grid (same params, same n_points ->
+        ! same resolve; the returned shift/g are the ones already reported).
+        do i = 1_ik, N_UNIFORM
+            thetas_u(i) = real(i - 1_ik, rk) * PI_C / real(N_UNIFORM - 1_ik, rk)
+        end do
+        thetas_u(N_UNIFORM) = PI_C
+
+        call compute_conversion_diagnostic_standalone_s(params, thetas_u, n_points, &
+                radii_u, dr_u, z_shift_u, g_opt_u, status_u)
+        if (status_u /= SHAPE_VALID) then
+            ! Metrics stay huge(); the caller sees the primary status.
+            status = status_u
+            return
+        end if
+
+        dtheta = PI_C / real(N_UNIFORM - 1_ik, rk)
+        rp_max = 0.0_rk
+        rpp_max = 0.0_rk
+        do i = 1_ik, N_UNIFORM
+            rp_max = max(rp_max, abs(dr_u(i)))
+        end do
+        do i = 2_ik, N_UNIFORM - 1_ik
+            rpp_max = max(rpp_max, &
+                    abs(dr_u(i + 1_ik) - dr_u(i - 1_ik)) / (2.0_rk * dtheta))
+        end do
+    end subroutine evaluate_shape_quality_diag_s
 
     !> Closed-form spheroid surface area for FoS with all a_k = 0:
     !! f = 1 - u^2, so semi-axes are polar cp = c and equatorial ae = 1/sqrt(c).
