@@ -37,6 +37,7 @@ program fos_param_standalone_test
             cache_radius_and_derivative_s, cache_neck_s, &
             cache_star_convexity_optimum_s, &
             compute_rho_at_z_s, &
+            compute_f_min_standalone_s, F_MIN_THRESHOLD, &
             FOS_ERROR_INVALID_C
     use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS
     use test_utils_mod, only: assert_true, assert_int_eq, assert_abs_close, &
@@ -283,6 +284,54 @@ program fos_param_standalone_test
     end do
     call assert_abs_close(max_dev, 0.0_rk, TOL_PARITY, &
             'tier-1 rho(z) matches the order-complete live evaluator')
+
+    !---------------------------------------------------------------------------
+    ! compute_f_min_standalone_s: raw beak-quantity diagnostic
+    !---------------------------------------------------------------------------
+    write(*, '(A)') '=== f_min raw-quantity diagnostic ==='
+
+    block
+        real(kind = rk) :: params7(7), f_min, u_at_min
+        logical :: interior_min
+        integer(kind = ik) :: st_diag
+
+        ! Sphere: f = 1 - u^2, scan clamped at |u| <= 0.999 -> boundary min.
+        params7 = [1.0_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+        call compute_f_min_standalone_s(params7, f_min, u_at_min, interior_min, st_diag)
+        call assert_int_eq(st_diag, SHAPE_VALID, 'f_min diag: sphere status')
+        call assert_abs_close(f_min, 1.0_rk - 0.999_rk**2, 1.0e-12_rk, &
+                'f_min diag: sphere clamp value 1.999e-3')
+        call assert_abs_close(abs(u_at_min), 0.999_rk, 1.0e-12_rk, &
+                'f_min diag: sphere min at clamp')
+        call assert_true(.not. interior_min, 'f_min diag: sphere min is boundary')
+
+        ! Neck-branch analytic anchor: a3=a5=a6=0 => a2 = a4/3, f(0) = 1 - 4*a4/3.
+        ! a4 = 0.75 is the touching point f(0) = 0 exactly. Smaller a4 will NOT
+        ! do: the interior value competes with the clamped boundary value
+        ! (~4.5e-3 at a4 = 0.6), and the boundary wins for a4 < ~0.7463.
+        params7 = [1.0_rk, 0.0_rk, 0.75_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+        call compute_f_min_standalone_s(params7, f_min, u_at_min, interior_min, st_diag)
+        call assert_int_eq(st_diag, SHAPE_VALID, 'f_min diag: neck anchor status')
+        call assert_abs_close(f_min, 0.0_rk, 1.0e-12_rk, &
+                'f_min diag: f(0) = 1 - 4 a4/3 = 0 at a4=0.75')
+        call assert_abs_close(u_at_min, 0.0_rk, 1.0e-3_rk, 'f_min diag: neck min at u=0')
+        call assert_true(interior_min, 'f_min diag: neck min is interior')
+
+        ! Polar-branch worked example (spec): c=1.60 a3=0.40 a4=0 a5=-0.05 a6=0.05
+        ! -> f_min ~ 5.1e-5, far below both threshold and the ~2e-3 tip baseline.
+        params7 = [1.60_rk, 0.40_rk, 0.0_rk, -0.05_rk, 0.05_rk, 0.0_rk, 0.0_rk]
+        call compute_f_min_standalone_s(params7, f_min, u_at_min, interior_min, st_diag)
+        call assert_int_eq(st_diag, SHAPE_VALID, 'f_min diag: beak example status (ungated)')
+        call assert_true(f_min < F_MIN_THRESHOLD, 'f_min diag: beak example below threshold')
+        call assert_true(abs(u_at_min) > 0.8_rk, 'f_min diag: beak example min near a pole')
+        write(*, '(A, ES12.4, A, F8.4)') 'f_min diag: beak example f_min = ', f_min, &
+                ', u_at_min = ', u_at_min
+
+        ! Invalid c still gates.
+        params7 = [0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+        call compute_f_min_standalone_s(params7, f_min, u_at_min, interior_min, st_diag)
+        call assert_int_eq(st_diag, FOS_ERROR_INVALID_C, 'f_min diag: c gate kept')
+    end block
 
     call test_summary()
 

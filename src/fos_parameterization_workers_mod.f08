@@ -86,6 +86,7 @@ module fos_parameterization_workers_mod
     public :: compute_rho_z_grid_standalone_s
     public :: compute_neck_standalone_s
     public :: compute_star_convexity_optimum_standalone_s
+    public :: compute_f_min_standalone_s
 
     !---------------------------------------------------------------------------
     ! Table-construction parameters
@@ -754,25 +755,34 @@ contains
     !! converging, and surface/Coulomb integrals blow up. The scan grid is
     !! clamped away from the poles, where f = 0 by construction.
     !!
-    !! @param[in]  tables   Initialized trig tables
-    !! @param[in]  params   FoS parameters (params(1) = c is not read)
-    !! @param[out] f_min    Smallest f over the scan grid
-    !! @param[out] beak_ok  .true. iff f_min > F_MIN_THRESHOLD
-    subroutine beak_scan_f_min_s(tables, params, f_min, beak_ok)
+    !! @param[in]  tables        Initialized trig tables
+    !! @param[in]  params        FoS parameters (params(1) = c is not read)
+    !! @param[out] f_min         Smallest f over the scan grid
+    !! @param[out] beak_ok       .true. iff f_min > F_MIN_THRESHOLD
+    !! @param[out] u_at_min      Optional: scan-grid u of the minimum
+    !! @param[out] interior_min  Optional: .true. iff the minimum is a strict
+    !!                           interior scan point (not at the clamp) — a
+    !!                           minimum away from the clamp IS a local minimum
+    !!                           of the scan, so no neighbor test is needed
+    subroutine beak_scan_f_min_s(tables, params, f_min, beak_ok, u_at_min, &
+            interior_min)
 
         type(tables_t), intent(in) :: tables
         real(kind = rk), intent(in) :: params(:)
         real(kind = rk), intent(out) :: f_min
         logical, intent(out) :: beak_ok
+        real(kind = rk), intent(out), optional :: u_at_min
+        logical, intent(out), optional :: interior_min
 
         real(kind = rk) :: a_even(tables%k_max), a_odd(tables%k_max)
         logical :: active(tables%k_max)
         real(kind = rk) :: sum_f, f_val, u
-        integer(kind = ik) :: i, k
+        integer(kind = ik) :: i, k, i_min
 
         call pair_coefficients_s(params, tables%k_max, a_even, a_odd, active)
 
         f_min = huge(1.0_rk)
+        i_min = 1_ik
         do i = 1_ik, FOS_BEAK_SCAN_POINTS
             sum_f = 0.0_rk
             do k = 1_ik, tables%k_max
@@ -782,10 +792,16 @@ contains
             end do
             u = tables%u_beak(i)
             f_val = 1.0_rk - u**2 - sum_f
-            if (f_val < f_min) f_min = f_val
+            if (f_val < f_min) then
+                f_min = f_val
+                i_min = i
+            end if
         end do
 
         beak_ok = f_min > F_MIN_THRESHOLD
+        if (present(u_at_min)) u_at_min = tables%u_beak(i_min)
+        if (present(interior_min)) interior_min = &
+                i_min > 1_ik .and. i_min < FOS_BEAK_SCAN_POINTS
 
     end subroutine beak_scan_f_min_s
 
@@ -2114,6 +2130,67 @@ contains
         g_opt = st%g_opt
 
     end subroutine compute_star_convexity_optimum_standalone_s
+
+    !> Raw beak-quantity diagnostic, standalone: the beak scan's f_min with its
+    !! location, ungated by beak/rho/star by construction — only stages #1–#4
+    !! run, and no verdict gate is applied. Gates kept: the parameter-vector
+    !! gates (length, 102). Probe/diagnostic use; the production verdict on the
+    !! same quantity is `compute_shape_standalone_s` (103 iff
+    !! f_min <= F_MIN_THRESHOLD).
+    !!
+    !! @param[in]  params        FoS parameters, 1 to FOS_MAX_PARAMS entries
+    !! @param[out] f_min         Smallest f over the 1001-pt clamped scan
+    !! @param[out] u_at_min      Scan-grid u of the minimum
+    !! @param[out] interior_min  .true. iff strict interior scan minimum
+    !! @param[out] status        SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS,
+    !!                           FOS_ERROR_INVALID_C or SHAPE_ERROR_INVALID_GRID
+    subroutine compute_f_min_standalone_s(params, f_min, u_at_min, &
+            interior_min, status)
+
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(out) :: f_min
+        real(kind = rk), intent(out) :: u_at_min
+        logical, intent(out) :: interior_min
+        integer(kind = ik), intent(out) :: status
+
+        type(tables_t) :: tables
+        logical :: beak_ok
+        integer(kind = ik) :: n, k_max
+
+        f_min = 0.0_rk
+        u_at_min = 0.0_rk
+        interior_min = .false.
+
+        n = size(params, kind = ik)
+
+        ! Same gate order as `standalone_run_s`: length before params(1).
+        if (n > FOS_MAX_PARAMS) then
+            status = SHAPE_ERROR_TOO_MANY_PARAMS
+            return
+        end if
+
+        if (n < 1_ik) then
+            status = FOS_ERROR_INVALID_C
+            return
+        end if
+
+        if (params(1) <= C_MIN) then
+            status = FOS_ERROR_INVALID_C
+            return
+        end if
+
+        k_max = min((n + 2_ik) / 2_ik + 1_ik, FOS_MAX_K)
+
+        call build_tables_s(tables, FOS_N_POINTS_FLOOR, NO_THETAS, k_max, status)
+        if (status /= SHAPE_VALID) return
+
+        call beak_scan_f_min_s(tables, params, f_min, beak_ok, u_at_min, &
+                interior_min)
+        call tables_free_s(tables)
+
+        status = SHAPE_VALID
+
+    end subroutine compute_f_min_standalone_s
 
     !> The standalone tier's single worker: validate, build local tables, run
     !! the kernels in cold order.
