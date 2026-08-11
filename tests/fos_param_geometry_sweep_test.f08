@@ -6,9 +6,13 @@
 !! tallies captured on the default coarse grid. Tier B (accuracy) and the
 !! representability probe are added by later tasks.
 !!
-!! Grid: c in [0.75, 3.50], a3 in [0.00, 0.60], a4 in [-0.20, 0.75],
-!! a5/a6 in [-0.15, 0.15]; default step 0.05 on every axis (713,440 points),
-!! `--full` refines a5/a6 to 0.01 (~14.0M points).
+!! Grid (the VALIDATED box): c in [0.75, 3.50], a3 in [0.00, 0.60],
+!! a4 in [-0.20, 0.75], a5 in [-0.15, 0.15], a6 in [-0.10, 0.10]; default
+!! step 0.05 on every axis (509,600 points), `--full` refines a5/a6 to 0.01
+!! (~9.5M points). The a6 bound is part of the 2026-08-11 F_MIN_THRESHOLD
+!! statement: at |a6| = 0.15 an a4 = 0.75, a3 = 0.55, c <= 0.85 family with
+!! healthy f_min degrades GL-4096 V/S (see the constant's doc comment);
+!! --a5-abs / --a6-abs re-run wider boxes as experiments.
 module fos_sweep_support_mod
 
     use precision_utilities_mod, only: ik, rk
@@ -25,7 +29,7 @@ module fos_sweep_support_mod
     real(kind = rk), parameter :: A3_LO = 0.00_rk, A3_HI = 0.60_rk
     real(kind = rk), parameter :: A4_LO = -0.20_rk, A4_HI = 0.75_rk
     real(kind = rk), parameter :: A5_LO = -0.15_rk, A5_HI = 0.15_rk
-    real(kind = rk), parameter :: A6_LO = -0.15_rk, A6_HI = 0.15_rk
+    real(kind = rk), parameter :: A6_LO = -0.10_rk, A6_HI = 0.10_rk
 
     !> u-grid resolution of every sweep-tier conversion (wmmm N_RHO_INTERNAL
     !! parity).
@@ -34,10 +38,14 @@ module fos_sweep_support_mod
     type :: sweep_config_t
         real(kind = rk) :: dc = 0.05_rk, da3 = 0.05_rk, da4 = 0.05_rk
         real(kind = rk) :: da5 = 0.05_rk, da6 = 0.05_rk
+        !> Axis bounds; runtime-overridable (--a5-abs / --a6-abs) for
+        !! box-trimming experiments.
+        real(kind = rk) :: a5_lo = A5_LO, a5_hi = A5_HI
+        real(kind = rk) :: a6_lo = A6_LO, a6_hi = A6_HI
         integer(kind = ik) :: n_c = 0_ik, n_a3 = 0_ik, n_a4 = 0_ik
         integer(kind = ik) :: n_a5 = 0_ik, n_a6 = 0_ik
         logical :: probe = .false., skip_tier_b = .false.
-        !> .true. iff no step override and no --full: golden tallies apply.
+        !> .true. iff no step/range override and no --full: golden tallies apply.
         logical :: golden_grid = .true.
     end type sweep_config_t
 
@@ -90,11 +98,20 @@ contains
             case ('--da6')
                 call read_real_arg_s(i, cfg%da6)
                 cfg%golden_grid = .false.
+            case ('--a5-abs')
+                call read_real_arg_s(i, cfg%a5_hi)
+                cfg%a5_lo = -cfg%a5_hi
+                cfg%golden_grid = .false.
+            case ('--a6-abs')
+                call read_real_arg_s(i, cfg%a6_hi)
+                cfg%a6_lo = -cfg%a6_hi
+                cfg%golden_grid = .false.
             case default
                 write(*, '(A,A)') 'Unknown argument: ', trim(arg)
                 write(*, '(A)') 'Usage: fos_param_geometry_sweep_test [--full]' // &
                         ' [--probe] [--skip-tier-b]' // &
-                        ' [--dc X] [--da3 X] [--da4 X] [--da5 X] [--da6 X]'
+                        ' [--dc X] [--da3 X] [--da4 X] [--da5 X] [--da6 X]' // &
+                        ' [--a5-abs X] [--a6-abs X]'
                 stop 2
             end select
             i = i + 1_ik
@@ -103,8 +120,8 @@ contains
         cfg%n_c = count_steps_f(C_LO, C_HI, cfg%dc)
         cfg%n_a3 = count_steps_f(A3_LO, A3_HI, cfg%da3)
         cfg%n_a4 = count_steps_f(A4_LO, A4_HI, cfg%da4)
-        cfg%n_a5 = count_steps_f(A5_LO, A5_HI, cfg%da5)
-        cfg%n_a6 = count_steps_f(A6_LO, A6_HI, cfg%da6)
+        cfg%n_a5 = count_steps_f(cfg%a5_lo, cfg%a5_hi, cfg%da5)
+        cfg%n_a6 = count_steps_f(cfg%a6_lo, cfg%a6_hi, cfg%da6)
 
     contains
 
@@ -142,6 +159,8 @@ contains
         write(*, '(A,F6.3,A,I0,A)') '  da4 = ', cfg%da4, '  (', cfg%n_a4, ' values)'
         write(*, '(A,F6.3,A,I0,A)') '  da5 = ', cfg%da5, '  (', cfg%n_a5, ' values)'
         write(*, '(A,F6.3,A,I0,A)') '  da6 = ', cfg%da6, '  (', cfg%n_a6, ' values)'
+        write(*, '(A,F6.3,A,F6.3,A)') '  a5 in [', cfg%a5_lo, ', ', cfg%a5_hi, ']'
+        write(*, '(A,F6.3,A,F6.3,A)') '  a6 in [', cfg%a6_lo, ', ', cfg%a6_hi, ']'
         write(*, '(A,I0)') '  grid points: ', &
                 cfg%n_c * cfg%n_a3 * cfg%n_a4 * cfg%n_a5 * cfg%n_a6
         write(*, '(A,L1)') '  golden grid: ', cfg%golden_grid
@@ -159,8 +178,8 @@ contains
         params = [C_LO + real(i_c - 1_ik, rk) * cfg%dc, &
                 A3_LO + real(i3 - 1_ik, rk) * cfg%da3, &
                 A4_LO + real(i4 - 1_ik, rk) * cfg%da4, &
-                A5_LO + real(i5 - 1_ik, rk) * cfg%da5, &
-                A6_LO + real(i6 - 1_ik, rk) * cfg%da6, &
+                cfg%a5_lo + real(i5 - 1_ik, rk) * cfg%da5, &
+                cfg%a6_lo + real(i6 - 1_ik, rk) * cfg%da6, &
                 0.0_rk, 0.0_rk]
 
     end function grid_params_f
@@ -190,19 +209,22 @@ program fos_param_geometry_sweep_test
     implicit none
 
     !> Tier B tolerances (absolute), re-baselined 2026-08-11 on the coarse
-    !! grid against the GL-4096 measurand.
+    !! grid of the validated box (a6 in [-0.10, 0.10]) with
+    !! F_MIN_THRESHOLD = 3.162e-4, against the GL-4096 measurand.
     !!
-    !! Round-trip is the conversion-correctness pin: measured worst 5.2e-12,
-    !! asserted 1e-10 (tightened from the inherited 1e-9). V/S are
-    !! measurand-quality metrics: their worst cases (measured 6.5e-6 and
-    !! 6.2e-3 at c=0.75-0.85, a3=0.55, a4=0.75, f_min ~ 3.9e-3) are GL-4096
-    !! QUADRATURE error on beak-marginal near-pinch shapes, not conversion
-    !! error — at the same worst point dV/V converges 6.5e-6 -> 5.0e-8 ->
-    !! 1.2e-9 for N = 4096/8192/16384 while the round-trip stays ~5e-12.
-    !! Provisional until the F_MIN_THRESHOLD decision (Task 7/8) settles which
-    !! marginal shapes stay accepted; re-tighten after the constant moves.
-    real(kind = rk), parameter :: TOL_VOLUME_B = 1.0e-4_rk
-    real(kind = rk), parameter :: TOL_SURFACE_REL = 5.0e-2_rk
+    !! Measured worst on 2026-08-11 (coarse, validated box): dV/V 1.39e-10,
+    !! dS/S 1.84e-6, round-trip 5.5e-12 — asserted one decade above. The dS
+    !! envelope is set by near-star-margin neck shapes (g(s*) ~ -0.012,
+    !! f_min healthy ~ 1.7e-3), the same population and order as the July
+    !! star-margin probe (dS <= 1.2e-6 in the last bin before g = 0); the
+    !! polar/beak-side accepted bins sit at dS <= 1.4e-8. On the pre-trim
+    !! box (|a6| = 0.15) the a4 = 0.75 corner family broke dS to 6.2e-3 at
+    !! healthy f_min (GL-4096 quadrature on its broad interior near-neck,
+    !! R'' ~ 5e4; dV/V converged 6.5e-6 -> 1.2e-9 over N = 4096 -> 16384
+    !! while round-trip stayed ~5e-12) — that family is outside the
+    !! validated box, not fixed by any legal threshold.
+    real(kind = rk), parameter :: TOL_VOLUME_B = 1.0e-9_rk
+    real(kind = rk), parameter :: TOL_SURFACE_REL = 2.0e-5_rk
     real(kind = rk), parameter :: TOL_ROUND_TRIP = 1.0e-10_rk
 
     !> Neck-context thresholds, mirroring wmmm's Level 2c physics filter
@@ -212,10 +234,11 @@ program fos_param_geometry_sweep_test
     real(kind = rk), parameter :: NECK_DEPTH_MIRROR = 0.25_rk
     real(kind = rk), parameter :: NECK_ELONGATION_MIRROR = 1.2_rk
 
-    !> Tier A verdict counts on the default coarse grid, captured 2026-08-11
-    !! (Task 3 first run). Index: 0 = valid, 1..4 = codes 100..103, 5 = other.
+    !> Tier A verdict counts on the default coarse grid of the validated box
+    !! (a6 in [-0.10, 0.10], F_MIN_THRESHOLD = 3.162e-4), captured 2026-08-11.
+    !! Index: 0 = valid, 1..4 = codes 100..103, 5 = other.
     integer(kind = ik), parameter :: GOLDEN_TALLY(0:5) = &
-            [468390_ik, 0_ik, 1058_ik, 0_ik, 243992_ik, 0_ik]
+            [403961_ik, 0_ik, 1199_ik, 0_ik, 104440_ik, 0_ik]
 
     type(sweep_config_t) :: cfg
     integer(kind = ik) :: tally(0:5), n_total

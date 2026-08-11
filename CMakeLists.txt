@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(fos-parameterization
-        VERSION 2.0.0
+        VERSION 2.1.0
         LANGUAGES Fortran CXX
         DESCRIPTION "Fourier-over-Spheroid (FoS) nuclear shape parameterization"
 )

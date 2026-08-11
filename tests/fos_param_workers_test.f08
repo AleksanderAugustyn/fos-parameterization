@@ -33,10 +33,13 @@ program fos_param_workers_test
     !! itself is the anchor.
     real(kind = rk), parameter :: ZS_PARAMS7_1X = 6.565141402540683E-002_rk
 
-    !> a4 of the symmetric (c = 2) family that the 1.x surface rejected as a
-    !! beak: the first grid point of the 1.x probe scan (0.60 + 5e-4 k) with
-    !! f_min < F_MIN_THRESHOLD. f(0) = 1 - 4 a4 / 3 = 6.67e-4 there.
-    real(kind = rk), parameter :: BEAK_A4_1X = 0.7495_rk
+    !> a4 of the symmetric (c = 2) family used as the below-threshold beak
+    !! fixture: f(0) = 1 - 4 a4 / 3 = 2.0e-4 < F_MIN_THRESHOLD = 3.162e-4.
+    !! Historical note: the 1.x-frozen probe value was 0.7495 (f(0) =
+    !! 6.67e-4), a beak only under the 1.x-era threshold 1e-3; the 2026-08-11
+    !! retune (see F_MIN_THRESHOLD) made that shape representable, so the
+    !! fixture deepened.
+    real(kind = rk), parameter :: BEAK_A4_1X = 0.74985_rk
 
     type(tables_t)     :: tables
     type(fos_bundle_t) :: bundle
@@ -101,8 +104,8 @@ program fos_param_workers_test
     !---------------------------------------------------------------------------
     ! Beak scan: sphere passes; a vector the 1.x surface rejects as a beak fails
     !---------------------------------------------------------------------------
-    ! The vector is not a guess: BEAK_A4_1X is what the 1.x probe scan settled
-    ! on, frozen from that surface before it was deleted (see the declaration).
+    ! The vector is not a guess: BEAK_A4_1X is the below-threshold beak
+    ! fixture (see the declaration for its 1.x provenance and 2.1.0 retune).
     params_beak(1) = 2.0_rk
     params_beak(2) = 0.0_rk
     params_beak(3) = BEAK_A4_1X

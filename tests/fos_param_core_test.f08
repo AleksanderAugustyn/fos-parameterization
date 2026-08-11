@@ -180,7 +180,7 @@ contains
                 max_t_opt, code)
         call assert_int_eq(code, FOS_ERROR_INVALID_C, 'optimum c=0: FOS_ERROR_INVALID_C')
 
-        params = [2.0_rk, 0.0_rk, 0.7497_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+        params = [2.0_rk, 0.0_rk, 0.74985_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
         call compute_star_convexity_optimum_standalone_s(params, N, z_shift_total, &
                 max_t_opt, code)
         call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, 'optimum beak: FOS_ERROR_BEAK_SINGULARITY')

@@ -3,6 +3,55 @@
 Notable changes to fos-parameterization. Versions follow semantic versioning;
 the Fortran, C and Python surfaces are versioned together.
 
+## 2.1.0 — 2026-08-11
+
+The beak criterion is now justified by a measured representability cliff, and
+the domain boundary moved accordingly.
+
+### Changed — F_MIN_THRESHOLD 1e-3 → 3.162e-4
+
+The geometry-sweep representability probe (new in this release) binned GL-4096
+volume/surface/round-trip accuracy by the beak quantity `f_min` (6 bins per
+decade, polar/neck branch split) through a beak- and star-ungated diagnostic
+conversion. On the validated box every bin with `f_min >= 3.162e-4` converts
+to `dV/V <= 2.4e-11`, `dS/S <= 1.4e-8`, round-trip `<= 5.5e-12`; the bin below
+breaks to `dS ~ 1.2e-3` and degrades monotonically further down. The new
+threshold sits one probe bin (10^(1/6)) above the measured cliff and 6x below
+the sphere clamp bound (1.999e-3), and readmits a demonstrably clean band —
++12% of the validated box (+61,040 of 509,600 coarse grid points). Full
+derivation and measurement record: the constant's doc comment.
+
+The validated box is part of the statement: `a6 in [-0.10, 0.10]` (was
+±0.15 in the wmmm-era sweep). At `|a6| = 0.15` an `a4 = 0.75, a3 = 0.55,
+c <= 0.85` family with healthy `f_min` degrades GL-4096 V/S via a broad
+interior near-neck (`R'' ~ 5e4`) — invisible to any legal `f_min` threshold;
+a curvature-based criterion is future work.
+
+### Fixed — `newton_radius_s` convergence on two shape classes
+
+Found by sweeping every accepted shape at GL-4096 with no physics filter
+(882 of 468,390 accepted shapes failed to convert): (1) at the extreme
+near-pole node the residual test was unsatisfiable (`dF/dr * ulp(r)` above
+the tolerance) — now accepted when the sign-change bracket collapses to
+2 ulps; (2) an attracting Newton period-2 orbit strictly inside the bracket
+evaded the leaves-the-bracket safeguard — past 50 iterations (the old hard
+cap) every step now bisects, which converges unconditionally. Nodes that
+converged before walk bit-identical iterate paths; all suites green
+untouched.
+
+### Added
+
+- `compute_f_min_standalone_s` — raw beak-quantity diagnostic (f_min,
+  location, interior/boundary branch), ungated by construction.
+- `compute_conversion_diagnostic_standalone_s` — beak- and star-ungated
+  R(theta) conversion with the resolve quantities surfaced (probe use;
+  production consumers stay on `compute_radius_and_derivative_standalone_s`).
+- `fos_param_geometry_sweep_test` (ctest `geometry_sweep`, label `sweep`) —
+  Tier A gate-classification with golden verdict counts, Tier B
+  conversion-accuracy sweep over every accepted shape (round-trip pinned at
+  1e-10), and the `--probe` representability probe; `--full`, per-axis step
+  and `--a5-abs`/`--a6-abs` box overrides.
+
 ## 2.0.0 — 2026-08-04
 
 Adoption of the shared shape-parameterization contract

@@ -136,8 +136,38 @@ module fos_parameterization_workers_mod
     !> Smallest elongation the evaluator treats as a shape.
     real(kind = rk), parameter, public :: C_MIN = 1.0e-10_rk
 
-    !> Beak-singularity threshold: shapes whose f_min falls below it are rejected.
-    real(kind = rk), parameter, public :: F_MIN_THRESHOLD = 1.0e-3_rk
+    !---------------------------------------------------------------------------
+    ! Beak-singularity threshold
+    !---------------------------------------------------------------------------
+    !> A shape is accepted iff f_min > threshold, where f_min is the minimum of
+    !! f(u) over the 1001-point scan clamped to |u| <= 0.999. f(+-1) = 0 for
+    !! every shape, so near a tip f ~ |f'(+-1)| * 1e-3: a boundary-clamped
+    !! f_min is a tip-slope proxy (sphere: f' = -2 -> baseline 1.999e-3, the
+    !! hard upper bound for any threshold), and f' -> 0 makes the tip a beak.
+    !! Two failure branches, both diverging as f_min^(-1/2): boundary-clamped
+    !! minima (polar branch, drho/dz ~ f'/(2c sqrt(c f_min)) -> R' blow-up
+    !! near a pole, prefactor c^(-3/2)) and strict-interior minima (neck
+    !! branch, slope bounded but d2rho/dz2 ~ f''/(2c^2 sqrt(c f_min)) -> R''
+    !! blow-up at the waist, prefactor c^(-5/2)).
+    !!
+    !! Value retuned 2026-08-11 (1e-3 -> 3.162e-4 = 10^-3.5) from the
+    !! geometry-sweep representability probe (fos_param_geometry_sweep_test
+    !! --probe; f_min binned 6/decade, branch-split, GL-4096 V/S/round-trip
+    !! through the beak-ungated diagnostic conversion) on the validated box
+    !! c in [0.75, 3.50], a3 in [0, 0.60], a4 in [-0.20, 0.75],
+    !! a5 in [-0.15, 0.15], a6 in [-0.10, 0.10]. Measured cliff: every bin
+    !! with f_min >= 3.162e-4 meets dV/V <= 2.4e-11, dS/S <= 1.4e-8,
+    !! round-trip <= 5.5e-12; the bin below (2.154e-4) breaks to dS ~ 1.2e-3
+    !! and degrades monotonically further down (dS ~ 3e-2 by 3e-5). The
+    !! threshold sits one probe bin (factor 10^(1/6)) above the measured
+    !! cliff edge and 6x below the sphere clamp bound. The a6 bound is part
+    !! of the statement: at |a6| = 0.15 an a4 = 0.75, a3 = 0.55, c <= 0.85
+    !! family exists whose broad interior near-neck (R'' ~ 5e4) degrades
+    !! GL-4096 V/S at f_min ~ 3.9e-3 — healthy by any legal f_min threshold;
+    !! catching it needs a future curvature (R'')-based criterion. The scan
+    !! clamp is load-bearing: f_min scales linearly with the clamp distance,
+    !! so threshold and clamp (0.999) move together. In reduced units (R0 = 1).
+    real(kind = rk), parameter, public :: F_MIN_THRESHOLD = 3.162e-4_rk
 
     !> Tip detection tolerance: f(±1) = 0 analytically, so u within roundoff of
     !! a tip is treated AS the tip (rho = 0, drho/dz = 0). Public: the raw

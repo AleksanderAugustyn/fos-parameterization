@@ -144,8 +144,9 @@ program fos_param_extensions_test
 
     params_beak = 0.0_rk
     params_beak(1) = 2.0_rk
-    ! a4 = 0.7495 is the vector the 1.x beak probe settled on, frozen here.
-    params_beak(3) = 0.7495_rk
+    ! f(0) = 2.0e-4 < F_MIN_THRESHOLD = 3.162e-4 (deepened from the 1.x
+    ! frozen 0.7495 when the 2026-08-11 retune made that shape representable).
+    params_beak(3) = 0.74985_rk
     call probe_tier1_s(params_beak, code)
     call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
             'probe vector is beak-rejected by the tier-1 resolve')

@@ -26,7 +26,8 @@ program fos_param_breakdown_test
     real(kind = rk), parameter :: NECK_MIN_DEPTH_MIRROR = 0.25_rk
     real(kind = rk), parameter :: NECK_MIN_ELONGATION_MIRROR = 1.2_rk
     ! Symmetric-family analytic boundaries: f(0) = 1 - 4 a4 / 3
-    real(kind = rk), parameter :: A4_BEAK_BOUNDARY = 0.999_rk * 0.75_rk   ! f(0) = F_MIN_THRESHOLD
+    real(kind = rk), parameter :: A4_BEAK_BOUNDARY = &
+            (1.0_rk - 3.162e-4_rk) * 0.75_rk   ! f(0) = F_MIN_THRESHOLD
     real(kind = rk), parameter :: A4_RHO_BOUNDARY = 0.75_rk               ! f(0) = 0
 
     !> Uniform theta nodes of the R(theta) grid, built once.
@@ -70,8 +71,9 @@ contains
                 radii, code)
         call assert_int_eq(code, FOS_VALID, 'boundary: c=2 a4=0.30 valid')
 
-        ! Just past the beak boundary (f(0) ~ 1e-6 > 0, f_min < 1e-3): beak code.
-        params(3) = A4_BEAK_BOUNDARY * (1.0_rk + 1.0e-3_rk)
+        ! Just past the beak boundary (f(0) ~ 1.2e-4 > 0, f_min below
+        ! F_MIN_THRESHOLD): beak code.
+        params(3) = A4_BEAK_BOUNDARY * (1.0_rk + 2.0e-4_rk)
         call compute_radius_grid_standalone_s(params, grid_thetas, N_GRID_SMALL, &
                 radii, code)
         call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
@@ -94,7 +96,8 @@ contains
     !> Two-sided beak boundary at the layer that owns the detector. The
     !! ungated star-convexity diagnostic applies exactly the 1.x
     !! validate_rho_grid_s gate set — beak and interior rho, no star-convexity
-    !! margin — so both sides of the analytic boundary a4* = 0.999 * 0.75 stay
+    !! margin — so both sides of the analytic boundary
+    !! a4* = (1 - F_MIN_THRESHOLD) * 0.75 stay
     !! testable, which they are not through the R(theta) grid form (the margin
     !! rejects these necked shapes regardless). The rho-negative side is read
     !! off the cylindrical form, the one path that never runs the beak scan.
@@ -108,18 +111,18 @@ contains
         params = 0.0_rk
         params(1) = 2.0_rk
 
-        ! Just below the boundary: f(0) = 1 - (4/3) a4 ~ 2e-3 > F_MIN_THRESHOLD.
-        params(3) = A4_BEAK_BOUNDARY * (1.0_rk - 1.0e-3_rk)
+        ! Just below the boundary: f(0) = 1 - (4/3) a4 ~ 5.2e-4 > F_MIN_THRESHOLD.
+        params(3) = A4_BEAK_BOUNDARY * (1.0_rk - 2.0e-4_rk)
         call compute_star_convexity_optimum_standalone_s(params, N_RHO_INTERNAL, &
                 z_shift_total, g_opt, code)
-        call assert_int_eq(code, FOS_VALID, 'unit: 0.999 a4* passes beak detection')
+        call assert_int_eq(code, FOS_VALID, 'unit: below a4* passes beak detection')
 
-        ! Just above: f(0) ~ 1e-6, in (0, F_MIN_THRESHOLD) -> beak code.
-        params(3) = A4_BEAK_BOUNDARY * (1.0_rk + 1.0e-3_rk)
+        ! Just above: f(0) ~ 1.2e-4, in (0, F_MIN_THRESHOLD) -> beak code.
+        params(3) = A4_BEAK_BOUNDARY * (1.0_rk + 2.0e-4_rk)
         call compute_star_convexity_optimum_standalone_s(params, N_RHO_INTERNAL, &
                 z_shift_total, g_opt, code)
         call assert_int_eq(code, FOS_ERROR_BEAK_SINGULARITY, &
-                'unit: 1.001 a4* -> FOS_ERROR_BEAK_SINGULARITY')
+                'unit: above a4* -> FOS_ERROR_BEAK_SINGULARITY')
 
         ! Past f(0) = 0: the interior grid point at u = 0 (N_RHO_INTERNAL odd)
         ! has rho = 0, which the cylindrical form reports on its own.

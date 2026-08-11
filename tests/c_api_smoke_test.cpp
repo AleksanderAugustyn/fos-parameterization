@@ -165,7 +165,7 @@ int main() {
     // to be reported instead of a live 103 and not merely instead of success.
     std::vector<double> beak_params(static_cast<std::size_t>(n_params), 0.0);
     beak_params[0] = 2.0;
-    beak_params[2] = 0.7495;  // the frozen 1.x beak probe vector
+    beak_params[2] = 0.74985;  // f(0) = 2.0e-4 < F_MIN_THRESHOLD = 3.162e-4
     s = fos_param_cache_radius_grid(cache, beak_params.data(), n_params,
                                     radii.data(), n_theta);
     check(s == FOS_ERROR_BEAK_SINGULARITY, "beak vector at the right size -> 103");
