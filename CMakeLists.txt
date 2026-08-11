@@ -143,6 +143,19 @@ set_target_properties(fos_param_pes_sweep PROPERTIES
 add_test(NAME pes_sweep COMMAND fos_param_pes_sweep)
 set_tests_properties(pes_sweep PROPERTIES LABELS sweep TIMEOUT 1800)
 
+# Geometry sweep: Tier A gate classification with golden counts, Tier B
+# conversion accuracy, and the representability probe (--probe). OpenMP is
+# optional — serial builds just run longer.
+find_package(OpenMP COMPONENTS Fortran)
+add_executable(fos_param_geometry_sweep_test tests/fos_param_geometry_sweep_test.f08)
+target_link_libraries(fos_param_geometry_sweep_test PRIVATE
+        fos_parameterization fos_param_test_utils fos_parameterization_flags
+        $<$<TARGET_EXISTS:OpenMP::OpenMP_Fortran>:OpenMP::OpenMP_Fortran>)
+set_target_properties(fos_param_geometry_sweep_test PROPERTIES
+        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/geometry_sweep)
+add_test(NAME geometry_sweep COMMAND fos_param_geometry_sweep_test)
+set_tests_properties(geometry_sweep PROPERTIES LABELS sweep TIMEOUT 3600)
+
 add_executable(fos_param_golden_capture tests/golden_capture.f08)
 target_link_libraries(fos_param_golden_capture PRIVATE
         fos_parameterization fos_param_test_utils fos_parameterization_flags)
