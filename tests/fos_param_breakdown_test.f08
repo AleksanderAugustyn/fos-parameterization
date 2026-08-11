@@ -27,7 +27,7 @@ program fos_param_breakdown_test
     real(kind = rk), parameter :: NECK_MIN_ELONGATION_MIRROR = 1.2_rk
     ! Symmetric-family analytic boundaries: f(0) = 1 - 4 a4 / 3
     real(kind = rk), parameter :: A4_BEAK_BOUNDARY = &
-            (1.0_rk - 3.162e-4_rk) * 0.75_rk   ! f(0) = F_MIN_THRESHOLD
+            (1.0_rk - 5.0e-4_rk) * 0.75_rk   ! f(0) = F_MIN_THRESHOLD
     real(kind = rk), parameter :: A4_RHO_BOUNDARY = 0.75_rk               ! f(0) = 0
 
     !> Uniform theta nodes of the R(theta) grid, built once.
@@ -71,7 +71,7 @@ contains
                 radii, code)
         call assert_int_eq(code, FOS_VALID, 'boundary: c=2 a4=0.30 valid')
 
-        ! Just past the beak boundary (f(0) ~ 1.2e-4 > 0, f_min below
+        ! Just past the beak boundary (f(0) ~ 3.0e-4 > 0, f_min below
         ! F_MIN_THRESHOLD): beak code.
         params(3) = A4_BEAK_BOUNDARY * (1.0_rk + 2.0e-4_rk)
         call compute_radius_grid_standalone_s(params, grid_thetas, N_GRID_SMALL, &
@@ -111,13 +111,13 @@ contains
         params = 0.0_rk
         params(1) = 2.0_rk
 
-        ! Just below the boundary: f(0) = 1 - (4/3) a4 ~ 5.2e-4 > F_MIN_THRESHOLD.
+        ! Just below the boundary: f(0) = 1 - (4/3) a4 ~ 7.0e-4 > F_MIN_THRESHOLD.
         params(3) = A4_BEAK_BOUNDARY * (1.0_rk - 2.0e-4_rk)
         call compute_star_convexity_optimum_standalone_s(params, N_RHO_INTERNAL, &
                 z_shift_total, g_opt, code)
         call assert_int_eq(code, FOS_VALID, 'unit: below a4* passes beak detection')
 
-        ! Just above: f(0) ~ 1.2e-4, in (0, F_MIN_THRESHOLD) -> beak code.
+        ! Just above: f(0) ~ 3.0e-4, in (0, F_MIN_THRESHOLD) -> beak code.
         params(3) = A4_BEAK_BOUNDARY * (1.0_rk + 2.0e-4_rk)
         call compute_star_convexity_optimum_standalone_s(params, N_RHO_INTERNAL, &
                 z_shift_total, g_opt, code)

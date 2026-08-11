@@ -8,17 +8,22 @@ the Fortran, C and Python surfaces are versioned together.
 The beak criterion is now justified by a measured representability cliff, and
 the domain boundary moved accordingly.
 
-### Changed — F_MIN_THRESHOLD 1e-3 → 3.162e-4
+### Changed — F_MIN_THRESHOLD 1e-3 → 5e-4
 
 The geometry-sweep representability probe (new in this release) binned GL-4096
 volume/surface/round-trip accuracy by the beak quantity `f_min` (6 bins per
 decade, polar/neck branch split) through a beak- and star-ungated diagnostic
-conversion. On the validated box every bin with `f_min >= 3.162e-4` converts
-to `dV/V <= 2.4e-11`, `dS/S <= 1.4e-8`, round-trip `<= 5.5e-12`; the bin below
-breaks to `dS ~ 1.2e-3` and degrades monotonically further down. The new
-threshold sits one probe bin (10^(1/6)) above the measured cliff and 6x below
-the sphere clamp bound (1.999e-3), and readmits a demonstrably clean band —
-+12% of the validated box (+61,040 of 509,600 coarse grid points). Full
+conversion, on both the coarse (0.05^5) and fine (a5/a6 at 0.01, 9.5M point)
+grids of the validated box. Measured structure: below ~2.2e-4 accuracy is
+catastrophic (dS to 4e-2); the band [3.162e-4, 4.642e-4) carries a fine-grid
+quadrature tail to dS 2.4e-4 (high-c, a3-at-box-edge shapes whose resolved
+origin sits near the south tip); above 5e-4 every accepted bin holds
+`dV/V <= 8.5e-8`, `dS/S <= 4.3e-5`, round-trip `<= 6.3e-12` (7.5M shapes,
+zero conversion failures). The new threshold — half the legacy value — clears
+both dirty bands, stays 4x below the sphere clamp bound (1.999e-3), and
+readmits a clean band of the previously rejected domain. The residual
+in-domain worst (dS ~ 4.3e-5 at f_min ~ 3e-3) is a family tail no legal
+threshold can evict — future curvature/origin-aware criterion. Full
 derivation and measurement record: the constant's doc comment.
 
 The validated box is part of the statement: `a6 in [-0.10, 0.10]` (was

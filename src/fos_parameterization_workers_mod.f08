@@ -150,24 +150,30 @@ module fos_parameterization_workers_mod
     !! branch, slope bounded but d2rho/dz2 ~ f''/(2c^2 sqrt(c f_min)) -> R''
     !! blow-up at the waist, prefactor c^(-5/2)).
     !!
-    !! Value retuned 2026-08-11 (1e-3 -> 3.162e-4 = 10^-3.5) from the
-    !! geometry-sweep representability probe (fos_param_geometry_sweep_test
-    !! --probe; f_min binned 6/decade, branch-split, GL-4096 V/S/round-trip
-    !! through the beak-ungated diagnostic conversion) on the validated box
+    !! Value retuned 2026-08-11 (1e-3 -> 5e-4) from the geometry-sweep
+    !! representability probe (fos_param_geometry_sweep_test --probe; f_min
+    !! binned 6/decade, branch-split, GL-4096 V/S/round-trip through the
+    !! beak-ungated diagnostic conversion) on the validated box
     !! c in [0.75, 3.50], a3 in [0, 0.60], a4 in [-0.20, 0.75],
-    !! a5 in [-0.15, 0.15], a6 in [-0.10, 0.10]. Measured cliff: every bin
-    !! with f_min >= 3.162e-4 meets dV/V <= 2.4e-11, dS/S <= 1.4e-8,
-    !! round-trip <= 5.5e-12; the bin below (2.154e-4) breaks to dS ~ 1.2e-3
-    !! and degrades monotonically further down (dS ~ 3e-2 by 3e-5). The
-    !! threshold sits one probe bin (factor 10^(1/6)) above the measured
-    !! cliff edge and 6x below the sphere clamp bound. The a6 bound is part
-    !! of the statement: at |a6| = 0.15 an a4 = 0.75, a3 = 0.55, c <= 0.85
-    !! family exists whose broad interior near-neck (R'' ~ 5e4) degrades
-    !! GL-4096 V/S at f_min ~ 3.9e-3 — healthy by any legal f_min threshold;
-    !! catching it needs a future curvature (R'')-based criterion. The scan
-    !! clamp is load-bearing: f_min scales linearly with the clamp distance,
-    !! so threshold and clamp (0.999) move together. In reduced units (R0 = 1).
-    real(kind = rk), parameter, public :: F_MIN_THRESHOLD = 3.162e-4_rk
+    !! a5 in [-0.15, 0.15], a6 in [-0.10, 0.10], coarse (0.05^5) plus fine
+    !! (a5/a6 at 0.01, 9.5M points). Measured structure, fine grid: below
+    !! ~2.2e-4 accuracy is catastrophic (dS to 4e-2, round-trip breaches);
+    !! the band [3.162e-4, 4.642e-4) carries a quadrature tail to dS 2.4e-4
+    !! (high-c, a3 = 0.60 shapes whose resolved origin sits ~0.04 off the
+    !! south tip); every accepted bin above 5e-4 meets dV/V <= 8.5e-8,
+    !! dS/S <= 4.3e-5, round-trip <= 6.3e-12 over 7.5M shapes with zero
+    !! conversion failures. 5e-4 (half the legacy 1e-3) clears both dirty
+    !! bands and stays 4x below the sphere clamp bound; the residual
+    !! in-domain worst (dS ~ 4.3e-5 at f_min ~ 3e-3) is a family tail no
+    !! legal threshold can evict. The a6 bound is part of the statement: at
+    !! |a6| = 0.15 an a4 = 0.75, a3 = 0.55, c <= 0.85 family exists whose
+    !! broad interior near-neck (R'' ~ 5e4) degrades GL-4096 V/S at
+    !! f_min ~ 3.9e-3 — healthy by any legal f_min threshold; catching it
+    !! (and the high-c tails) needs a future curvature/origin-aware
+    !! criterion. The scan clamp is load-bearing: f_min scales linearly with
+    !! the clamp distance, so threshold and clamp (0.999) move together. In
+    !! reduced units (R0 = 1).
+    real(kind = rk), parameter, public :: F_MIN_THRESHOLD = 5.0e-4_rk
 
     !> Tip detection tolerance: f(±1) = 0 analytically, so u within roundoff of
     !! a tip is treated AS the tip (rho = 0, drho/dz = 0). Public: the raw

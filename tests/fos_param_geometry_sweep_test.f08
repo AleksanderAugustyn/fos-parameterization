@@ -208,23 +208,23 @@ program fos_param_geometry_sweep_test
 
     implicit none
 
-    !> Tier B tolerances (absolute), re-baselined 2026-08-11 on the coarse
-    !! grid of the validated box (a6 in [-0.10, 0.10]) with
-    !! F_MIN_THRESHOLD = 3.162e-4, against the GL-4096 measurand.
+    !> Tier B tolerances (absolute), re-baselined 2026-08-11 on the FINE grid
+    !! of the validated box (a6 in [-0.10, 0.10], a5/a6 step 0.01, 9.5M pts)
+    !! with F_MIN_THRESHOLD = 5e-4, against the GL-4096 measurand.
     !!
-    !! Measured worst on 2026-08-11 (coarse, validated box): dV/V 1.39e-10,
-    !! dS/S 1.84e-6, round-trip 5.5e-12 — asserted one decade above. The dS
-    !! envelope is set by near-star-margin neck shapes (g(s*) ~ -0.012,
-    !! f_min healthy ~ 1.7e-3), the same population and order as the July
-    !! star-margin probe (dS <= 1.2e-6 in the last bin before g = 0); the
-    !! polar/beak-side accepted bins sit at dS <= 1.4e-8. On the pre-trim
-    !! box (|a6| = 0.15) the a4 = 0.75 corner family broke dS to 6.2e-3 at
-    !! healthy f_min (GL-4096 quadrature on its broad interior near-neck,
-    !! R'' ~ 5e4; dV/V converged 6.5e-6 -> 1.2e-9 over N = 4096 -> 16384
-    !! while round-trip stayed ~5e-12) — that family is outside the
-    !! validated box, not fixed by any legal threshold.
-    real(kind = rk), parameter :: TOL_VOLUME_B = 1.0e-9_rk
-    real(kind = rk), parameter :: TOL_SURFACE_REL = 2.0e-5_rk
+    !! Fine-probe worst over the accepted f_min bins above 5e-4: dV/V
+    !! 8.5e-8, dS/S 4.3e-5, round-trip 6.3e-12 — asserted roughly one decade
+    !! above. The V/S envelope is set by high-f_min family tails
+    !! (f_min ~ 2e-3..4e-3, high c with a3 at the box edge, resolved origin
+    !! near the south tip; conversion exact, GL-4096 quadrature-limited —
+    !! dV/V converges ~N^-7 while round-trip stays ~5e-12) that NO legal
+    !! threshold can evict; the threshold-adjacent quadrature band
+    !! ([3.162e-4, 4.642e-4), fine dS 2.4e-4) sits below 5e-4 and is
+    !! rejected. On the pre-trim box (|a6| = 0.15) the a4 = 0.75 corner
+    !! family broke dS to 6.2e-3 at healthy f_min — outside the validated
+    !! box. Round-trip is the conversion-correctness pin.
+    real(kind = rk), parameter :: TOL_VOLUME_B = 1.0e-6_rk
+    real(kind = rk), parameter :: TOL_SURFACE_REL = 5.0e-4_rk
     real(kind = rk), parameter :: TOL_ROUND_TRIP = 1.0e-10_rk
 
     !> Neck-context thresholds, mirroring wmmm's Level 2c physics filter
@@ -235,10 +235,10 @@ program fos_param_geometry_sweep_test
     real(kind = rk), parameter :: NECK_ELONGATION_MIRROR = 1.2_rk
 
     !> Tier A verdict counts on the default coarse grid of the validated box
-    !! (a6 in [-0.10, 0.10], F_MIN_THRESHOLD = 3.162e-4), captured 2026-08-11.
+    !! (a6 in [-0.10, 0.10], F_MIN_THRESHOLD = 5e-4), captured 2026-08-11.
     !! Index: 0 = valid, 1..4 = codes 100..103, 5 = other.
     integer(kind = ik), parameter :: GOLDEN_TALLY(0:5) = &
-            [403961_ik, 0_ik, 1199_ik, 0_ik, 104440_ik, 0_ik]
+            [390409_ik, 0_ik, 1087_ik, 0_ik, 118104_ik, 0_ik]
 
     type(sweep_config_t) :: cfg
     integer(kind = ik) :: tally(0:5), n_total

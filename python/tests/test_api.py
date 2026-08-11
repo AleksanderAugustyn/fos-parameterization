@@ -23,7 +23,7 @@ SPHERE = [1.0, 0.0, 0.0]
 N_POINTS = 181           # the golden-capture resolution
 ASYMMETRIC = [1.80, 0.20, 0.30, 0.01, -0.02, 0.0, 0.0]
 # Beak-rejected by the R(theta) conversion, still a drawable rho(z) profile.
-# f(0) = 1 - 4*a4/3 = 2.0e-4 < F_MIN_THRESHOLD = 3.162e-4 (2026-08-11 retune)
+# f(0) = 1 - 4*a4/3 = 2.0e-4 < F_MIN_THRESHOLD = 5.0e-4 (2026-08-11 retune)
 BEAK = [2.0, 0.0, 0.74985]
 TOO_MANY = [1.0] + [0.0] * 50   # 51 entries, one past FOS_PARAM_MAX_PARAMS
 

@@ -44,7 +44,7 @@ program fos_param_error_test
 
     ! Beak singularity: for a3 = a5 = a6 = 0, a2 = a4/3 and f(0) = 1 - 4 a4 / 3.
     ! a4 = 0.74985 gives f(0) = 2.0e-4: rho(0) > 0 (passes the rho check) but
-    ! f_min < F_MIN_THRESHOLD = 3.162e-4 (fails beak detection).
+    ! f_min < F_MIN_THRESHOLD = 5.0e-4 (fails beak detection).
     params = 0.0_rk
     params(1) = 2.0_rk
     params(3) = 0.74985_rk

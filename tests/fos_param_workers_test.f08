@@ -34,7 +34,7 @@ program fos_param_workers_test
     real(kind = rk), parameter :: ZS_PARAMS7_1X = 6.565141402540683E-002_rk
 
     !> a4 of the symmetric (c = 2) family used as the below-threshold beak
-    !! fixture: f(0) = 1 - 4 a4 / 3 = 2.0e-4 < F_MIN_THRESHOLD = 3.162e-4.
+    !! fixture: f(0) = 1 - 4 a4 / 3 = 2.0e-4 < F_MIN_THRESHOLD = 5.0e-4.
     !! Historical note: the 1.x-frozen probe value was 0.7495 (f(0) =
     !! 6.67e-4), a beak only under the 1.x-era threshold 1e-3; the 2026-08-11
     !! retune (see F_MIN_THRESHOLD) made that shape representable, so the
