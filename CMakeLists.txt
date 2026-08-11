@@ -154,7 +154,9 @@ target_link_libraries(fos_param_geometry_sweep_test PRIVATE
 set_target_properties(fos_param_geometry_sweep_test PROPERTIES
         Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/geometry_sweep)
 add_test(NAME geometry_sweep COMMAND fos_param_geometry_sweep_test)
-set_tests_properties(geometry_sweep PROPERTIES LABELS sweep TIMEOUT 3600)
+# 2 h: the coarse Tier A+B runs in ~3 min on 16 OpenMP threads, but OpenMP is
+# optional and a serial build needs on the order of an hour.
+set_tests_properties(geometry_sweep PROPERTIES LABELS sweep TIMEOUT 7200)
 
 add_executable(fos_param_golden_capture tests/golden_capture.f08)
 target_link_libraries(fos_param_golden_capture PRIVATE

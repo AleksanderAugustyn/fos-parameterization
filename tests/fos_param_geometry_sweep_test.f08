@@ -551,6 +551,15 @@ contains
                             ! shapes; the rest resolve through the diagnostic
                             ! path (g is set before the theta solve, so a 104
                             ! there still reports a valid g).
+                            !
+                            ! Known sliver: bin membership uses g at 7201
+                            ! while the measured conversion resolves at
+                            ! N_POINTS_SWEEP, so shapes within the two
+                            ! resolutions' g difference (~1e-5) of the -0.01
+                            ! margin can be classified across it. Tier B
+                            ! (production gate set, 1001) cross-checks the
+                            ! envelope: its worst cases match the probe's
+                            ! bin envelope on both grids.
                             if (beak_pass) then
                                 call compute_star_convexity_optimum_standalone_s( &
                                         params, N_RHO_JULY, zt7, g7, stg)

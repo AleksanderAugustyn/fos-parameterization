@@ -23,7 +23,7 @@
 !! rho(z) grid, and the grid must match the order-complete 1.x live evaluator.
 program fos_param_standalone_test
 
-    use precision_utilities_mod, only: ik, rk
+    use precision_utilities_mod, only: ik, ikl, rk
     use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: FOS_MAX_PARAMS, &
             compute_radius_grid_standalone_s, &
@@ -513,10 +513,16 @@ contains
 
         integer(kind = ik) :: j
         logical :: same
+        ! volatile per test_utils_mod's scalar assert: under Release
+        ! -ffast-math a -0.0 store over a known +0.0 can be elided, so the
+        ! pattern under test would never reach the transfer.
+        real(kind = rk), volatile :: av, bv
 
         same = .true.
         do j = 1_ik, size(got, kind = ik)
-            if (abs(got(j) - want(j)) > 0.0_rk) same = .false.
+            av = got(j)
+            bv = want(j)
+            if (transfer(av, 0_ikl) /= transfer(bv, 0_ikl)) same = .false.
         end do
 
         call assert_true(same, label // ': standalone == cold cache bitwise')
