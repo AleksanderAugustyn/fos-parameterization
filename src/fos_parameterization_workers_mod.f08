@@ -87,6 +87,7 @@ module fos_parameterization_workers_mod
     public :: compute_neck_standalone_s
     public :: compute_star_convexity_optimum_standalone_s
     public :: compute_f_min_standalone_s
+    public :: compute_conversion_diagnostic_standalone_s
 
     !---------------------------------------------------------------------------
     ! Table-construction parameters
@@ -1926,6 +1927,77 @@ contains
 
     end subroutine compute_radius_and_derivative_standalone_s
 
+    !> Beak- and star-ungated R(theta) conversion with the resolve quantities
+    !! surfaced. Probe/diagnostic use ONLY; production consumers use
+    !! `compute_radius_and_derivative_standalone_s`.
+    !!
+    !! Identical to the production conversion except the beak (103) and star
+    !! (101) gates are skipped — of the shape gates only interior rho <= 0
+    !! (100) can reject. Newton may legitimately fail to converge on a
+    !! non-star-convex shape; FOS_ERROR_CONVERGENCE is probe data, not a bug.
+    !!
+    !! @param[in]  params     FoS parameters, 1 to FOS_MAX_PARAMS entries
+    !! @param[in]  thetas     Polar angles in [0, pi], at least one
+    !! @param[in]  n_points   u-grid resolution, >= FOS_N_POINTS_FLOOR
+    !! @param[out] radii      R(theta), size(thetas) long
+    !! @param[out] dr_dtheta  dR/dtheta, size(thetas) long
+    !! @param[out] z_shift    Total resolved shift used by the conversion
+    !! @param[out] g_opt      g(s*) from the resolve
+    !! @param[out] status     SHAPE_VALID on success, else the rejecting code
+    subroutine compute_conversion_diagnostic_standalone_s(params, thetas, &
+            n_points, radii, dr_dtheta, z_shift, g_opt, status)
+
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(in) :: thetas(:)
+        integer(kind = ik), intent(in) :: n_points
+        real(kind = rk), intent(out) :: radii(:)
+        real(kind = rk), intent(out) :: dr_dtheta(:)
+        real(kind = rk), intent(out) :: z_shift
+        real(kind = rk), intent(out) :: g_opt
+        integer(kind = ik), intent(out) :: status
+
+        type(sa_state_t) :: st
+        type(fos_bundle_t) :: bundle
+        integer(kind = ik) :: n
+
+        z_shift = 0.0_rk
+        g_opt = 0.0_rk
+
+        call standalone_run_s(params, thetas, n_points, .true., st, status)
+        if (status /= SHAPE_VALID) then
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        if (st%tables%n_theta < 1_ik) then
+            status = SHAPE_ERROR_INVALID_GRID
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        call sa_gate_s(st, .false., status, gate_beak = .false.)
+        if (status /= SHAPE_VALID) then
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        z_shift = st%z_shift_total
+        g_opt = st%g_opt
+
+        n = st%tables%n_theta
+        if (size(radii, kind = ik) /= n .or. size(dr_dtheta, kind = ik) /= n) then
+            status = FOS_ERROR_BUFFER_MISMATCH
+            call zero_fill_pair_s(radii, dr_dtheta)
+            return
+        end if
+
+        bundle = fos_bundle_f(params, st%z_shift_total, st%rho_max)
+        call solve_thetas_s(bundle, st%tables%thetas, radii, dr_dtheta, status)
+
+        if (status /= SHAPE_VALID) call zero_fill_pair_s(radii, dr_dtheta)
+
+    end subroutine compute_conversion_diagnostic_standalone_s
+
     !> Resolved shape — total z-shift and the analytic pole radii — standalone.
     !!
     !! Gates: the parameter-vector gates (1, 102), the grid, then the three
@@ -2300,15 +2372,24 @@ contains
     !! @param[in]  st         Resolved per-call state
     !! @param[in]  gate_star  .true. to reject on the star-convexity margin
     !! @param[out] status     SHAPE_VALID, or the rejecting code
-    pure subroutine sa_gate_s(st, gate_star, status)
+    !! @param[in]  gate_beak  Optional, default .true.: reject on the beak
+    !!                        verdict. Only the diagnostic conversion path
+    !!                        passes .false.
+    pure subroutine sa_gate_s(st, gate_star, status, gate_beak)
 
         type(sa_state_t), intent(in) :: st
         logical, intent(in) :: gate_star
         integer(kind = ik), intent(out) :: status
+        logical, intent(in), optional :: gate_beak
+
+        logical :: gb
+
+        gb = .true.
+        if (present(gate_beak)) gb = gate_beak
 
         status = SHAPE_VALID
 
-        if (.not. st%beak_ok) then
+        if (gb .and. .not. st%beak_ok) then
             status = FOS_ERROR_BEAK_SINGULARITY
             return
         end if

@@ -95,7 +95,7 @@ module fos_parameterization_mod
             compute_radius_and_derivative_standalone_s, compute_shape_standalone_s, &
             compute_rho_z_grid_standalone_s, compute_neck_standalone_s, &
             compute_star_convexity_optimum_standalone_s, &
-            compute_f_min_standalone_s, &
+            compute_f_min_standalone_s, compute_conversion_diagnostic_standalone_s, &
             FOS_N_POINTS_FLOOR, FOS_MAX_K, FOS_COEFF_NEGLIGIBLE, FOS_U_TIP_TOL, &
             C_MIN, F_MIN_THRESHOLD, STAR_CONVEXITY_MARGIN, &
             FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_NOT_STAR_CONVEX, FOS_ERROR_INVALID_C, &
@@ -149,6 +149,7 @@ module fos_parameterization_mod
     public :: compute_neck_standalone_s
     public :: compute_star_convexity_optimum_standalone_s
     public :: compute_f_min_standalone_s
+    public :: compute_conversion_diagnostic_standalone_s
 
     !---------------------------------------------------------------------------
     ! Status-reporting scalar helpers

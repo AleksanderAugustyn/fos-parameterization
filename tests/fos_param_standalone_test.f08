@@ -38,7 +38,9 @@ program fos_param_standalone_test
             cache_star_convexity_optimum_s, &
             compute_rho_at_z_s, &
             compute_f_min_standalone_s, F_MIN_THRESHOLD, &
-            FOS_ERROR_INVALID_C
+            compute_conversion_diagnostic_standalone_s, STAR_CONVEXITY_MARGIN, &
+            FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY, &
+            FOS_ERROR_NOT_STAR_CONVEX
     use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS
     use test_utils_mod, only: assert_true, assert_int_eq, assert_abs_close, &
             test_summary
@@ -331,6 +333,59 @@ program fos_param_standalone_test
         params7 = [0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
         call compute_f_min_standalone_s(params7, f_min, u_at_min, interior_min, st_diag)
         call assert_int_eq(st_diag, FOS_ERROR_INVALID_C, 'f_min diag: c gate kept')
+    end block
+
+    !---------------------------------------------------------------------------
+    ! compute_conversion_diagnostic_standalone_s: beak-ungated conversion
+    !---------------------------------------------------------------------------
+    write(*, '(A)') '=== beak-ungated diagnostic conversion ==='
+
+    block
+        integer(kind = ik), parameter :: NT = 101_ik
+        real(kind = rk) :: params7(7), dthetas(NT), r_prod(NT), dr_prod(NT)
+        real(kind = rk) :: r_diag(NT), dr_diag(NT), z_shift_d, g_opt_d
+        integer(kind = ik) :: st_diag, j
+
+        do j = 1_ik, NT
+            dthetas(j) = real(j - 1_ik, rk) * PI_C / real(NT - 1_ik, rk)
+        end do
+        ! 100*PI_C/100 rounds one ulp above PI_C and the grid gate rejects
+        ! thetas > pi; pin the endpoint.
+        dthetas(NT) = PI_C
+
+        ! Below-threshold beak shape: production 103, diagnostic converts.
+        params7 = [1.60_rk, 0.40_rk, 0.0_rk, -0.05_rk, 0.05_rk, 0.0_rk, 0.0_rk]
+        call compute_radius_and_derivative_standalone_s(params7, dthetas, 501_ik, &
+                r_prod, dr_prod, st_diag)
+        call assert_int_eq(st_diag, FOS_ERROR_BEAK_SINGULARITY, &
+                'diag conv: prod gates 103')
+        call compute_conversion_diagnostic_standalone_s(params7, dthetas, 501_ik, &
+                r_diag, dr_diag, z_shift_d, g_opt_d, st_diag)
+        call assert_int_eq(st_diag, SHAPE_VALID, 'diag conv: bypass converts beak shape')
+        call assert_true(all(r_diag > 0.0_rk), 'diag conv: radii positive')
+
+        ! Valid shape: both paths bitwise identical.
+        params7 = [1.50_rk, 0.10_rk, 0.10_rk, 0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+        call compute_radius_and_derivative_standalone_s(params7, dthetas, 501_ik, &
+                r_prod, dr_prod, st_diag)
+        call assert_int_eq(st_diag, SHAPE_VALID, 'diag conv: reference shape valid')
+        call compute_conversion_diagnostic_standalone_s(params7, dthetas, 501_ik, &
+                r_diag, dr_diag, z_shift_d, g_opt_d, st_diag)
+        call assert_int_eq(st_diag, SHAPE_VALID, 'diag conv: diagnostic path valid')
+        call assert_bits_eq(r_diag, r_prod, 'diag conv: radii bitwise parity')
+        call assert_bits_eq(dr_diag, dr_prod, 'diag conv: dr bitwise parity')
+        call assert_true(g_opt_d <= -STAR_CONVEXITY_MARGIN, 'diag conv: g_opt reported')
+
+        ! Gate contract: only rho (100) may reject besides the vector/c/grid
+        ! gates — never 101/103. A corner shape may validly convert, fail rho,
+        ! or fail Newton (convergence); it must NOT come back star- or
+        ! beak-rejected through this path.
+        params7 = [0.80_rk, 0.60_rk, 0.75_rk, 0.15_rk, 0.15_rk, 0.0_rk, 0.0_rk]
+        call compute_conversion_diagnostic_standalone_s(params7, dthetas, 501_ik, &
+                r_diag, dr_diag, z_shift_d, g_opt_d, st_diag)
+        call assert_true(st_diag /= FOS_ERROR_NOT_STAR_CONVEX &
+                .and. st_diag /= FOS_ERROR_BEAK_SINGULARITY, &
+                'diag conv: 101/103 both bypassed')
     end block
 
     call test_summary()
