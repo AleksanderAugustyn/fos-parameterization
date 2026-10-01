@@ -14,19 +14,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # --- Fetch GCC compiler options package ---
 FetchContent_Declare(
-        GCC-Compiler-Options
-        GIT_REPOSITORY https://github.com/AleksanderAugustyn/GCC-Compiler-Options.git
+        gcc-compiler-options
+        GIT_REPOSITORY https://github.com/AleksanderAugustyn/gcc-compiler-options.git
         GIT_TAG 2.0.0
 )
-FetchContent_MakeAvailable(GCC-Compiler-Options)
+FetchContent_MakeAvailable(gcc-compiler-options)
 
 # --- Fetch foundational Fortran modules ---
 FetchContent_Declare(
-        Fortran-Foundations
-        GIT_REPOSITORY https://github.com/AleksanderAugustyn/Fortran-Foundations.git
+        fortran-foundations
+        GIT_REPOSITORY https://github.com/AleksanderAugustyn/fortran-foundations.git
         GIT_TAG 2.4.0
 )
-FetchContent_MakeAvailable(Fortran-Foundations)
+FetchContent_MakeAvailable(fortran-foundations)
 
 # --- Preprocessor & build type ---
 set(CMAKE_Fortran_PREPROCESS ON)
@@ -35,7 +35,7 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "RelWithDebInfo" "Release")
 endif ()
 
-# --- Compiler flags via GCC-Compiler-Options ---
+# --- Compiler flags via gcc-compiler-options ---
 include(GCCCompilerOptions/FortranCompilerOptions)
 create_fortran_library_interface(TARGET fos_parameterization_flags)
 
