@@ -53,6 +53,17 @@ def _inclusive_grid(n: int) -> np.ndarray:
     return grid
 
 
+def _same_bits(a: np.ndarray, b: np.ndarray) -> bool:
+    """True when ``a`` and ``b`` hold the same IEEE754 bit patterns.
+
+    ``np.array_equal`` compares values, so it calls ``+0.0`` and ``-0.0``
+    equal; the contract's bitwise claims need the bytes. In the wheel job this
+    suite is the only bitwise check on the compiler that ships.
+    """
+    a, b = np.asarray(a), np.asarray(b)
+    return a.shape == b.shape and a.dtype == b.dtype and a.tobytes() == b.tobytes()
+
+
 # Golden shapes captured by tests/golden_capture.f08 (Debug build, 17 sig
 # digits). n_points = 181; the indices are 0-based equivalents of the Fortran
 # [1, 31, ..., 181].
@@ -428,9 +439,9 @@ def test_unchecked_profile_draws_a_separated_shape() -> None:
         assert cache.rho_z_grid(SPLIT).status == fp.Status.rho_negative
         cached = cache.rho_z_grid_unchecked(SPLIT)
     assert cached.ok
-    assert np.array_equal(cached.z, raw.z)
-    assert np.array_equal(cached.rho, raw.rho)
-    assert np.array_equal(cached.drho_dz, raw.drho_dz)
+    assert _same_bits(cached.z, raw.z)
+    assert _same_bits(cached.rho, raw.rho)
+    assert _same_bits(cached.drho_dz, raw.drho_dz)
     assert cached.z_shift == raw.z_shift
 
 
@@ -438,9 +449,9 @@ def test_unchecked_profile_equals_checked_on_a_connected_shape() -> None:
     checked = fp.rho_z_grid(ASYMMETRIC, N_POINTS)
     raw = fp.rho_z_grid_unchecked(ASYMMETRIC, N_POINTS)
     assert checked.ok and raw.ok
-    assert np.array_equal(raw.z, checked.z)
-    assert np.array_equal(raw.rho, checked.rho)
-    assert np.array_equal(raw.drho_dz, checked.drho_dz)
+    assert _same_bits(raw.z, checked.z)
+    assert _same_bits(raw.rho, checked.rho)
+    assert _same_bits(raw.drho_dz, checked.drho_dz)
 
 
 def test_unchecked_profile_keeps_the_c_gate() -> None:
@@ -451,13 +462,20 @@ def test_unchecked_profile_keeps_the_c_gate() -> None:
 
 # --- cached tier -----------------------------------------------------------
 
+def test_same_bits_distinguishes_signed_zero() -> None:
+    # The hole _same_bits closes: value equality calls +0.0 and -0.0 equal.
+    assert np.array_equal([0.0], [-0.0])
+    assert not _same_bits(np.array([0.0]), np.array([-0.0]))
+    assert _same_bits(np.array([0.0, 1.5]), np.array([0.0, 1.5]))
+
+
 def test_cache_matches_tier1_bitwise() -> None:
     thetas = fp.theta_grid(64)
     flat = fp.radius_grid(ASYMMETRIC, thetas, N_POINTS)
     with fp.Cache(7, N_POINTS, thetas) as cache:
         cached = cache.radius_grid(ASYMMETRIC)
     assert flat.ok and cached.ok
-    assert np.array_equal(flat.radii, cached.radii)
+    assert _same_bits(flat.radii, cached.radii)
 
 
 def test_cache_reuse_is_stable_across_shapes() -> None:
@@ -466,7 +484,7 @@ def test_cache_reuse_is_stable_across_shapes() -> None:
         first = cache.radius_grid(SPHERE)
         cache.radius_grid([1.5, 0.1, 0.2])
         again = cache.radius_grid(SPHERE)
-    assert np.array_equal(first.radii, again.radii)
+    assert _same_bits(first.radii, again.radii)
 
 
 def test_cache_derivative_and_at_thetas_agree() -> None:
@@ -477,8 +495,8 @@ def test_cache_derivative_and_at_thetas_agree() -> None:
     assert grid.ok and at.ok
     # Exact, on every compiler: both outputs call one solve loop that no tier
     # routine can inline. This is the wheel's bitwise gate (GCC 10).
-    assert np.array_equal(at.radii, grid.radii)
-    assert np.array_equal(at.dr_dtheta, grid.dr_dtheta)
+    assert _same_bits(at.radii, grid.radii)
+    assert _same_bits(at.dr_dtheta, grid.dr_dtheta)
 
 
 def test_cache_of_larger_max_params_gives_the_same_bits() -> None:
@@ -488,8 +506,8 @@ def test_cache_of_larger_max_params_gives_the_same_bits() -> None:
         a = exact.radius_and_derivative(ASYMMETRIC)
         b = wide.radius_and_derivative(ASYMMETRIC)
     assert a.ok and b.ok
-    assert np.array_equal(a.radii, b.radii)
-    assert np.array_equal(a.dr_dtheta, b.dr_dtheta)
+    assert _same_bits(a.radii, b.radii)
+    assert _same_bits(a.dr_dtheta, b.dr_dtheta)
 
 
 def test_short_vector_equals_its_zero_padded_form() -> None:
@@ -502,16 +520,16 @@ def test_short_vector_equals_its_zero_padded_form() -> None:
         shape_a = cache.shape(short)
         shape_b = cache.shape(short + [0.0] * 5)
     assert a.ok and b.ok and c.ok
-    assert np.array_equal(a.radii, b.radii) and np.array_equal(a.radii, c.radii)
-    assert np.array_equal(a.dr_dtheta, b.dr_dtheta)
-    assert np.array_equal(a.dr_dtheta, c.dr_dtheta)
+    assert _same_bits(a.radii, b.radii) and _same_bits(a.radii, c.radii)
+    assert _same_bits(a.dr_dtheta, b.dr_dtheta)
+    assert _same_bits(a.dr_dtheta, c.dr_dtheta)
     assert shape_a == shape_b
 
     flat = fp.radius_and_derivative(short, thetas, N_POINTS)
     flat_padded = fp.radius_and_derivative(short + [0.0] * 5, thetas, N_POINTS)
-    assert np.array_equal(flat.radii, a.radii)
-    assert np.array_equal(flat_padded.radii, a.radii)
-    assert np.array_equal(flat_padded.dr_dtheta, a.dr_dtheta)
+    assert _same_bits(flat.radii, a.radii)
+    assert _same_bits(flat_padded.radii, a.radii)
+    assert _same_bits(flat_padded.dr_dtheta, a.dr_dtheta)
 
 
 def test_cache_is_stateless_across_a_rejection() -> None:
@@ -522,8 +540,8 @@ def test_cache_is_stateless_across_a_rejection() -> None:
         assert cache.radius_grid([1e-11]).status == fp.Status.invalid_c
         again = cache.radius_and_derivative(ASYMMETRIC)
     assert first.ok and again.ok
-    assert np.array_equal(first.radii, again.radii)
-    assert np.array_equal(first.dr_dtheta, again.dr_dtheta)
+    assert _same_bits(first.radii, again.radii)
+    assert _same_bits(first.dr_dtheta, again.dr_dtheta)
 
 
 def test_cache_shared_between_threads_reproduces_serial_results() -> None:
@@ -566,8 +584,8 @@ def test_cache_shared_between_threads_reproduces_serial_results() -> None:
         assert threaded[tid] is not None
         for a, b in zip(threaded[tid], serial[tid]):
             assert a[0] == b[0] and a[3] == b[3] and a[5] == b[5]
-            assert np.array_equal(a[1], b[1]) and np.array_equal(a[2], b[2])
-            assert np.array_equal(a[4], b[4])
+            assert _same_bits(a[1], b[1]) and _same_bits(a[2], b[2])
+            assert _same_bits(a[4], b[4])
             assert a[6:] == b[6:]
             n_valid += int(b[0] == fp.Status.valid and b[3] == fp.Status.valid
                            and b[5] == fp.Status.valid)
@@ -713,7 +731,7 @@ def test_inputs_are_converted_to_contiguous_float64() -> None:
     ]
     for res in variants:
         assert res.ok
-        assert np.array_equal(res.radii, ref.radii)
+        assert _same_bits(res.radii, ref.radii)
 
 
 def test_cache_copies_its_thetas() -> None:
@@ -724,7 +742,7 @@ def test_cache_copies_its_thetas() -> None:
         thetas[:] = 0.3
         after = cache.radius_grid(ASYMMETRIC)
     assert before.ok and after.ok
-    assert np.array_equal(before.radii, after.radii)
+    assert _same_bits(before.radii, after.radii)
 
 
 def test_removed_2x_members_absent() -> None:

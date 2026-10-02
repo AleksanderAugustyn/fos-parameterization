@@ -196,15 +196,21 @@ contains
         type(c_ptr) :: handle
 
         type(cache_t), pointer :: p
+        type(cache_t) :: probe
         integer(kind = ik) :: st
         integer :: alloc_stat
         real(kind = rk), allocatable :: thetas_f(:)
+        real(kind = rk) :: no_thetas(0)
 
         handle = c_null_ptr
 
         allocate(thetas_f(extent_f(n_theta)), stat = alloc_stat)
         if (alloc_stat /= 0) then
-            if (present(status)) status = int(SHAPE_ERROR_INVALID_GRID, c_int)
+            ! The sizes outrank the buffer: on an empty set the tier judges
+            ! max_params and n_points first and allocates nothing (5, 1, else 3).
+            call cache_init_s(probe, int(max_params, ik), int(n_points, ik), &
+                    no_thetas, st)
+            if (present(status)) status = int(st, c_int)
             return
         end if
         thetas_f = real(thetas, rk)
