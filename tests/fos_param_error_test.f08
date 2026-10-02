@@ -5,7 +5,8 @@ program fos_param_error_test
     use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: compute_radius_grid_standalone_s, &
             status_message, &
-            FOS_VALID, FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY
+            FOS_VALID, FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY, &
+            SHAPE_ERROR_WRONG_PARAM_COUNT
     use test_utils_mod, only: assert_true, assert_int_eq, test_summary
 
     implicit none
@@ -40,7 +41,8 @@ program fos_param_error_test
 
     ! Empty parameter array
     call compute_radius_grid_standalone_s(empty_params, thetas, N_GRID_SMALL, radii, status)
-    call assert_int_eq(status, FOS_ERROR_INVALID_C, 'empty params: FOS_ERROR_INVALID_C')
+    call assert_int_eq(status, SHAPE_ERROR_WRONG_PARAM_COUNT, &
+            'empty params: SHAPE_ERROR_WRONG_PARAM_COUNT')
 
     ! Beak singularity: for a3 = a5 = a6 = 0, a2 = a4/3 and f(0) = 1 - 4 a4 / 3.
     ! a4 = 0.74985 gives f(0) = 2.0e-4: rho(0) > 0 (passes the rho check) but

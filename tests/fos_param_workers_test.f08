@@ -14,11 +14,12 @@ program fos_param_workers_test
     use fos_parameterization_mod, only: compute_a2_s, compute_z_shift_s, &
             get_fos_coefficient_f, compute_fos_f_and_derivatives_s, &
             FOS_ERROR_INVALID_C
-    use fos_parameterization_workers_mod, only: tables_t, tables_init_s, &
+    use fos_parameterization_workers_mod, only: tables_t, &
             tables_free_s, build_tables_s, fos_bundle_t, compute_f_grid_s, &
             beak_scan_f_min_s, scale_rho_grid_s, newton_radius_s, &
             active_length_f, table_order_f, shifted_origin_f, refine_neck_s
-    use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS
+    use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
+            SHAPE_ERROR_WRONG_PARAM_COUNT
     use test_utils_mod, only: assert_true, assert_int_eq, assert_abs_close, &
             assert_bits_eq, test_summary
 
@@ -70,7 +71,8 @@ program fos_param_workers_test
         thetas(i) = real(i, rk) * PI_C / 5.0_rk
     end do
 
-    call tables_init_s(tables, N_POINTS, thetas, status)
+    ! Order 6: what a max_params = 8 cache builds.
+    call build_tables_s(tables, N_POINTS, thetas, table_order_f(8_ik), status)
     call assert_int_eq(int(status), int(SHAPE_VALID), 'tables built')
 
     !---------------------------------------------------------------------------
@@ -94,14 +96,14 @@ program fos_param_workers_test
     call assert_int_eq(int(status), int(SHAPE_ERROR_TOO_MANY_PARAMS), 'a2 51 params rejected')
 
     !---------------------------------------------------------------------------
-    ! z_shift: parity, empty and degenerate c -> 102
+    ! z_shift: parity, empty -> 4, degenerate c -> 102
     !---------------------------------------------------------------------------
     call compute_z_shift_s(PARAMS7, zs, status)
     call assert_int_eq(int(status), int(SHAPE_VALID), 'z_shift valid')
     call assert_abs_close(zs, ZS_PARAMS7_1X, 0.0_rk, 'z_shift bitwise-parity with 1.x')
 
     call compute_z_shift_s(PARAMS7(1:0), zs, status)
-    call assert_int_eq(int(status), int(FOS_ERROR_INVALID_C), 'z_shift empty -> 102')
+    call assert_int_eq(int(status), int(SHAPE_ERROR_WRONG_PARAM_COUNT), 'z_shift empty -> 4')
     call compute_z_shift_s([1.0e-11_rk, 0.1_rk], zs, status)
     call assert_int_eq(int(status), int(FOS_ERROR_INVALID_C), 'z_shift degenerate c -> 102')
 

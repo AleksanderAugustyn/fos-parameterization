@@ -9,6 +9,7 @@ module test_utils_mod
 
     public :: assert_true, assert_int_eq, assert_close, assert_abs_close, &
             assert_bits_eq, test_summary
+    public :: bits_eq_f, arrays_bits_eq_f, is_zero_f, all_zero_f
 
     integer(kind = ik) :: n_pass = 0_ik
     integer(kind = ik) :: n_fail = 0_ik
@@ -78,6 +79,48 @@ contains
         bv = b
         call assert_true(transfer(av, 0_ikl) == transfer(bv, 0_ikl), label)
     end subroutine assert_bits_eq
+
+    !> Bit-level equality of two reals, as a value (for compound conditions).
+    !! Same volatile rule as `assert_bits_eq`.
+    function bits_eq_f(a, b) result(same)
+        real(kind = rk), intent(in) :: a, b
+        logical :: same
+        real(kind = rk), volatile :: av, bv
+        av = a
+        bv = b
+        same = transfer(av, 0_ikl) == transfer(bv, 0_ikl)
+    end function bits_eq_f
+
+    !> Element-wise bit equality of two arrays; .false. if the lengths differ.
+    function arrays_bits_eq_f(a, b) result(same)
+        real(kind = rk), intent(in) :: a(:), b(:)
+        logical :: same
+        integer(kind = ik) :: j
+        same = size(a, kind = ik) == size(b, kind = ik)
+        if (.not. same) return
+        do j = 1_ik, size(a, kind = ik)
+            if (.not. bits_eq_f(a(j), b(j))) same = .false.
+        end do
+    end function arrays_bits_eq_f
+
+    !> .true. iff the value is exactly zero, either sign (`==` on reals is
+    !! banned by -Wcompare-reals).
+    pure function is_zero_f(x) result(zero)
+        real(kind = rk), intent(in) :: x
+        logical :: zero
+        zero = .not. (abs(x) > 0.0_rk)
+    end function is_zero_f
+
+    !> .true. iff every element is exactly zero.
+    pure function all_zero_f(a) result(zeroed)
+        real(kind = rk), intent(in) :: a(:)
+        logical :: zeroed
+        integer(kind = ik) :: j
+        zeroed = .true.
+        do j = 1_ik, size(a, kind = ik)
+            if (abs(a(j)) > 0.0_rk) zeroed = .false.
+        end do
+    end function all_zero_f
 
     subroutine test_summary()
         write(*, '(A,I0,A,I0,A)') 'Tests: ', n_pass, ' passed, ', n_fail, ' failed.'

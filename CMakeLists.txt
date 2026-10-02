@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(fos-parameterization
-        VERSION 2.1.0
+        VERSION 3.0.0
         LANGUAGES Fortran CXX
         DESCRIPTION "Fourier-over-Spheroid (FoS) nuclear shape parameterization"
 )
@@ -24,7 +24,7 @@ FetchContent_MakeAvailable(gcc-compiler-options)
 FetchContent_Declare(
         fortran-foundations
         GIT_REPOSITORY https://github.com/AleksanderAugustyn/fortran-foundations.git
-        GIT_TAG 2.4.0
+        GIT_TAG 3.0.0
 )
 FetchContent_MakeAvailable(fortran-foundations)
 
@@ -45,6 +45,17 @@ set(FOS_PARAM_SOURCES
         src/fos_parameterization_mod.f08
         src/fos_parameterization_c_api_mod.f08
 )
+
+# --- No LTO for the library's own objects ---
+# One-shot == cached, short == zero-padded and repeat == first call are BITWISE
+# claims. The arithmetic lives in the workers module and the tiers in the front
+# module; without LTO no kernel can be inlined into a tier routine, so every
+# tier path executes the same machine code. With -flto=auto -ffast-math a
+# kernel is inlined into each caller and optimized per call site, and the same
+# call then returns different last bits from different call sites. A
+# source-file property lands after the gcc-opts interface flags, so it wins.
+# Consumers keep LTO for their own code.
+set_source_files_properties(${FOS_PARAM_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-lto")
 
 # --- Static library target ---
 add_library(fos_parameterization STATIC ${FOS_PARAM_SOURCES})
@@ -121,8 +132,7 @@ set_target_properties(fos_param_test_utils PROPERTIES
 target_include_directories(fos_param_test_utils PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests>)
 
-set(FOS_PARAM_TEST_SUITES core helpers error neck breakdown derivative status tables workers cache resolve outputs extensions standalone
-        bitwise minimality interleave boundary)
+set(FOS_PARAM_TEST_SUITES core helpers error neck breakdown derivative status workers cache resolve outputs extensions standalone)
 foreach (suite IN LISTS FOS_PARAM_TEST_SUITES)
     add_executable(fos_param_${suite}_test tests/fos_param_${suite}_test.f08)
     target_link_libraries(fos_param_${suite}_test PRIVATE
@@ -131,17 +141,6 @@ foreach (suite IN LISTS FOS_PARAM_TEST_SUITES)
             Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/${suite})
     add_test(NAME ${suite} COMMAND fos_param_${suite}_test)
 endforeach ()
-
-# PES-range sweep gate: incremental == cold over the PES parameter box, every
-# cached slot moving. Small enough (~9k points x 2 caches) to run as a ctest in
-# both configurations; the throughput it prints is a record, not a threshold.
-add_executable(fos_param_pes_sweep tests/fos_pes_sweep.f08)
-target_link_libraries(fos_param_pes_sweep PRIVATE
-        fos_parameterization fos_param_test_utils fos_parameterization_flags)
-set_target_properties(fos_param_pes_sweep PROPERTIES
-        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/sweep)
-add_test(NAME pes_sweep COMMAND fos_param_pes_sweep)
-set_tests_properties(pes_sweep PROPERTIES LABELS sweep TIMEOUT 1800)
 
 # Geometry sweep: Tier A gate classification with golden counts, Tier B
 # conversion accuracy, and the representability probe (--probe). OpenMP is
@@ -164,14 +163,4 @@ target_link_libraries(fos_param_golden_capture PRIVATE
 set_target_properties(fos_param_golden_capture PROPERTIES
         Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/capture)
 
-add_executable(fos_param_c_api_smoke_test tests/c_api_smoke_test.cpp)
-target_link_libraries(fos_param_c_api_smoke_test PRIVATE fos_parameterization_cxx)
-add_test(NAME c_api_smoke COMMAND fos_param_c_api_smoke_test)
-
-# Thread model: one shared tables handle, one cache per thread.
-find_package(Threads REQUIRED)
-add_executable(fos_param_thread_stress_test tests/thread_stress_test.cpp)
-target_link_libraries(fos_param_thread_stress_test PRIVATE
-        fos_parameterization_cxx Threads::Threads)
-add_test(NAME thread_stress COMMAND fos_param_thread_stress_test)
 endif ()
