@@ -1,14 +1,17 @@
-// Smoke test for the 2.0.0 C API. Exercises the SHARED library — the same
+// Smoke test for the 3.0.0 C API. Exercises the SHARED library — the same
 // binary the Python bindings load.
 //
-// Covers the whole surface shape: handle lifecycle (tables + caches), the
-// cached computes with their explicit buffer sizes, the buffer-mismatch code
-// (105), the flat tier-1 calls with their nullable trailing status, the raw
-// rho(z) evaluator, and the static status-message table.
+// Covers the whole surface shape: the cache lifecycle with the status code of
+// every create rejection, the cached computes with their explicit buffer
+// sizes, the order of the usage codes (2 > 4 > 105 > the shape gates), the
+// unchecked cylindrical profile, the one-shot calls with their nullable
+// trailing status, the raw rho(z) evaluator, and the static status-message
+// table.
 #include "fos_parameterization.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <numbers>
 #include <vector>
 
@@ -60,36 +63,47 @@ int main() {
     const int n_params = static_cast<int>(params.size());
     const std::vector<double> sphere{1.0};
 
-    // --- Tables lifecycle ---------------------------------------------------
-    void* tables = fos_param_tables_create(n_points, thetas.data(), n_theta);
-    check(tables != nullptr, "tables_create(501, 64 thetas) is non-NULL");
-
-    // Below the 100-node floor: NULL handle, invalid-grid code available via
-    // the shared macro set.
-    void* bad_tables = fos_param_tables_create(4, thetas.data(), n_theta);
-    check(bad_tables == nullptr, "tables_create below the node floor is NULL");
-
     // --- Cache lifecycle ----------------------------------------------------
-    void* cache = fos_param_cache_create_shared(tables, n_params);
-    check(cache != nullptr, "cache_create_shared is non-NULL");
+    int create_status = -1;
+    fos_param_cache_t* cache = fos_param_cache_create(n_params, n_points, thetas.data(),
+                                                      n_theta, &create_status);
+    check(cache != nullptr, "cache_create(7, 501, 64 thetas) is non-NULL");
+    check(create_status == FOS_VALID, "cache_create reports status 0 on success");
 
-    void* own_cache = fos_param_cache_create(n_params, n_points, thetas.data(), n_theta);
-    check(own_cache != nullptr, "cache_create (private tables) is non-NULL");
+    // The largest max_params, and a NULL status pointer.
+    fos_param_cache_t* wide_cache = fos_param_cache_create(
+            FOS_PARAM_MAX_PARAMS, n_points, thetas.data(), n_theta, nullptr);
+    check(wide_cache != nullptr, "cache_create(max_params = 50, NULL status) is non-NULL");
 
-    // The cached tier caps n_params at 8.
-    void* too_many = fos_param_cache_create_shared(tables, 9);
-    check(too_many == nullptr, "cache_create_shared with 9 params is NULL");
-
-    void* null_tables_cache = fos_param_cache_create_shared(nullptr, n_params);
-    check(null_tables_cache == nullptr, "cache_create_shared(NULL tables) is NULL");
-
-    // n_theta floor is 1, the same floor tables_create applies.
-    void* no_theta_cache = fos_param_cache_create(n_params, n_points, thetas.data(), 0);
-    check(no_theta_cache == nullptr, "cache_create with n_theta = 0 is NULL");
-    void* neg_theta_cache = fos_param_cache_create(n_params, n_points, thetas.data(), -4);
-    check(neg_theta_cache == nullptr, "cache_create with negative n_theta is NULL");
-    void* neg_theta_tables = fos_param_tables_create(n_points, thetas.data(), -4);
-    check(neg_theta_tables == nullptr, "tables_create with negative n_theta is NULL");
+    // Every rejection is a NULL handle plus its own code, in the documented
+    // order: 5, 1, then the grid (3).
+    create_status = -1;
+    check(fos_param_cache_create(0, n_points, thetas.data(), n_theta, &create_status) == nullptr
+                  && create_status == FOS_ERROR_INVALID_INIT,
+          "cache_create with max_params = 0 -> NULL, 5");
+    create_status = -1;
+    check(fos_param_cache_create(FOS_PARAM_MAX_PARAMS + 1, n_points, thetas.data(), n_theta,
+                                 &create_status) == nullptr
+                  && create_status == FOS_ERROR_TOO_MANY_PARAMS,
+          "cache_create with max_params = 51 -> NULL, 1");
+    create_status = -1;
+    check(fos_param_cache_create(n_params, 4, thetas.data(), n_theta, &create_status) == nullptr
+                  && create_status == FOS_ERROR_INVALID_GRID,
+          "cache_create below the node floor -> NULL, 3");
+    create_status = -1;
+    check(fos_param_cache_create(n_params, n_points, thetas.data(), 0, &create_status) == nullptr
+                  && create_status == FOS_ERROR_INVALID_GRID,
+          "cache_create with n_theta = 0 -> NULL, 3");
+    create_status = -1;
+    check(fos_param_cache_create(n_params, n_points, thetas.data(), -4, &create_status) == nullptr
+                  && create_status == FOS_ERROR_INVALID_GRID,
+          "cache_create with negative n_theta -> NULL, 3");
+    create_status = -1;
+    check(fos_param_cache_create(0, 4, thetas.data(), 0, &create_status) == nullptr
+                  && create_status == FOS_ERROR_INVALID_INIT,
+          "cache_create: the parameter count is judged before the grid");
+    check(fos_param_cache_create(0, n_points, thetas.data(), n_theta, nullptr) == nullptr,
+          "cache_create rejection with a NULL status pointer does not crash");
 
     // --- Cached computes ----------------------------------------------------
     std::vector<double> radii(n_theta, -1.0);
@@ -123,15 +137,38 @@ int main() {
                                    rho_probe.data(), drho_probe.data(), -1, &neg_shift);
     check(s == FOS_ERROR_BUFFER_MISMATCH, "negative n_z -> FOS_ERROR_BUFFER_MISMATCH (105)");
 
-    // Wrong parameter count -> 4 (the cached tier is exact-length).
-    s = fos_param_cache_radius_grid(cache, params.data(), n_params - 1,
+    // Parameter count: one more than max_params -> 4.
+    std::vector<double> long_params = params;
+    long_params.push_back(0.001);
+    s = fos_param_cache_radius_grid(cache, long_params.data(), n_params + 1,
                                     radii.data(), n_theta);
-    check(s == FOS_ERROR_WRONG_PARAM_COUNT, "short params -> FOS_ERROR_WRONG_PARAM_COUNT (4)");
+    check(s == FOS_ERROR_WRONG_PARAM_COUNT, "max_params + 1 -> FOS_ERROR_WRONG_PARAM_COUNT (4)");
+    check(all_zero(radii), "wrong parameter count zero-fills the output");
+
+    // A NULL params pointer with a zero count is an empty vector, not a
+    // dereference -> 4.
+    s = fos_param_cache_radius_grid(cache, nullptr, 0, radii.data(), n_theta);
+    check(s == FOS_ERROR_WRONG_PARAM_COUNT, "NULL params, n_params = 0 -> 4");
+
+    // A negative n_params is an empty vector -> 4.
+    s = fos_param_cache_radius_grid(cache, params.data(), -1, radii.data(), n_theta);
+    check(s == FOS_ERROR_WRONG_PARAM_COUNT, "negative n_params -> 4");
 
     // Precedence 4 > 105: both wrong at once still reports the parameter count.
-    s = fos_param_cache_radius_grid(cache, params.data(), n_params - 1,
+    s = fos_param_cache_radius_grid(cache, long_params.data(), n_params + 1,
                                     short_radii.data(), n_theta - 1);
     check(s == FOS_ERROR_WRONG_PARAM_COUNT, "wrong params + wrong n_radii -> 4");
+
+    // A short vector is accepted, and equals its zero-padded form bit for bit.
+    std::vector<double> short_out(n_theta, -1.0), padded_out(n_theta, -1.0);
+    const std::vector<double> padded{params[0], params[1], params[2], 0.0, 0.0, 0.0, 0.0};
+    s = fos_param_cache_radius_grid(cache, params.data(), 3, short_out.data(), n_theta);
+    check(s == FOS_VALID, "a 3-parameter vector on a max_params = 7 cache is accepted");
+    s = fos_param_cache_radius_grid(cache, padded.data(), n_params, padded_out.data(), n_theta);
+    check(s == FOS_VALID, "the zero-padded vector is accepted");
+    check(std::memcmp(short_out.data(), padded_out.data(),
+                      static_cast<std::size_t>(n_theta) * sizeof(double)) == 0,
+          "short == zero-padded, bit for bit");
 
     // NULL handle -> 2, never a dereference.
     s = fos_param_cache_radius_grid(nullptr, params.data(), n_params,
@@ -153,12 +190,16 @@ int main() {
     check(all_finite_positive(extra_r), "at_thetas radii positive");
 
     // A negative size is not an extent on this form either: 105, nothing
-    // written. (Clamping it to zero would make the stated and the expected
-    // extent agree and return FOS_VALID having computed nothing.)
+    // written. (Clamped to zero it would read as an empty theta set.)
     s = fos_param_cache_radius_and_derivative_at_thetas(
             cache, params.data(), n_params, extra_thetas.data(), -3,
             extra_r.data(), extra_dr.data());
     check(s == FOS_ERROR_BUFFER_MISMATCH, "negative n_thetas -> FOS_ERROR_BUFFER_MISMATCH (105)");
+    // ... but the parameter count is still judged first: 4 outranks 105.
+    s = fos_param_cache_radius_and_derivative_at_thetas(
+            cache, params.data(), 0, extra_thetas.data(), -3,
+            extra_r.data(), extra_dr.data());
+    check(s == FOS_ERROR_WRONG_PARAM_COUNT, "at-thetas: n_params = 0 and negative n_thetas -> 4");
 
     // A wrong buffer size is the CALLER's error and outranks the SHAPE's.
     // Probe the beak vector at the right size first, so the 105 below is known
@@ -201,18 +242,36 @@ int main() {
                                                &z_shift_total, &g_opt);
     check(s == FOS_VALID, "cache_star_convexity_optimum returns FOS_VALID");
 
-    // A private-tables cache must agree with the shared-tables one.
-    std::vector<double> own_radii(n_theta, -1.0);
-    s = fos_param_cache_radius_grid(own_cache, params.data(), n_params,
-                                    own_radii.data(), n_theta);
-    check(s == FOS_VALID, "private-tables cache returns FOS_VALID");
-    bool same = true;
-    for (int i = 0; i < n_theta; ++i) {
-        same = same && own_radii[static_cast<std::size_t>(i)] == radii_ref[static_cast<std::size_t>(i)];
-    }
-    check(same, "private and shared tables give identical radii");
+    // A cache with a larger max_params must give identical radii.
+    std::vector<double> wide_radii(n_theta, -1.0);
+    s = fos_param_cache_radius_grid(wide_cache, params.data(), n_params,
+                                    wide_radii.data(), n_theta);
+    check(s == FOS_VALID, "max_params = 50 cache returns FOS_VALID");
+    check(std::memcmp(wide_radii.data(), radii_ref.data(),
+                      static_cast<std::size_t>(n_theta) * sizeof(double)) == 0,
+          "caches of different max_params give identical radii");
 
-    // --- Flat tier-1 calls --------------------------------------------------
+    // --- Unchecked cylindrical profile --------------------------------------
+    // c = 2, a4 = 0.9: f(0) = 1 - 4 a4 / 3 < 0, two fragments.
+    const std::vector<double> split{2.0, 0.0, 0.9};
+    std::vector<double> uz(n_points, -1.0), urho(n_points, -1.0), udrho(n_points, -1.0);
+    double raw_shift = -1.0;
+    s = fos_param_cache_rho_z_grid(cache, split.data(), 3, uz.data(), urho.data(),
+                                   udrho.data(), n_points, &raw_shift);
+    check(s == FOS_ERROR_RHO_NEGATIVE, "separated shape: checked profile -> 100");
+    check(all_zero(urho), "separated shape: checked profile zero-filled");
+    s = fos_param_cache_rho_z_grid_unchecked(cache, split.data(), 3, uz.data(), urho.data(),
+                                             udrho.data(), n_points, &raw_shift);
+    check(s == FOS_VALID, "separated shape: unchecked profile valid");
+    check(urho[n_points / 2] == 0.0 && udrho[n_points / 2] == 0.0,
+          "unchecked profile: rho = drho/dz = 0 in the void");
+    check(urho[n_points / 8] > 0.1 && urho[n_points - n_points / 8] > 0.1,
+          "unchecked profile: a fragment on each side");
+    s = fos_param_cache_rho_z_grid_unchecked(cache, split.data(), 3, uz.data(), urho.data(),
+                                             udrho.data(), n_points - 1, &raw_shift);
+    check(s == FOS_ERROR_BUFFER_MISMATCH, "unchecked profile: wrong n_z -> 105");
+
+    // --- One-shot calls -----------------------------------------------------
     int st = -1;
     std::vector<double> flat_radii(n_theta, -1.0);
     fos_param_radius_grid(params.data(), n_params, thetas.data(), n_theta,
@@ -251,7 +310,27 @@ int main() {
     fos_param_a2(a4_only.data(), 3, &a2, &st);
     check(st == FOS_VALID && std::fabs(a2 - 0.5 / 3.0) < 1e-15, "flat a2 = a4/3");
 
-    // A negative size on a flat call is a bad C argument, not a handle
+    // The one-shot unchecked profile equals the cached one, bit for bit.
+    std::vector<double> fz(n_points, -1.0), frho(n_points, -1.0), fdrho(n_points, -1.0);
+    double flat_shift = -1.0;
+    fos_param_cache_rho_z_grid_unchecked(cache, split.data(), 3, uz.data(), urho.data(),
+                                         udrho.data(), n_points, &raw_shift);
+    fos_param_rho_z_grid_unchecked(split.data(), 3, n_points, fz.data(), frho.data(),
+                                   fdrho.data(), &flat_shift, &st);
+    check(st == FOS_VALID, "one-shot unchecked profile valid on a separated shape");
+    check(std::memcmp(frho.data(), urho.data(),
+                      static_cast<std::size_t>(n_points) * sizeof(double)) == 0,
+          "one-shot unchecked profile == cached, bit for bit");
+
+    // An empty vector is 4 in every one-shot call that needs c; a2 accepts it.
+    fos_param_shape(params.data(), 0, n_points, &z_shift, &r_north, &r_south, &st);
+    check(st == FOS_ERROR_WRONG_PARAM_COUNT, "one-shot shape, n_params = 0 -> 4");
+    fos_param_z_shift(params.data(), 0, &zs, &st);
+    check(st == FOS_ERROR_WRONG_PARAM_COUNT, "one-shot z_shift, n_params = 0 -> 4");
+    fos_param_a2(params.data(), 0, &a2, &st);
+    check(st == FOS_VALID && a2 == 0.0, "one-shot a2, n_params = 0 -> valid, the sphere");
+
+    // A negative size on a one-shot call is a bad C argument, not a handle
     // mismatch: FOS_ERROR_INVALID_INIT (5).
     fos_param_radius_grid(params.data(), n_params, thetas.data(), -3, n_points,
                           flat_radii.data(), &st);
@@ -259,7 +338,7 @@ int main() {
     fos_param_z_shift(params.data(), -2, &zs, &st);
     check(st == FOS_ERROR_INVALID_INIT, "flat z_shift, negative n_params -> 5");
 
-    // Rejections still travel through the flat tier.
+    // Rejections still travel through the one-shot tier.
     const std::vector<double> bad_c{0.0, 0.0, 0.0};
     fos_param_z_shift(bad_c.data(), 3, &zs, &st);
     check(st == FOS_ERROR_INVALID_C, "flat z_shift with c = 0 -> FOS_ERROR_INVALID_C (102)");
@@ -282,13 +361,13 @@ int main() {
     check(ok_msg != nullptr && ok_msg[0] != '\0', "status_message(0) is non-empty");
     const char* unknown = fos_param_status_message(-12345);
     check(unknown != nullptr && unknown[0] != '\0', "status_message(unknown) falls back");
+    check(std::strcmp(fos_param_status_message(6), unknown) == 0,
+          "status_message(6) is the fallback: the code is retired");
 
-    // --- Teardown: caches first, tables last --------------------------------
+    // --- Teardown ------------------------------------------------------------
     fos_param_cache_destroy(cache);
-    fos_param_cache_destroy(own_cache);
+    fos_param_cache_destroy(wide_cache);
     fos_param_cache_destroy(nullptr);  // NULL-safe
-    fos_param_tables_destroy(tables);
-    fos_param_tables_destroy(nullptr);  // NULL-safe
 
     std::printf("c_api_smoke_test: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
