@@ -143,6 +143,18 @@ foreach (suite IN LISTS FOS_PARAM_TEST_SUITES)
     add_test(NAME ${suite} COMMAND fos_param_${suite}_test)
 endforeach ()
 
+# PES-range sweep gate: shared cache == fresh cache over the PES parameter box,
+# every parameter slot moving. Small enough (~9k points, two computes each) to
+# run as a ctest in both configurations; the throughput it prints is a record,
+# not a threshold.
+add_executable(fos_param_pes_sweep tests/fos_pes_sweep.f08)
+target_link_libraries(fos_param_pes_sweep PRIVATE
+        fos_parameterization fos_param_test_utils fos_parameterization_flags)
+set_target_properties(fos_param_pes_sweep PROPERTIES
+        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/sweep)
+add_test(NAME pes_sweep COMMAND fos_param_pes_sweep)
+set_tests_properties(pes_sweep PROPERTIES LABELS sweep TIMEOUT 1800)
+
 # Geometry sweep: Tier A gate classification with golden counts, Tier B
 # conversion accuracy, and the representability probe (--probe). OpenMP is
 # optional — serial builds just run longer.
