@@ -175,12 +175,15 @@ contains
         integer(kind = ik), intent(in) :: i_c, i3, i4, i5, i6
         real(kind = rk) :: params(7)
 
-        params = [C_LO + real(i_c - 1_ik, rk) * cfg%dc, &
-                A3_LO + real(i3 - 1_ik, rk) * cfg%da3, &
-                A4_LO + real(i4 - 1_ik, rk) * cfg%da4, &
-                cfg%a5_lo + real(i5 - 1_ik, rk) * cfg%da5, &
-                cfg%a6_lo + real(i6 - 1_ik, rk) * cfg%da6, &
-                0.0_rk, 0.0_rk]
+        ! Element-wise: an array constructor with non-constant elements creates
+        ! a temporary, which the Debug profile rejects (-Werror=array-temporaries).
+        params(1) = C_LO + real(i_c - 1_ik, rk) * cfg%dc
+        params(2) = A3_LO + real(i3 - 1_ik, rk) * cfg%da3
+        params(3) = A4_LO + real(i4 - 1_ik, rk) * cfg%da4
+        params(4) = cfg%a5_lo + real(i5 - 1_ik, rk) * cfg%da5
+        params(5) = cfg%a6_lo + real(i6 - 1_ik, rk) * cfg%da6
+        params(6) = 0.0_rk
+        params(7) = 0.0_rk
 
     end function grid_params_f
 
