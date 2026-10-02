@@ -64,6 +64,12 @@ module fos_parameterization_workers_mod
     public :: scale_rho_grid_s
     public :: resolve_origin_s
     public :: newton_radius_s
+    public :: fos_bundle_f
+    public :: solve_thetas_s
+    public :: refine_neck_s
+    public :: active_length_f
+    public :: table_order_f
+    public :: shifted_origin_f
 
     ! Cache lifecycle, cached outputs, and engine introspection
     public :: fos_masks_f
@@ -483,7 +489,7 @@ contains
     !! @param[in]  n_points  u-grid resolution, >= FOS_N_POINTS_FLOOR
     !! @param[in]  thetas    Polar angles in [0, pi], at least one
     !! @param[out] status    SHAPE_VALID, or SHAPE_ERROR_INVALID_GRID
-    subroutine tables_init_s(tables, n_points, thetas, status)
+    pure subroutine tables_init_s(tables, n_points, thetas, status)
 
         type(tables_t), intent(out) :: tables
         integer(kind = ik), intent(in) :: n_points
@@ -507,7 +513,7 @@ contains
     !> Releases every table array and clears the initialized flag. Infallible.
     !!
     !! @param[in,out] tables  Tables to reset; safe on an already-free instance
-    subroutine tables_free_s(tables)
+    pure subroutine tables_free_s(tables)
 
         type(tables_t), intent(inout) :: tables
 
@@ -547,7 +553,7 @@ contains
     !! @param[in]  thetas    Polar angles in [0, pi]; may be empty
     !! @param[in]  k_max     Number of Fourier orders to tabulate, >= 1
     !! @param[out] status    SHAPE_VALID, or SHAPE_ERROR_INVALID_GRID
-    subroutine build_tables_s(tables, n_points, thetas, k_max, status)
+    pure subroutine build_tables_s(tables, n_points, thetas, k_max, status)
 
         type(tables_t), intent(out) :: tables
         integer(kind = ik), intent(in) :: n_points
@@ -669,7 +675,7 @@ contains
     !!
     !! @param[in,out] tables  Partially built tables, freed here
     !! @param[out]    status  Always SHAPE_ERROR_INVALID_GRID
-    subroutine reject_tables_s(tables, status)
+    pure subroutine reject_tables_s(tables, status)
 
         type(tables_t), intent(inout) :: tables
         integer(kind = ik), intent(out) :: status
@@ -704,7 +710,9 @@ contains
             return
         end if
 
-        a2 = a2_f(params)
+        ! Trimmed, so a short vector and its zero-padded form run the same loop
+        ! on the same data.
+        a2 = a2_f(params(1:active_length_f(params)))
         status = SHAPE_VALID
 
     end subroutine compute_a2_s
@@ -722,7 +730,7 @@ contains
         integer(kind = ik), intent(out) :: status
 
         real(kind = rk) :: c, sum_term, a_odd, sign_factor
-        integer(kind = ik) :: n
+        integer(kind = ik) :: n, n_active
 
         z_shift = 0.0_rk
 
@@ -742,9 +750,12 @@ contains
             return
         end if
 
+        ! Trimmed like `compute_a2_s`; c > C_MIN makes n_active >= 1.
+        n_active = active_length_f(params)
+
         sum_term = 0.0_rk
         do n = 1_ik, FOS_MAX_K
-            a_odd = coefficient_f(params, 2_ik * n + 1_ik, 0.0_rk)
+            a_odd = coefficient_f(params(1:n_active), 2_ik * n + 1_ik, 0.0_rk)
             if (abs(a_odd) < FOS_COEFF_NEGLIGIBLE) cycle
             sign_factor = merge(-1.0_rk, 1.0_rk, mod(n, 2_ik) == 0_ik)
             sum_term = sum_term + sign_factor * a_odd / real(n, rk)
@@ -754,6 +765,71 @@ contains
         status = SHAPE_VALID
 
     end subroutine compute_z_shift_s
+
+    !===========================================================================
+    ! PARAMETER-VECTOR HELPERS
+    !===========================================================================
+
+    !> Index of the last nonzero parameter; 0 for an empty or all-zero vector.
+    !!
+    !! Both tiers trim a vector to this length before any kernel runs, so a
+    !! short vector and its zero-padded form reach the kernels as the same data
+    !! with the same trip counts. The test is `abs(x) > 0`, so a trailing -0.0
+    !! counts as zero. Interior zeros are kept.
+    !!
+    !! @param[in] params  Parameter vector, any length
+    !! @return            Largest k with params(k) /= 0, or 0
+    pure function active_length_f(params) result(n_active)
+
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik) :: n_active
+
+        integer(kind = ik) :: k
+
+        n_active = 0_ik
+        do k = size(params, kind = ik), 1_ik, -1_ik
+            if (abs(params(k)) > 0.0_rk) then
+                n_active = k
+                exit
+            end if
+        end do
+
+    end function active_length_f
+
+    !> Fourier orders a vector of `n_params` parameters needs.
+    !!
+    !! (n_params + 2)/2 + 1, capped at FOS_MAX_K: the formula of the live
+    !! evaluator `eval_f_s`. It sizes a cache's tables from `max_params` and
+    !! bounds the kernel loops from the vector's own length.
+    !!
+    !! @param[in] n_params  Parameter count, >= 0
+    !! @return              Number of Fourier orders
+    pure function table_order_f(n_params) result(k_max)
+
+        integer(kind = ik), intent(in) :: n_params
+        integer(kind = ik) :: k_max
+
+        k_max = min((n_params + 2_ik) / 2_ik + 1_ik, FOS_MAX_K)
+
+    end function table_order_f
+
+    !> Total z-shift for an origin moved by `s` from the COM frame.
+    !!
+    !! One addition, kept in this module so the tier code performs no arithmetic
+    !! on an output value.
+    !!
+    !! @param[in] z_shift_intrinsic  COM shift
+    !! @param[in] s                  Additional origin shift
+    !! @return                       z_shift_intrinsic + s
+    pure function shifted_origin_f(z_shift_intrinsic, s) result(z_shift)
+
+        real(kind = rk), intent(in) :: z_shift_intrinsic
+        real(kind = rk), intent(in) :: s
+        real(kind = rk) :: z_shift
+
+        z_shift = z_shift_intrinsic + s
+
+    end function shifted_origin_f
 
     !===========================================================================
     ! TABLED SHAPE FUNCTION
@@ -766,13 +842,14 @@ contains
     !!
     !! Preconditions (caller's, unchecked): `tables` initialized,
     !! `size(f_grid) = size(fp_grid) >= tables%n_points`, and the table's k_max
-    !! covers the vector, k_max >= (size(params) + 2)/2 + 1.
+    !! covers the vector, k_max >= (size(params) + 2)/2 + 1. The sum runs over
+    !! the vector's orders, `table_order_f(size(params))`, never further.
     !!
     !! @param[in]  tables   Initialized trig tables
     !! @param[in]  params   FoS parameters (params(1) = c is not read)
     !! @param[out] f_grid   f at tables%u
     !! @param[out] fp_grid  df/du at tables%u
-    subroutine compute_f_grid_s(tables, params, f_grid, fp_grid)
+    pure subroutine compute_f_grid_s(tables, params, f_grid, fp_grid)
 
         type(tables_t), intent(in) :: tables
         real(kind = rk), intent(in) :: params(:)
@@ -782,14 +859,20 @@ contains
         real(kind = rk) :: a_even(tables%k_max), a_odd(tables%k_max)
         logical :: active(tables%k_max)
         real(kind = rk) :: sum_f, sum_fp, u
-        integer(kind = ik) :: i, k
+        integer(kind = ik) :: i, k, k_hi
 
-        call pair_coefficients_s(params, tables%k_max, a_even, a_odd, active)
+        ! The loop runs over the orders the VECTOR needs, not the orders the
+        ! table holds: tables of different order then execute the same trip
+        ! count on the same data, which is what makes a larger cache
+        ! bit-identical to a smaller one.
+        k_hi = min(table_order_f(size(params, kind = ik)), tables%k_max)
+
+        call pair_coefficients_s(params, k_hi, a_even, a_odd, active)
 
         do i = 1_ik, tables%n_points
             sum_f = 0.0_rk
             sum_fp = 0.0_rk
-            do k = 1_ik, tables%k_max
+            do k = 1_ik, k_hi
                 if (.not. active(k)) cycle
                 sum_f = sum_f + a_even(k) * tables%cos_even(i, k) &
                         + a_odd(k) * tables%sin_odd(i, k)
@@ -818,7 +901,7 @@ contains
     !!                           interior scan point (not at the clamp) — a
     !!                           minimum away from the clamp IS a local minimum
     !!                           of the scan, so no neighbor test is needed
-    subroutine beak_scan_f_min_s(tables, params, f_min, beak_ok, u_at_min, &
+    pure subroutine beak_scan_f_min_s(tables, params, f_min, beak_ok, u_at_min, &
             interior_min)
 
         type(tables_t), intent(in) :: tables
@@ -831,15 +914,18 @@ contains
         real(kind = rk) :: a_even(tables%k_max), a_odd(tables%k_max)
         logical :: active(tables%k_max)
         real(kind = rk) :: sum_f, f_val, u
-        integer(kind = ik) :: i, k, i_min
+        integer(kind = ik) :: i, k, i_min, k_hi
 
-        call pair_coefficients_s(params, tables%k_max, a_even, a_odd, active)
+        ! Same bound as `compute_f_grid_s`: the vector's orders, not the table's.
+        k_hi = min(table_order_f(size(params, kind = ik)), tables%k_max)
+
+        call pair_coefficients_s(params, k_hi, a_even, a_odd, active)
 
         f_min = huge(1.0_rk)
         i_min = 1_ik
         do i = 1_ik, FOS_BEAK_SCAN_POINTS
             sum_f = 0.0_rk
-            do k = 1_ik, tables%k_max
+            do k = 1_ik, k_hi
                 if (.not. active(k)) cycle
                 sum_f = sum_f + a_even(k) * tables%bk_cos_even(i, k) &
                         + a_odd(k) * tables%bk_sin_odd(i, k)
@@ -883,7 +969,7 @@ contains
     !! @param[out] drho_dz            Slope
     !! @param[out] rho_max            Largest rho on the grid (Newton bracket input)
     !! @param[out] rho_positive       .false. iff an interior node has rho <= RHO_TOLERANCE
-    subroutine scale_rho_grid_s(tables, c, z_shift_intrinsic, f_grid, fp_grid, &
+    pure subroutine scale_rho_grid_s(tables, c, z_shift_intrinsic, f_grid, fp_grid, &
             z, rho, drho_dz, rho_max, rho_positive)
 
         type(tables_t), intent(in) :: tables
@@ -2794,7 +2880,7 @@ contains
     !! @param[out] dr_dtheta  dR/dtheta at those angles
     !! @param[out] status     SHAPE_VALID, or FOS_ERROR_CONVERGENCE if ANY node
     !!                        missed NR_TOLERANCE
-    subroutine solve_thetas_s(bundle, thetas, radii, dr_dtheta, status)
+    pure subroutine solve_thetas_s(bundle, thetas, radii, dr_dtheta, status)
 
         ! One source loop is not enough: at -O3 with -flto and -finline-limit=1000
         ! this body is inlined into BOTH call sites, and -ffast-math then
@@ -2919,6 +3005,66 @@ contains
         found = .true.
 
     end subroutine find_neck_index_s
+
+    !> Neck of a resolved rho(z) grid: the interior rho minimum between the two
+    !! largest rho maxima, refined to machine precision.
+    !!
+    !! A coarse scan over the grid brackets the neck, then Newton iteration on
+    !! f'(u) = 0, bracketed to one grid spacing around the scan result so it
+    !! cannot escape to a different extremum, refines it. `found` is .false.,
+    !! with both outputs zero, for a profile with fewer than two rho maxima:
+    !! having no neck is an answer, not an error.
+    !!
+    !! Preconditions (caller's, unchecked): `tables` initialized, `rho` the
+    !! tables%n_points-long grid of this vector, params(1) > C_MIN.
+    !!
+    !! @param[in]  tables             Initialized trig tables (for the u nodes)
+    !! @param[in]  params             FoS parameters
+    !! @param[in]  rho                Cylindrical radius on the u grid
+    !! @param[in]  z_shift_intrinsic  COM shift of the profile
+    !! @param[out] z_neck             Neck z-position in the COM frame
+    !! @param[out] rho_neck           Neck radius
+    !! @param[out] found              .true. iff the profile has a neck
+    pure subroutine refine_neck_s(tables, params, rho, z_shift_intrinsic, &
+            z_neck, rho_neck, found)
+
+        type(tables_t), intent(in) :: tables
+        real(kind = rk), intent(in) :: params(:)
+        real(kind = rk), intent(in) :: rho(:)
+        real(kind = rk), intent(in) :: z_shift_intrinsic
+        real(kind = rk), intent(out) :: z_neck
+        real(kind = rk), intent(out) :: rho_neck
+        logical, intent(out) :: found
+
+        integer(kind = ik) :: neck_idx, iter
+        real(kind = rk) :: c, u, u_lo, u_hi, du, step
+        real(kind = rk) :: f_val, fp_val, fpp_val
+
+        z_neck = 0.0_rk
+        rho_neck = 0.0_rk
+
+        call find_neck_index_s(rho, neck_idx, found)
+        if (.not. found) return
+
+        c = params(1)
+        du = 2.0_rk / real(tables%n_points - 1_ik, rk)
+        u = tables%u(neck_idx)
+        u_lo = max(-1.0_rk, u - du)
+        u_hi = min(1.0_rk, u + du)
+
+        do iter = 1_ik, NECK_NEWTON_MAX_ITER
+            call eval_f_s(params, u, f_val, fp_val, fpp_val)
+            if (fpp_val <= 0.0_rk) exit
+            step = fp_val / fpp_val
+            u = min(u_hi, max(u_lo, u - step))
+            if (abs(step) < NECK_NEWTON_TOL) exit
+        end do
+
+        call eval_f_s(params, u, f_val, fp_val)
+        rho_neck = sqrt(max(f_val, 0.0_rk) / c)
+        z_neck = c * u + z_shift_intrinsic
+
+    end subroutine refine_neck_s
 
     !> a2 from the volume constraint, without the length check.
     pure function a2_f(params) result(a2)
