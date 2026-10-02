@@ -1,4 +1,4 @@
-"""Contract tests for the 2.0.0 Python surface.
+"""Contract tests for the 3.0.0 Python surface.
 
 Shape-validation failures are results, not exceptions: the buffers come back
 zero-filled with a nonzero :class:`Status`. Only usage errors — a failed
@@ -11,6 +11,7 @@ call. Recapture procedure lives in that file's header.
 from __future__ import annotations
 
 import math
+import threading
 
 import numpy as np
 import pytest
@@ -25,6 +26,8 @@ ASYMMETRIC = [1.80, 0.20, 0.30, 0.01, -0.02, 0.0, 0.0]
 # Beak-rejected by the R(theta) conversion, still a drawable rho(z) profile.
 # f(0) = 1 - 4*a4/3 = 2.0e-4 < F_MIN_THRESHOLD = 5.0e-4 (2026-08-11 retune)
 BEAK = [2.0, 0.0, 0.74985]
+# Two fragments: f(0) = 1 - 4*a4/3 = -0.2.
+SPLIT = [2.0, 0.0, 0.9]
 TOO_MANY = [1.0] + [0.0] * 50   # 51 entries, one past FOS_PARAM_MAX_PARAMS
 
 
@@ -344,7 +347,7 @@ def test_invalid_c_is_a_status() -> None:
     lambda: fp.neck(TOO_MANY, N_POINTS),
 ])
 def test_too_many_params_is_a_status_not_a_raise(call) -> None:
-    """51 params exceeds the tier-1 cap: Status(1) must exist and be returned.
+    """51 params exceeds the one-shot cap: Status(1) must exist and be returned.
 
     Regression: the 1.x enum had no member for 1, so Status(1) raised
     ValueError instead of reporting the rejection.
@@ -353,6 +356,22 @@ def test_too_many_params_is_a_status_not_a_raise(call) -> None:
     assert res.status == fp.Status.too_many_params
     assert not res.ok
     assert res.message
+
+
+@pytest.mark.parametrize("call", [
+    lambda: fp.radius_grid([], fp.theta_grid(16), N_POINTS),
+    lambda: fp.radius_and_derivative([], fp.theta_grid(16), N_POINTS),
+    lambda: fp.rho_z_grid([], N_POINTS),
+    lambda: fp.rho_z_grid_unchecked([], N_POINTS),
+    lambda: fp.shape([], N_POINTS),
+    lambda: fp.neck([], N_POINTS),
+    lambda: fp.star_convexity_optimum([], N_POINTS),
+])
+def test_empty_params_is_wrong_param_count(call) -> None:
+    """An empty vector is code 4 in every one-shot output (2.x returned 102)."""
+    res = call()
+    assert res.status == fp.Status.wrong_param_count
+    assert not res.ok
 
 
 def test_invalid_grid_is_a_status() -> None:
@@ -392,6 +411,44 @@ def test_beak_gates_radius_grid_but_not_rho_z_grid() -> None:
     assert profile.rho.max() > 0.0
 
 
+# --- unchecked cylindrical profile -----------------------------------------
+
+def test_unchecked_profile_draws_a_separated_shape() -> None:
+    checked = fp.rho_z_grid(SPLIT, N_POINTS)
+    assert checked.status == fp.Status.rho_negative
+    assert np.all(checked.rho == 0.0)
+
+    raw = fp.rho_z_grid_unchecked(SPLIT, N_POINTS)
+    assert raw.ok
+    mid = N_POINTS // 2
+    assert raw.rho[mid] == 0.0 and raw.drho_dz[mid] == 0.0      # the void
+    assert raw.rho[:mid].max() > 0.1 and raw.rho[mid + 1:].max() > 0.1
+
+    with fp.Cache(3, N_POINTS, fp.theta_grid(16)) as cache:
+        assert cache.rho_z_grid(SPLIT).status == fp.Status.rho_negative
+        cached = cache.rho_z_grid_unchecked(SPLIT)
+    assert cached.ok
+    assert np.array_equal(cached.z, raw.z)
+    assert np.array_equal(cached.rho, raw.rho)
+    assert np.array_equal(cached.drho_dz, raw.drho_dz)
+    assert cached.z_shift == raw.z_shift
+
+
+def test_unchecked_profile_equals_checked_on_a_connected_shape() -> None:
+    checked = fp.rho_z_grid(ASYMMETRIC, N_POINTS)
+    raw = fp.rho_z_grid_unchecked(ASYMMETRIC, N_POINTS)
+    assert checked.ok and raw.ok
+    assert np.array_equal(raw.z, checked.z)
+    assert np.array_equal(raw.rho, checked.rho)
+    assert np.array_equal(raw.drho_dz, checked.drho_dz)
+
+
+def test_unchecked_profile_keeps_the_c_gate() -> None:
+    res = fp.rho_z_grid_unchecked([1e-11], N_POINTS)
+    assert res.status == fp.Status.invalid_c
+    assert np.all(res.rho == 0.0) and res.z_shift == 0.0
+
+
 # --- cached tier -----------------------------------------------------------
 
 def test_cache_matches_tier1_bitwise() -> None:
@@ -418,8 +475,105 @@ def test_cache_derivative_and_at_thetas_agree() -> None:
         grid = cache.radius_and_derivative([1.5, 0.08, 0.05])
         at = cache.radius_and_derivative_at_thetas([1.5, 0.08, 0.05], thetas)
     assert grid.ok and at.ok
-    np.testing.assert_allclose(at.radii, grid.radii, rtol=0.0, atol=1e-14)
-    np.testing.assert_allclose(at.dr_dtheta, grid.dr_dtheta, rtol=0.0, atol=1e-14)
+    # Exact, on every compiler: both outputs call one solve loop that no tier
+    # routine can inline. This is the wheel's bitwise gate (GCC 10).
+    assert np.array_equal(at.radii, grid.radii)
+    assert np.array_equal(at.dr_dtheta, grid.dr_dtheta)
+
+
+def test_cache_of_larger_max_params_gives_the_same_bits() -> None:
+    thetas = fp.theta_grid(32)
+    with fp.Cache(7, N_POINTS, thetas) as exact, \
+            fp.Cache(fp.MAX_PARAMS, N_POINTS, thetas) as wide:
+        a = exact.radius_and_derivative(ASYMMETRIC)
+        b = wide.radius_and_derivative(ASYMMETRIC)
+    assert a.ok and b.ok
+    assert np.array_equal(a.radii, b.radii)
+    assert np.array_equal(a.dr_dtheta, b.dr_dtheta)
+
+
+def test_short_vector_equals_its_zero_padded_form() -> None:
+    thetas = fp.theta_grid(32)
+    short = [1.5, 0.08, 0.05]
+    with fp.Cache(8, N_POINTS, thetas) as cache:
+        a = cache.radius_and_derivative(short)
+        b = cache.radius_and_derivative(short + [0.0] * 5)
+        c = cache.radius_and_derivative(short + [-0.0] * 2)
+        shape_a = cache.shape(short)
+        shape_b = cache.shape(short + [0.0] * 5)
+    assert a.ok and b.ok and c.ok
+    assert np.array_equal(a.radii, b.radii) and np.array_equal(a.radii, c.radii)
+    assert np.array_equal(a.dr_dtheta, b.dr_dtheta)
+    assert np.array_equal(a.dr_dtheta, c.dr_dtheta)
+    assert shape_a == shape_b
+
+    flat = fp.radius_and_derivative(short, thetas, N_POINTS)
+    flat_padded = fp.radius_and_derivative(short + [0.0] * 5, thetas, N_POINTS)
+    assert np.array_equal(flat.radii, a.radii)
+    assert np.array_equal(flat_padded.radii, a.radii)
+    assert np.array_equal(flat_padded.dr_dtheta, a.dr_dtheta)
+
+
+def test_cache_is_stateless_across_a_rejection() -> None:
+    thetas = fp.theta_grid(32)
+    with fp.Cache(7, N_POINTS, thetas) as cache:
+        first = cache.radius_and_derivative(ASYMMETRIC)
+        assert cache.radius_grid(BEAK).status == fp.Status.beak_singularity
+        assert cache.radius_grid([1e-11]).status == fp.Status.invalid_c
+        again = cache.radius_and_derivative(ASYMMETRIC)
+    assert first.ok and again.ok
+    assert np.array_equal(first.radii, again.radii)
+    assert np.array_equal(first.dr_dtheta, again.dr_dtheta)
+
+
+def test_cache_shared_between_threads_reproduces_serial_results() -> None:
+    """Contract family 3: many threads computing on ONE cache."""
+    thetas = fp.theta_grid(48)
+    n_threads, n_steps = 8, 40
+
+    def shape_for(tid: int, step: int) -> list:
+        t = 0.01 * (tid + 1)
+        u = 0.005 * (step % 41)
+        full = [1.30 + u + t, 0.05 * t, 0.10 - 0.5 * u, 0.02, 0.01, 0.005, 0.002]
+        return full[:3 + 2 * (step % 3)]
+
+    def walk(cache: "fp.Cache", tid: int) -> list:
+        out = []
+        for step in range(n_steps):
+            p = shape_for(tid, step)
+            rd = cache.radius_and_derivative(p)
+            prof = cache.rho_z_grid(p)
+            shp = cache.shape(p)
+            out.append((rd.status, rd.radii, rd.dr_dtheta, prof.status, prof.rho,
+                        shp.status, shp.z_shift, shp.r_north, shp.r_south))
+        return out
+
+    with fp.Cache(7, N_POINTS, thetas) as cache:
+        serial = [walk(cache, tid) for tid in range(n_threads)]
+        threaded: list = [None] * n_threads
+
+        def worker(tid: int) -> None:
+            threaded[tid] = walk(cache, tid)
+
+        pool = [threading.Thread(target=worker, args=(tid,)) for tid in range(n_threads)]
+        for th in pool:
+            th.start()
+        for th in pool:
+            th.join()
+
+    n_valid = 0
+    for tid in range(n_threads):
+        assert threaded[tid] is not None
+        for a, b in zip(threaded[tid], serial[tid]):
+            assert a[0] == b[0] and a[3] == b[3] and a[5] == b[5]
+            assert np.array_equal(a[1], b[1]) and np.array_equal(a[2], b[2])
+            assert np.array_equal(a[4], b[4])
+            assert a[6:] == b[6:]
+            n_valid += int(b[0] == fp.Status.valid and b[3] == fp.Status.valid
+                           and b[5] == fp.Status.valid)
+    # Zero-filled rejections would compare equal too: the test must not be
+    # able to pass vacuously.
+    assert n_valid == n_threads * n_steps
 
 
 def test_cache_shape_rho_neck_and_star_convexity() -> None:
@@ -437,10 +591,14 @@ def test_cache_shape_rho_neck_and_star_convexity() -> None:
 
 def test_cache_wrong_param_count_is_a_status() -> None:
     with fp.Cache(3, N_POINTS, fp.theta_grid(16)) as cache:
-        res = cache.radius_grid([1.0, 0.0])
-    assert res.status == fp.Status.wrong_param_count
-    assert not res.ok
-    assert np.all(res.radii == 0.0)
+        short = cache.radius_grid([1.0, 0.0])            # 1 .. max_params: accepted
+        long = cache.radius_grid([1.0, 0.0, 0.0, 0.01])  # max_params + 1
+        empty = cache.radius_grid([])
+    assert short.ok
+    assert long.status == fp.Status.wrong_param_count
+    assert not long.ok
+    assert np.all(long.radii == 0.0)
+    assert empty.status == fp.Status.wrong_param_count
 
 
 def test_cache_beak_gating_asymmetry() -> None:
@@ -453,14 +611,34 @@ def test_cache_beak_gating_asymmetry() -> None:
 
 # --- usage errors ----------------------------------------------------------
 
-@pytest.mark.parametrize("n_params,n_points", [
-    (9, N_POINTS),   # above CACHE_MAX_PARAMS
-    (0, N_POINTS),   # below 1
-    (3, 50),         # below the n_points floor
+@pytest.mark.parametrize("max_params,n_points,thetas,code", [
+    (51, N_POINTS, fp.theta_grid(16), fp.Status.too_many_params),  # above MAX_PARAMS
+    (0, N_POINTS, fp.theta_grid(16), fp.Status.invalid_init),      # below 1
+    (3, 50, fp.theta_grid(16), fp.Status.invalid_grid),            # below the n_points floor
+    (3, N_POINTS, [], fp.Status.invalid_grid),                     # no thetas
+    (3, N_POINTS, [0.5, 4.0], fp.Status.invalid_grid),             # theta outside [0, pi]
+    (0, 50, [], fp.Status.invalid_init),                           # count is judged first
 ])
-def test_bad_cache_arguments_raise(n_params: int, n_points: int) -> None:
-    with pytest.raises(fp.FosParamError):
-        fp.Cache(n_params, n_points, fp.theta_grid(16))
+def test_bad_cache_arguments_raise_with_the_status(max_params, n_points, thetas,
+                                                   code) -> None:
+    with pytest.raises(fp.FosParamError) as excinfo:
+        fp.Cache(max_params, n_points, thetas)
+    assert excinfo.value.status == code
+    assert code.name in str(excinfo.value)
+
+
+def test_cache_accepts_both_limits_of_max_params() -> None:
+    for max_params in (1, fp.MAX_PARAMS):
+        with fp.Cache(max_params, N_POINTS, fp.theta_grid(16)) as cache:
+            assert cache.max_params == max_params
+            assert cache.n_points == N_POINTS and cache.n_thetas == 16
+            assert cache.radius_grid(SPHERE[:1]).ok
+
+
+def test_python_side_errors_carry_no_status() -> None:
+    with pytest.raises(fp.FosParamError) as excinfo:
+        fp.radius_grid([[1.0, 0.0]], fp.theta_grid(16), N_POINTS)
+    assert excinfo.value.status is None
 
 
 def test_use_after_close_raises() -> None:
@@ -491,8 +669,9 @@ def test_non_1d_input_raises() -> None:
 # --- diagnostics -----------------------------------------------------------
 
 def test_status_enum_covers_the_c_contract() -> None:
-    assert [int(s) for s in fp.Status] == [0, 1, 2, 3, 4, 5, 6,
+    assert [int(s) for s in fp.Status] == [0, 1, 2, 3, 4, 5,
                                            100, 101, 102, 103, 104, 105]
+    assert "unknown" in fp.status_message(6)      # retired, never reused
 
 
 def test_status_message_covers_every_code() -> None:
@@ -503,16 +682,52 @@ def test_status_message_covers_every_code() -> None:
 
 
 def test_limits_are_exported() -> None:
-    assert fp.CACHE_MAX_PARAMS == 8
     assert fp.MAX_PARAMS == 50
     assert fp.N_POINTS_FLOOR == 100
 
 
-# --- removed 1.x surface ---------------------------------------------------
+# --- removed 1.x and 2.x surface -------------------------------------------
 
 @pytest.mark.parametrize("name", [
     "rho_profile", "RhoProfileResult", "ShapeResult", "MESSAGE_BUFFER_SIZE",
+    "CACHE_MAX_PARAMS",
 ])
 def test_removed_names_absent(name: str) -> None:
     assert not hasattr(fp, name)
     assert name not in fp.__all__
+
+
+# --- inputs ----------------------------------------------------------------
+
+def test_inputs_are_converted_to_contiguous_float64() -> None:
+    """Lists of ints, float32 arrays and strided views give the float64 result."""
+    thetas = fp.theta_grid(16)
+    ref = fp.radius_grid([2.0, 0.0, 0.25], thetas, N_POINTS)   # exact in float32
+    assert ref.ok
+    variants = [
+        fp.radius_grid([2, 0, 0.25], thetas, N_POINTS),
+        fp.radius_grid(np.array([2.0, 0.0, 0.25], dtype=np.float32), thetas, N_POINTS),
+        fp.radius_grid(np.array([2.0, 9.0, 0.0, 9.0, 0.25])[::2], thetas, N_POINTS),
+        fp.radius_grid((2.0, 0.0, 0.25), list(thetas), N_POINTS),
+        fp.radius_grid([2.0, 0.0, 0.25], thetas[::-1][::-1], N_POINTS),
+    ]
+    for res in variants:
+        assert res.ok
+        assert np.array_equal(res.radii, ref.radii)
+
+
+def test_cache_copies_its_thetas() -> None:
+    """Mutating the caller's theta array after construction moves no result."""
+    thetas = fp.theta_grid(16)
+    with fp.Cache(7, N_POINTS, thetas) as cache:
+        before = cache.radius_grid(ASYMMETRIC)
+        thetas[:] = 0.3
+        after = cache.radius_grid(ASYMMETRIC)
+    assert before.ok and after.ok
+    assert np.array_equal(before.radii, after.radii)
+
+
+def test_removed_2x_members_absent() -> None:
+    assert not hasattr(fp.Status, "tables_not_initialized")
+    with fp.Cache(3, N_POINTS, fp.theta_grid(16)) as cache:
+        assert not hasattr(cache, "n_params")
