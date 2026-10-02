@@ -44,6 +44,16 @@ jobs:
         run: |
           mkdir dist
           cp wheelhouse/*.whl dist_sdist/*.tar.gz dist/
+      - name: Check the metadata PyPI will render
+        # A tag must never publish a page without a description or repo link:
+        # twine check fails on a missing or unrenderable long description, and
+        # the grep pins the three project URLs.
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check --strict dist/*
+          tar -xOzf dist/*.tar.gz --wildcards '*/PKG-INFO' > /tmp/PKG-INFO
+          grep -q '^Description-Content-Type: text/markdown' /tmp/PKG-INFO
+          test "$(grep -c '^Project-URL: ' /tmp/PKG-INFO)" -eq 3
       - uses: actions/upload-artifact@v4
         with:
           name: dist

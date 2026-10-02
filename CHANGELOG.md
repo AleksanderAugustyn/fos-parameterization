@@ -3,6 +3,145 @@
 Notable changes to fos-parameterization. Versions follow semantic versioning;
 the Fortran, C and Python surfaces are versioned together.
 
+## 3.0.0 — 2026-10-02
+
+Adoption of the two-tier shape parameterization contract: one-shot functions,
+plus one read-only cache built once and shared across threads. The mutable
+cache, the `shape_engine_t` recompute tracker and the shared-tables mode are
+gone. Physics is unchanged for every shape 2.1.0 accepts: the 2.1.0 golden
+literals pass unregenerated and the geometry sweep reproduces its counts.
+
+Breaking on every surface. There are no aliases and no transition release.
+
+### Changed — the cache is read-only
+
+- `cache_t` is what `tables_t` was: everything determined by the resolution,
+  nothing derived from a shape parameter. It is immutable after
+  `cache_init_s`, every compute takes it `intent(in)`, and any number of
+  threads may compute on one cache at once.
+- `cache_init_s(cache, max_params, n_points, thetas, status)`: `max_params`
+  is the consumer's choice, 1 to 50, and sets the table order
+  `(max_params + 2)/2 + 1`. The cap of 8 is gone.
+- A cached call accepts any vector of `1 .. max_params` parameters (2.x:
+  exactly `n_params`). Missing trailing parameters are zero.
+- Trailing zeros (of either sign) are trimmed before any kernel runs, in both
+  tiers. A short vector and its zero-padded form give bitwise-identical
+  outputs. Interior zeros are kept.
+- A cache has allocatable components only: assignment is a deep copy, a cache
+  that goes out of scope releases its tables, and `cache_free_s` is no longer
+  mandatory.
+- The one-shot routines are wrappers: each builds a local cache and calls the
+  cached routine. One-shot and cached outputs are bitwise identical for any
+  cache with `max_params >= size(params)`.
+- Init and every compute routine are `pure`.
+
+### Changed — status codes and the order of the checks
+
+One order on every surface; the first failing check sets the status. Usage
+codes come first and never depend on parameter values.
+
+- An empty parameter vector in a one-shot call returns 4
+  (`SHAPE_ERROR_WRONG_PARAM_COUNT`); 2.x returned 102. This covers the seven
+  one-shot outputs, `compute_z_shift_s` and the two diagnostics.
+  `compute_a2_s` still accepts an empty vector.
+- `cache_init_s`: `max_params < 1` returns 5, `max_params > 50` returns 1,
+  then the grid returns 3.
+- Fortran tier: a wrong output buffer (105) and an invalid theta set (3) are
+  now reported before a degenerate `c` (102) and before the shape gates. 2.x
+  judged the shape first there, while its C layer already checked 105 first.
+- An empty theta set passed to the at-thetas output returns 3 (2.x returned
+  valid and computed nothing).
+- Per-call scratch that cannot be allocated returns 3 (2.x: error termination
+  in the one-shot tier).
+- Code 6 (`SHAPE_ERROR_TABLES_NOT_INITIALIZED`) is retired. The number is
+  never reused; its message is the unknown-code text.
+- Message texts of codes 1 and 4 are reworded.
+
+### Added
+
+- `cache_rho_z_grid_unchecked_s` / `compute_rho_z_grid_unchecked_standalone_s`
+  (C: `fos_param_cache_rho_z_grid_unchecked`, `fos_param_rho_z_grid_unchecked`;
+  Python: `Cache.rho_z_grid_unchecked`, `rho_z_grid_unchecked`): the
+  cylindrical profile without the rho-positivity gate. It never returns 100;
+  `rho` and `drho_dz` are 0 in the void of a separated shape. `z_shift` is the
+  closed-form intrinsic shift, which for a separated shape is not the centre
+  of mass of the fragments.
+- Accessors `cache_max_params_f`, `cache_n_points_f`, `cache_n_thetas_f`,
+  `cache_is_initialized_f`.
+- `SHAPE_MAX_PARAMS` re-exported from `shape_core_mod`.
+- README, and the PyPI metadata that renders it (`readme`, `[project.urls]`).
+- CI on push and pull request: the suites in Debug and Release on gfortran 13,
+  and the manylinux2014 wheel (GCC 10.2) built and tested.
+
+### Removed
+
+- Fortran: `tables_t`, `tables_init_s`, `tables_free_s`, `cache_init_shared_s`,
+  `cache_recompute_count_f`, `fos_masks_f`, `FOS_N_INTERMEDIATES`, the `I_*`
+  indices, `FOS_TABLES_K_MAX`, `SHAPE_ERROR_TABLES_NOT_INITIALIZED`.
+- C: `fos_param_tables_create`, `fos_param_tables_destroy`,
+  `fos_param_cache_create_shared`, `FOS_PARAM_CACHE_MAX_PARAMS`,
+  `FOS_ERROR_TABLES_NOT_INITIALIZED`.
+- Python: `CACHE_MAX_PARAMS`, `Status.tables_not_initialized`, the `n_params`
+  attribute of `Cache`.
+
+### C API
+
+- The handle is a typed opaque `fos_param_cache_t`; every compute takes it
+  `const`.
+- `fos_param_cache_create(max_params, n_points, thetas, n_theta, status)`
+  returns `NULL` on failure and reports the rejecting code through the
+  nullable `status`. An `n_theta` below 1 and a theta buffer that cannot be
+  allocated report 3; failure to allocate the handle object reports 5.
+- `n_params = 0` in a one-shot call returns 4, except in `fos_param_a2`.
+- `fos_param_cache_radius_and_derivative_at_thetas` with a negative `n_thetas`
+  returns 105 only when the parameter count is valid; a count outside
+  `1 .. max_params` returns 4 first (2.1.0 returned 105 regardless).
+- Every other mapping of the C layer is as in 2.1.0.
+
+### Python
+
+- `Cache(max_params, n_points, thetas)`, with attributes `max_params`,
+  `n_points`, `n_thetas`. A `Cache` may be shared between threads.
+- A failed construction raises `FosParamError` carrying the status code in
+  its `status` attribute.
+
+### Internals
+
+- The arithmetic and the tiers are in different files. Every kernel lives in
+  `fos_parameterization_workers_mod`; the cache type, the checks, the trimming,
+  the gates and both tiers live in `fos_parameterization_mod`, which performs
+  no arithmetic on an output value.
+- The library's own objects are compiled without LTO (`-fno-lto`). Together
+  with the file split this means no kernel can be inlined into a tier routine,
+  so every tier path executes the same machine code and the bitwise claims
+  hold on every compiler, the wheel's GCC 10 included. The `noinline`
+  directive on the R(theta) solve loop, which GCC 10 ignored, is removed, and
+  the wheel's fixed-grid against at-thetas test is now exact (it tolerated
+  1e-14).
+- Measured cost of `-fno-lto` on the PES sweep (Release, GCC 13.3, best of 3):
+  1.7% on the coarse pass and 3.4% on the fine pass of shared-cache shape
+  time. With LTO left on, the bitwise suites also pass on this compiler: the
+  rule is a guard, not the fix of an observed failure.
+- The two table kernels sum the Fourier orders the vector needs, not the
+  orders the table holds, so caches of different `max_params` run the same
+  trip count on the same data.
+- fortran-foundations 3.0.0 (`shape_core_mod` reduced to the shared
+  constants).
+
+### Tests
+
+- New contract suites: `equivalence` (one-shot == cached, short ==
+  zero-padded, rejections, the unchecked profile), `statelessness` (repeat
+  calls, calls after every rejection, mixed sequences against fresh caches
+  across call sites), `boundary` (both sides of every limit), and a
+  concurrency test with 8 threads on one shared cache. `bitwise`, `interleave`,
+  `minimality` and `tables` are gone with what they tested.
+- Code 104 is untested. No vector reaches it: a search of 158,370 shapes
+  through the ungated diagnostic conversion, at up to 258 thetas including
+  nodes 1e-7 from the poles, returned 104 for none.
+- `fos_param_geometry_sweep_test` builds in Debug again (an array constructor
+  tripped `-Werror=array-temporaries`).
+
 ## 2.1.0 — 2026-08-11
 
 The beak criterion is now justified by a measured representability cliff, and

@@ -41,7 +41,8 @@ program fos_param_standalone_test
             compute_conversion_diagnostic_standalone_s, STAR_CONVEXITY_MARGIN, &
             FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY, &
             FOS_ERROR_NOT_STAR_CONVEX
-    use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS
+    use shape_core_mod, only: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
+            SHAPE_ERROR_WRONG_PARAM_COUNT
     use test_utils_mod, only: assert_true, assert_int_eq, assert_abs_close, &
             test_summary
 
@@ -151,7 +152,7 @@ program fos_param_standalone_test
     !---------------------------------------------------------------------------
     write(*, '(A)') '=== Degenerate vectors, all six forms ==='
 
-    call reject_all_forms(NO_PARAMS, FOS_ERROR_INVALID_C, 'empty params')
+    call reject_all_forms(NO_PARAMS, SHAPE_ERROR_WRONG_PARAM_COUNT, 'empty params')
 
     params_bad_c(1) = 1.0e-11_rk
     call reject_all_forms(params_bad_c, FOS_ERROR_INVALID_C, 'degenerate c')
@@ -237,7 +238,7 @@ program fos_param_standalone_test
     !---------------------------------------------------------------------------
     ! This is the assertion that pins the ledger closure. A 20-parameter vector
     ! gets k_max = min((20+2)/2+1, 50) = 12 orders, so a_21 (order k = 10) is
-    ! tabulated and contributes. Hard-code k_max back to FOS_TABLES_K_MAX = 6 and
+    ! tabulated and contributes. Hard-code the table order back to 6 and
     ! `pair_coefficients_s` never even looks at order 10: the coefficient
     ! vanishes from f(u), both assertions below fail, and the regression is
     ! caught. Nothing else in the suite would notice — accepting a long vector is

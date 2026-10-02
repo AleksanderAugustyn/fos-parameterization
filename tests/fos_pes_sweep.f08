@@ -1,34 +1,32 @@
-!> PES-range sweep gate: incremental == cold, bit for bit, over a PES box.
+!> PES-range sweep gate: shared cache == fresh cache, bit for bit, over a PES box.
 !!
-!! The contract's bitwise rule is asserted by `fos_param_bitwise_test` on four
+!! The contract's equivalence and statelessness rules are asserted by
+!! `fos_param_equivalence_test` and `fos_param_statelessness_test` on
 !! hand-chosen regimes. This gate asserts the SAME property statistically, over
 !! the parameter box a PES scan actually walks, with every one of the eight
-!! cached slots moving:
+!! parameter slots moving:
 !!
 !!   pass 1 (coarse) — c x a3 x a4 on a 15 x 8 x 8 grid, higher coefficients 0.
 !!   pass 2 (fine)   — a reduced (c, a3, a4) base times a5, a6 (5 values each),
-!!                     a7, a8 and a9 (3 values each). a9 is p8, the last cached
-!!                     slot; without it one mask column would never be dirtied.
+!!                     a7, a8 and a9 (3 values each).
 !!
-!! Every point is computed twice: once in ONE cache walked through the whole
-!! grid in odometer order (so each step reuses whatever its parameter diff did
-!! not invalidate), and once in a cache created fresh for that point alone. The
-!! two radius grids must be bit-identical and the two statuses must agree —
-!! rejections included, since a rejected call zero-fills and the zero pattern is
-!! part of the property.
+!! Every point is computed twice: once on ONE shared cache walked through the
+!! whole grid in odometer order — the way a PES scan uses the library — and
+!! once on a cache built for that point alone, in a different procedure
+!! (`fresh_point_s`), so the comparison also crosses call sites. The two radius
+!! grids must be bit-identical and the two statuses must agree — rejections
+!! included, since a rejected call zero-fills and the zero pattern is part of
+!! the property.
 !!
 !! Rejections are a normal outcome of a PES box and are counted, not failed. The
 !! histogram and the two throughputs are PRINTED for the validation record; none
-!! of them is asserted, so no CI threshold can go flaky. The throughputs are
-!! measured on separate clocks and mean different things: "incremental" times
-!! the warm compute alone (one shape per grid point, on a cache that already
-!! holds the previous point's intermediates — the rate a PES scan sees), "cold"
-!! times the fresh cache's whole life (table build + compute + free, dominated
-!! by the table build). Each counts one shape per grid point, so neither is the
-!! sweep's total wall time — every point is resolved twice. Asserted: zero bitwise
-!! mismatches, zero status mismatches, no misuse status (1-6) anywhere, and a
-!! nonzero valid count (a sweep that rejected everything would pass the bitwise
-!! property vacuously).
+!! of them is asserted, so no CI threshold can go flaky. "shared" times the
+!! compute alone on the shared cache — the rate a PES scan sees, and the number
+!! the no-LTO cost is measured on; "fresh" times a cache's whole life (table
+!! build + compute + free, dominated by the table build). Each counts one shape
+!! per grid point. Asserted: zero bitwise mismatches, zero status mismatches, no
+!! usage status (1-5, 105) anywhere, and a nonzero valid count (a sweep that
+!! rejected everything would pass the bitwise property vacuously).
 program fos_pes_sweep
 
     use precision_utilities_mod, only: ik, ikl, rk
@@ -36,8 +34,7 @@ program fos_pes_sweep
     use fos_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
             cache_radius_grid_s, SHAPE_VALID, FOS_ERROR_RHO_NEGATIVE, &
             FOS_ERROR_NOT_STAR_CONVEX, FOS_ERROR_INVALID_C, &
-            FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_CONVERGENCE, &
-            FOS_ERROR_BUFFER_MISMATCH
+            FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_CONVERGENCE
     use test_utils_mod, only: assert_true, assert_int_eq, assert_bits_eq, &
             test_summary
 
@@ -47,19 +44,19 @@ program fos_pes_sweep
     integer(kind = ik), parameter :: N_POINTS = 201_ik
     integer(kind = ik), parameter :: N_THETA = 41_ik
 
-    !> Histogram buckets: the seven reachable codes plus one catch-all. A count
-    !! in the catch-all means a misuse status (1-6) or an unknown code, and the
-    !! gate fails on it.
-    integer(kind = ik), parameter :: N_CODES = 7_ik
+    !> Histogram buckets: success and the five value codes, plus one catch-all.
+    !! A count in the catch-all means a usage status (1-5, or 105 — the sweep
+    !! passes correctly sized buffers) or an unknown code, and the gate fails
+    !! on it.
+    integer(kind = ik), parameter :: N_CODES = 6_ik
     integer(kind = ik), parameter :: CODES(N_CODES) = &
             [SHAPE_VALID, FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_NOT_STAR_CONVEX, &
              FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY, &
-             FOS_ERROR_CONVERGENCE, FOS_ERROR_BUFFER_MISMATCH]
+             FOS_ERROR_CONVERGENCE]
     character(len = 26), parameter :: CODE_NAMES(N_CODES) = &
             ['  0 valid                 ', '100 rho <= 0              ', &
              '101 not star-convex       ', '102 invalid c             ', &
-             '103 beak singularity      ', '104 newton not converged  ', &
-             '105 buffer mismatch       ']
+             '103 beak singularity      ', '104 newton not converged  ']
 
     !> Coarse pass: the PES box proper. Slots 4-8 pinned to 0.
     real(kind = rk), parameter :: COARSE_LO(N_DIMS) = &
@@ -98,7 +95,8 @@ program fos_pes_sweep
 
 contains
 
-    !> Sweeps one rectangular grid, comparing incremental against cold.
+    !> Sweeps one rectangular grid, comparing the shared cache against a fresh
+    !! cache per point.
     !!
     !! @param[in] label   Pass name for the printed block and assertion labels
     !! @param[in] lo      Per-slot lower bound
@@ -112,14 +110,15 @@ contains
         integer(kind = ik), intent(in) :: n(N_DIMS)
         real(kind = rk),    intent(in) :: thetas(N_THETA)
 
-        type(cache_t)       :: warm, cold
+        type(cache_t)       :: shared
         real(kind = rk)     :: params(N_DIMS), step(N_DIMS)
-        real(kind = rk)     :: r_warm(N_THETA), r_cold(N_THETA)
-        real(kind = rk)     :: warm_seconds, cold_seconds
-        integer(kind = ik)  :: idx(N_DIMS), d, b, t, status_warm, status_cold
-        integer(kind = ik)  :: status, n_cold_init_fail
+        real(kind = rk)     :: r_shared(N_THETA), r_fresh(N_THETA)
+        real(kind = rk)     :: shared_seconds, fresh_seconds
+        integer(kind = ik)  :: idx(N_DIMS), d, b, t, status_shared, status_fresh
+        integer(kind = ik)  :: status, n_fresh_init_fail
         integer(kind = ikl) :: n_total, hist(N_CODES + 1_ik)
-        integer(kind = ikl) :: warm_ticks, cold_ticks, t0, t1, tick_rate
+        integer(kind = ikl) :: shared_ticks, fresh_ticks, t0, t1, tick_rate
+        logical             :: fresh_ok
 
         do d = 1_ik, N_DIMS
             if (n(d) > 1_ik) then
@@ -134,15 +133,16 @@ contains
             n_total = n_total * int(n(d), ikl)
         end do
 
-        call cache_init_s(warm, N_DIMS, N_POINTS, thetas, status)
-        call assert_int_eq(status, SHAPE_VALID, label // ': warm cache init')
+        call cache_init_s(shared, N_DIMS, N_POINTS, thetas, status)
+        call assert_int_eq(status, SHAPE_VALID, label // ': shared cache init')
         if (status /= SHAPE_VALID) return
 
         hist(:) = 0_ikl
-        n_cold_init_fail = 0_ik
-        warm_ticks = 0_ikl
-        cold_ticks = 0_ikl
+        n_fresh_init_fail = 0_ik
+        shared_ticks = 0_ikl
+        fresh_ticks = 0_ikl
         idx(:) = 1_ik
+
         call system_clock(count_rate = tick_rate)
 
         do
@@ -150,45 +150,37 @@ contains
                 params(d) = lo(d) + real(idx(d) - 1_ik, rk) * step(d)
             end do
 
-            ! Timed segment 1: the incremental path only — one compute on a
-            ! cache that already holds the previous point's intermediates. This
-            ! is the rate a PES scan actually sees.
+            ! Timed segment 1: one compute on the shared cache. This is the
+            ! rate a PES scan actually sees.
             call system_clock(count = t0)
-            call cache_radius_grid_s(warm, params, r_warm, status_warm)
+            call cache_radius_grid_s(shared, params, r_shared, status_shared)
             call system_clock(count = t1)
-            warm_ticks = warm_ticks + (t1 - t0)
+            shared_ticks = shared_ticks + (t1 - t0)
 
-            ! Timed segment 2: the cold reference — table build, one compute and
-            ! the free, which is what a caller pays who builds a cache per shape.
-            ! Kept separate because the table build dominates it.
+            ! Timed segment 2: the fresh-cache reference — table build, one
+            ! compute and the free, in another procedure.
             call system_clock(count = t0)
-            call cache_init_s(cold, N_DIMS, N_POINTS, thetas, status)
-            if (status /= SHAPE_VALID) then
-                call system_clock(count = t1)
-                cold_ticks = cold_ticks + (t1 - t0)
-                n_cold_init_fail = n_cold_init_fail + 1_ik
-            else
-                call cache_radius_grid_s(cold, params, r_cold, status_cold)
-                call cache_free_s(cold)
-                call system_clock(count = t1)
-                cold_ticks = cold_ticks + (t1 - t0)
+            call fresh_point_s(params, thetas, r_fresh, status_fresh, fresh_ok)
+            call system_clock(count = t1)
+            fresh_ticks = fresh_ticks + (t1 - t0)
 
+            if (.not. fresh_ok) then
+                n_fresh_init_fail = n_fresh_init_fail + 1_ik
+            else
                 ! Comparison is outside both timed segments: the assertions are
                 ! the gate's work, not the library's.
-                call assert_int_eq(status_warm, status_cold, &
-                        label // ': incremental status == cold status')
+                call assert_int_eq(status_shared, status_fresh, &
+                        label // ': shared status == fresh status')
                 do t = 1_ik, N_THETA
-                    call assert_bits_eq(r_warm(t), r_cold(t), &
-                            label // ': incremental radius == cold radius')
+                    call assert_bits_eq(r_shared(t), r_fresh(t), &
+                            label // ': shared radius == fresh radius')
                 end do
             end if
 
-            b = code_bucket_f(status_warm)
+            b = code_bucket_f(status_shared)
             hist(b) = hist(b) + 1_ikl
 
-            ! Odometer step, last slot fastest: consecutive points differ in as
-            ! few parameters as possible, which is what makes the incremental
-            ! cache do incremental work.
+            ! Odometer step, last slot fastest.
             d = N_DIMS
             do
                 idx(d) = idx(d) + 1_ik
@@ -200,10 +192,10 @@ contains
             if (d < 1_ik) exit
         end do
 
-        call cache_free_s(warm)
+        call cache_free_s(shared)
 
-        warm_seconds = real(warm_ticks, rk) / real(tick_rate, rk)
-        cold_seconds = real(cold_ticks, rk) / real(tick_rate, rk)
+        shared_seconds = real(shared_ticks, rk) / real(tick_rate, rk)
+        fresh_seconds = real(fresh_ticks, rk) / real(tick_rate, rk)
 
         write(*, '(A)') repeat('-', 68)
         write(*, '(A,A)')  'PES sweep pass: ', label
@@ -216,22 +208,51 @@ contains
         end do
         write(*, '(A,I0)')    '  unexpected statuses : ', hist(N_CODES + 1_ik)
         ! Both rates count ONE shape per grid point, over the segment named.
-        ! Every point is resolved twice (warm and cold), so neither figure is
-        ! the sweep's total wall time; they are two different per-shape costs.
-        write(*, '(A,F12.3)') '  incremental seconds : ', warm_seconds
-        write(*, '(A,F14.1)') '  incremental shapes/s: ', rate_f(n_total, warm_seconds)
-        write(*, '(A,F12.3)') '  cold seconds        : ', cold_seconds
-        write(*, '(A,F14.1)') '  cold shapes/s (incl. cache init + free): ', &
-                rate_f(n_total, cold_seconds)
+        write(*, '(A,F12.3)') '  shared seconds      : ', shared_seconds
+        write(*, '(A,F14.1)') '  shared shapes/s     : ', rate_f(n_total, shared_seconds)
+        write(*, '(A,F12.3)') '  fresh seconds       : ', fresh_seconds
+        write(*, '(A,F14.1)') '  fresh shapes/s (incl. cache init + free): ', &
+                rate_f(n_total, fresh_seconds)
 
         ! Asserted outcomes. The histogram above is a record, not a gate; these
-        ! four are the gate.
-        call assert_int_eq(n_cold_init_fail, 0_ik, label // ': cold cache inits all succeeded')
+        ! are the gate.
+        call assert_int_eq(n_fresh_init_fail, 0_ik, label // ': fresh cache inits all succeeded')
         call assert_true(hist(N_CODES + 1_ik) == 0_ikl, &
-                label // ': no misuse or unknown status')
+                label // ': no usage or unknown status')
         call assert_true(hist(1) > 0_ikl, label // ': at least one valid shape')
 
     end subroutine run_pass_s
+
+    !> One point on a cache built for it alone. A separate procedure from the
+    !! shared-cache call on purpose: the comparison must cross call sites.
+    !!
+    !! @param[in]  params  Parameter vector of the grid point
+    !! @param[in]  thetas  Polar nodes
+    !! @param[out] radii   R(theta); zero-filled on any rejection
+    !! @param[out] status  Status of the compute (undefined when init failed)
+    !! @param[out] ok      .false. iff the fresh cache could not be built
+    subroutine fresh_point_s(params, thetas, radii, status, ok)
+
+        real(kind = rk),    intent(in)  :: params(N_DIMS)
+        real(kind = rk),    intent(in)  :: thetas(N_THETA)
+        real(kind = rk),    intent(out) :: radii(N_THETA)
+        integer(kind = ik), intent(out) :: status
+        logical,            intent(out) :: ok
+
+        type(cache_t) :: fresh
+        integer(kind = ik) :: init_status
+
+        radii = 0.0_rk
+        status = SHAPE_VALID
+
+        call cache_init_s(fresh, N_DIMS, N_POINTS, thetas, init_status)
+        ok = init_status == SHAPE_VALID
+        if (.not. ok) return
+
+        call cache_radius_grid_s(fresh, params, radii, status)
+        call cache_free_s(fresh)
+
+    end subroutine fresh_point_s
 
     !> Shapes per second, 0 when the segment was too short for the clock.
     !!

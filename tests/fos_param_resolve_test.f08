@@ -17,7 +17,7 @@ program fos_param_resolve_test
     use precision_utilities_mod, only: ik, ikl, rk
     use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
-            cache_shape_s, cache_rho_z_grid_s, cache_recompute_count_f, &
+            cache_shape_s, cache_rho_z_grid_s, &
             compute_z_shift_s, compute_shape_standalone_s, &
             FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_NOT_STAR_CONVEX, &
             FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_INVALID_C
@@ -34,6 +34,9 @@ program fos_param_resolve_test
             [1.5_rk, 0.1_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk, 0.002_rk]
     real(kind = rk), parameter :: ASYM7(N_PARAMS) = &
             [1.8_rk, 0.15_rk, 0.1_rk, 0.08_rk, 0.0_rk, 0.0_rk, 0.0_rk]
+    !> One parameter more than the cache's max_params.
+    real(kind = rk), parameter :: LONG8(N_PARAMS + 1_ik) = &
+            [1.5_rk, 0.1_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk, 0.002_rk, 0.001_rk]
 
     !> Total z-shifts the 1.x `compute_fos_shape_s` resolved at N_POINTS,
     !! frozen from commit 648428c (the last commit carrying that surface). The
@@ -65,7 +68,6 @@ program fos_param_resolve_test
     real(kind = rk)    :: params_beak(N_PARAMS), params_rho(N_PARAMS)
     real(kind = rk)    :: z(N_POINTS), rho(N_POINTS), drho_dz(N_POINTS)
     real(kind = rk)    :: grid_shift
-    integer(kind = ik) :: before(6)
     logical            :: found
 
     do i = 1_ik, 4_ik
@@ -76,19 +78,31 @@ program fos_param_resolve_test
     call assert_int_eq(status, SHAPE_VALID, 'cache init valid')
 
     !---------------------------------------------------------------------------
-    ! Wrong parameter count wins over everything and zero-fills
+    ! Parameter count: any length in 1..max_params is accepted and a short
+    ! vector equals its zero-padded form; one more than max_params is 4
     !---------------------------------------------------------------------------
+    call cache_shape_s(cache, PARAMS7(1:3), z_shift, r_north, r_south, status)
+    call assert_int_eq(status, SHAPE_VALID, 'short params accepted')
+    params_rho = 0.0_rk
+    do i = 1_ik, 3_ik
+        params_rho(i) = PARAMS7(i)
+    end do
+    call cache_shape_s(cache, params_rho, ref_shift, ref_north, ref_south, status)
+    call assert_int_eq(status, SHAPE_VALID, 'zero-padded params accepted')
+    call assert_true(bits_eq_f(z_shift, ref_shift) .and. bits_eq_f(r_north, ref_north) &
+            .and. bits_eq_f(r_south, ref_south), 'short == zero-padded, bit for bit')
+
     z_shift = 1.0_rk
     r_north = 1.0_rk
     r_south = 1.0_rk
-    call cache_shape_s(cache, PARAMS7(1:3), z_shift, r_north, r_south, status)
-    call assert_int_eq(status, SHAPE_ERROR_WRONG_PARAM_COUNT, 'short params -> 4')
-    call assert_abs_close(z_shift, 0.0_rk, 0.0_rk, 'short params zero-fills z_shift')
-    call assert_abs_close(r_north, 0.0_rk, 0.0_rk, 'short params zero-fills r_north')
-    call assert_abs_close(r_south, 0.0_rk, 0.0_rk, 'short params zero-fills r_south')
+    call cache_shape_s(cache, LONG8, z_shift, r_north, r_south, status)
+    call assert_int_eq(status, SHAPE_ERROR_WRONG_PARAM_COUNT, 'max_params + 1 -> 4')
+    call assert_abs_close(z_shift, 0.0_rk, 0.0_rk, 'long params zero-fills z_shift')
+    call assert_abs_close(r_north, 0.0_rk, 0.0_rk, 'long params zero-fills r_north')
+    call assert_abs_close(r_south, 0.0_rk, 0.0_rk, 'long params zero-fills r_south')
 
     !---------------------------------------------------------------------------
-    ! Degenerate c: 102 before any intermediate runs
+    ! Degenerate c: 102 before any stage runs
     !---------------------------------------------------------------------------
     params_rho = 0.0_rk
     params_rho(1) = 1.0e-11_rk
@@ -133,33 +147,23 @@ program fos_param_resolve_test
             'asym takes the COM origin (z_shift bit-equal to intrinsic)')
 
     !---------------------------------------------------------------------------
-    ! Minimality: a repeat call recomputes nothing; #7/#8 never run here
+    ! No state: a repeat call, and a call after a different output, return the
+    ! same bits
     !---------------------------------------------------------------------------
-    do i = 1_ik, 6_ik
-        before(i) = count_f(i)
-    end do
-    call cache_shape_s(cache, ASYM7, z_shift, r_north, r_south, status)
+    call cache_shape_s(cache, ASYM7, ref_shift, ref_north, ref_south, status)
     call assert_int_eq(status, SHAPE_VALID, 'repeat shape call valid')
-    do i = 1_ik, 6_ik
-        call assert_int_eq(count_f(i), before(i), 'repeat call recomputes nothing')
-    end do
-    call assert_int_eq(count_f(7_ik), 0_ik, 'radius grid (#7) untouched')
-    call assert_int_eq(count_f(8_ik), 0_ik, 'radius derivative (#8) untouched')
+    call assert_true(bits_eq_f(z_shift, ref_shift) .and. bits_eq_f(r_north, ref_north) &
+            .and. bits_eq_f(r_south, ref_south), 'repeat shape call returns the same bits')
 
-    ! The cylindrical output shares #1-#3/#5, so a following shape call on the
-    ! same vector recomputes only the beak scan (#4) and the resolve (#6).
+    call cache_shape_s(cache, PARAMS7, z_shift, r_north, r_south, status)
+    call assert_int_eq(status, SHAPE_VALID, 'params7 shape valid before the grid call')
     call cache_rho_z_grid_s(cache, PARAMS7, z, rho, drho_dz, grid_shift, status)
     call assert_int_eq(status, SHAPE_VALID, 'cylindrical output valid')
-    do i = 1_ik, 6_ik
-        before(i) = count_f(i)
-    end do
-    call cache_shape_s(cache, PARAMS7, z_shift, r_north, r_south, status)
+    call cache_shape_s(cache, PARAMS7, ref_shift, ref_north, ref_south, status)
     call assert_int_eq(status, SHAPE_VALID, 'shape after rho grid valid')
-    call assert_int_eq(count_f(1_ik), before(1), 'shared a2 reused')
-    call assert_int_eq(count_f(3_ik), before(3), 'shared f-grid reused')
-    call assert_int_eq(count_f(5_ik), before(5), 'shared rho grid reused')
-    call assert_int_eq(count_f(4_ik), before(4) + 1_ik, 'beak scan computed')
-    call assert_int_eq(count_f(6_ik), before(6) + 1_ik, 'resolve computed')
+    call assert_true(bits_eq_f(z_shift, ref_shift) .and. bits_eq_f(r_north, ref_north) &
+            .and. bits_eq_f(r_south, ref_south), &
+            'shape after a cylindrical call returns the same bits')
 
     !---------------------------------------------------------------------------
     ! Marginal origin branch: the COM is too steep, so s* is taken
@@ -204,10 +208,10 @@ program fos_param_resolve_test
     !---------------------------------------------------------------------------
     ! Gate 100 vs 103: the rho-negative vector, both cached outputs
     !---------------------------------------------------------------------------
-    ! An interior rho <= 0 means f <= 0 there, which the beak scan (#4, denser
-    ! than the rho grid) also sees — and #4 gates first in cache_shape_s. So the
+    ! An interior rho <= 0 means f <= 0 there, which the beak scan (denser than
+    ! the rho grid) also sees — and it gates first in cache_shape_s. So the
     ! shape path reports 103 where 1.x reported 100, while the cylindrical
-    ! output, which never runs #4, still reports 100.
+    ! output, which never runs the beak scan, still reports 100.
     params_rho = 0.0_rk
     params_rho(1) = 1.0_rk
     ! a3 = 0.9 is the vector the 1.x rho probe settled on. Tier-1 applies the
@@ -250,13 +254,6 @@ program fos_param_resolve_test
 
 contains
 
-    !> Recompute counter as an `ik` integer, for the assertion helpers.
-    function count_f(intermediate) result(n)
-        integer(kind = ik), intent(in) :: intermediate
-        integer(kind = ik) :: n
-        n = int(cache_recompute_count_f(cache, intermediate), ik)
-    end function count_f
-
     !> Bit-level equality without a real `==` (banned by -Werror).
     pure function bits_eq_f(a, b) result(same)
         real(kind = rk), intent(in) :: a, b
@@ -288,8 +285,8 @@ contains
 
     end subroutine probe_tier1_s
 
-    !> A rejected shape zero-fills every output and returns the cache to cold:
-    !! the next good call recomputes intermediates #1-#6 from scratch.
+    !> A rejected shape zero-fills every output and leaves nothing behind: the
+    !! next good call is unaffected.
     subroutine check_rejection_s(p, want_code, label)
         real(kind = rk), intent(in) :: p(:)
         integer(kind = ik), intent(in) :: want_code
@@ -311,23 +308,18 @@ contains
 
     end subroutine check_rejection_s
 
-    !> params7 must succeed after a rejection, recomputing every intermediate.
+    !> params7 must succeed after a rejection, with its known shift: no state
+    !! exists for the rejection to disturb.
     subroutine recover_s(label)
         character(len = *), intent(in) :: label
 
         real(kind = rk) :: shift_out, north_out, south_out
-        integer(kind = ik) :: code_out, j, counts(6)
-
-        do j = 1_ik, 6_ik
-            counts(j) = count_f(j)
-        end do
+        integer(kind = ik) :: code_out
 
         call cache_shape_s(cache, PARAMS7, shift_out, north_out, south_out, code_out)
         call assert_int_eq(code_out, SHAPE_VALID, label // ': recovery call valid')
-        do j = 1_ik, 6_ik
-            call assert_int_eq(count_f(j), counts(j) + 1_ik, &
-                    label // ': recovery recomputed the intermediate')
-        end do
+        call assert_close(shift_out, SHIFT_PARAMS7_1X, 1.0e-12_rk, &
+                label // ': recovery z_shift')
 
     end subroutine recover_s
 

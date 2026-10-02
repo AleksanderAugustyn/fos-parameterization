@@ -5,6 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "fos-parameterization"
 description = "Python bindings for the Fourier-over-Spheroid (FoS) nuclear-shape parameterization library"
+readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.9"
@@ -13,6 +14,11 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/AleksanderAugustyn/fos-parameterization"
+Repository = "https://github.com/AleksanderAugustyn/fos-parameterization"
+Changelog = "https://github.com/AleksanderAugustyn/fos-parameterization/blob/master/CHANGELOG.md"
 
 [tool.scikit-build]
 cmake.source-dir = "."

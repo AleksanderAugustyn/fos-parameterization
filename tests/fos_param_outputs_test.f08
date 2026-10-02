@@ -20,7 +20,7 @@ program fos_param_outputs_test
     use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
             cache_shape_s, cache_radius_grid_s, cache_radius_and_derivative_s, &
-            cache_radius_and_derivative_at_thetas_s, cache_recompute_count_f, &
+            cache_radius_and_derivative_at_thetas_s, &
             compute_shape_standalone_s, compute_radius_and_derivative_standalone_s, &
             compute_rho_at_z_s, &
             FOS_ERROR_INVALID_C, FOS_ERROR_BUFFER_MISMATCH, &
@@ -38,6 +38,9 @@ program fos_param_outputs_test
 
     real(kind = rk), parameter :: PARAMS7(N_PARAMS) = &
             [1.5_rk, 0.1_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk, 0.002_rk]
+    !> One parameter more than the cache's max_params.
+    real(kind = rk), parameter :: LONG8(N_PARAMS + 1_ik) = &
+            [1.5_rk, 0.1_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk, 0.002_rk, 0.001_rk]
 
     !> Total z-shift the deleted 1.x `compute_fos_shape_s` resolved for PARAMS7
     !! at N_POINTS, frozen from commit 648428c — the numeric anchor the tier
@@ -60,7 +63,7 @@ program fos_param_outputs_test
     real(kind = rk)    :: at_radii(N_THETA), at_dr(N_THETA)
     real(kind = rk)    :: few_thetas(3), few_radii(3), few_dr(3)
     real(kind = rk)    :: bad_thetas(N_THETA)
-    integer(kind = ik) :: before(8)
+    real(kind = rk)    :: rev_thetas(N_THETA), rev_radii(N_THETA), rev_dr(N_THETA)
     logical            :: all_bits_eq
 
     do i = 1_ik, N_THETA
@@ -74,9 +77,13 @@ program fos_param_outputs_test
     ! Parameter-vector gates, ahead of everything else
     !---------------------------------------------------------------------------
     radii = 1.0_rk
+    call cache_radius_grid_s(cache, LONG8, radii, status)
+    call assert_int_eq(status, SHAPE_ERROR_WRONG_PARAM_COUNT, 'max_params + 1 -> 4')
+    call assert_true(all_zero_f(radii), 'long params zero-fills radii')
+
+    radii = 1.0_rk
     call cache_radius_grid_s(cache, PARAMS7(1:3), radii, status)
-    call assert_int_eq(status, SHAPE_ERROR_WRONG_PARAM_COUNT, 'short params -> 4')
-    call assert_true(all_zero_f(radii), 'short params zero-fills radii')
+    call assert_int_eq(status, SHAPE_VALID, 'short params accepted')
 
     radii = 1.0_rk
     params_star = 0.0_rk
@@ -156,6 +163,22 @@ program fos_param_outputs_test
     call assert_abs_close(few_radii(1), ref_north, 0.0_rk, 'at_thetas north pole')
     call assert_abs_close(few_radii(3), ref_south, 0.0_rk, 'at_thetas south pole')
 
+    ! Every node is solved on its own: a reversed theta set gives the reversed
+    ! results bit for bit, so the order (or sortedness) of the caller's thetas
+    ! never matters.
+    do i = 1_ik, N_THETA
+        rev_thetas(i) = thetas(N_THETA + 1_ik - i)
+    end do
+    call cache_radius_and_derivative_at_thetas_s(cache, PARAMS7, rev_thetas, &
+            rev_radii, rev_dr, status)
+    call assert_int_eq(status, SHAPE_VALID, 'at_thetas on a descending node set valid')
+    all_bits_eq = .true.
+    do i = 1_ik, N_THETA
+        if (.not. bits_eq_f(rev_radii(i), at_radii(N_THETA + 1_ik - i))) all_bits_eq = .false.
+        if (.not. bits_eq_f(rev_dr(i), at_dr(N_THETA + 1_ik - i))) all_bits_eq = .false.
+    end do
+    call assert_true(all_bits_eq, 'at_thetas: a descending set gives the reversed results')
+
     !---------------------------------------------------------------------------
     ! Out-of-range theta
     !---------------------------------------------------------------------------
@@ -174,31 +197,6 @@ program fos_param_outputs_test
     call cache_radius_and_derivative_at_thetas_s(cache, PARAMS7, bad_thetas, &
             at_radii, at_dr, status)
     call assert_int_eq(status, SHAPE_ERROR_INVALID_GRID, 'negative theta -> invalid grid')
-
-    !---------------------------------------------------------------------------
-    ! Minimality: #7 and #8 are stamped, at_thetas stamps nothing
-    !---------------------------------------------------------------------------
-    call cache_radius_grid_s(cache, PARAMS7, radii, status)
-    call assert_int_eq(status, SHAPE_VALID, 'radius grid valid before counting')
-    call cache_radius_and_derivative_s(cache, PARAMS7, radii_d, dr_dtheta, status)
-    call assert_int_eq(status, SHAPE_VALID, 'radius+derivative valid before counting')
-    do i = 1_ik, 8_ik
-        before(i) = count_f(i)
-    end do
-
-    call cache_radius_grid_s(cache, PARAMS7, radii, status)
-    call assert_int_eq(status, SHAPE_VALID, 'repeat radius grid valid')
-    call cache_radius_and_derivative_s(cache, PARAMS7, radii_d, dr_dtheta, status)
-    call assert_int_eq(status, SHAPE_VALID, 'repeat radius+derivative valid')
-    do i = 1_ik, 8_ik
-        call assert_int_eq(count_f(i), before(i), 'repeat call recomputes nothing')
-    end do
-
-    call cache_radius_and_derivative_at_thetas_s(cache, PARAMS7, few_thetas, &
-            few_radii, few_dr, status)
-    call assert_int_eq(status, SHAPE_VALID, 'at_thetas valid while counting')
-    call assert_int_eq(count_f(7_ik), before(7), 'at_thetas does not stamp #7')
-    call assert_int_eq(count_f(8_ik), before(8), 'at_thetas does not stamp #8')
 
     !---------------------------------------------------------------------------
     ! Shape gates propagate to every R(theta) form
@@ -228,13 +226,6 @@ program fos_param_outputs_test
     call test_summary()
 
 contains
-
-    !> Recompute counter as an `ik` integer, for the assertion helpers.
-    function count_f(intermediate) result(n)
-        integer(kind = ik), intent(in) :: intermediate
-        integer(kind = ik) :: n
-        n = int(cache_recompute_count_f(cache, intermediate), ik)
-    end function count_f
 
     !> Bit-level equality without a real `==` (banned by -Werror).
     pure function bits_eq_f(a, b) result(same)

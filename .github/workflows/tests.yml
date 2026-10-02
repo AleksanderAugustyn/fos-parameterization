@@ -1,0 +1,63 @@
+name: tests
+on:
+  push:
+    branches: [master]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  suites:
+    # ubuntu-24.04 ships gfortran 13, the compiler the library is developed with.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran g++ cmake make
+          gfortran --version | head -1
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      - name: Build
+        # Every target, geometry_sweep included: Debug compiles it under
+        # -Werror, which is what catches an array temporary.
+        run: cmake --build build -j
+      - name: ctest (Fortran and C++ suites)
+        # geometry_sweep is built but not run: half a million shapes take
+        # minutes on 16 threads and far longer on a 4-core runner.
+        run: ctest --test-dir build --output-on-failure -E geometry_sweep
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: pytest against the built shared library
+        env:
+          FOS_PARAM_LIB: ${{ github.workspace }}/build/libfos_parameterization.so
+          PYTHONPATH: ${{ github.workspace }}/python
+        run: |
+          python -m pip install --quiet numpy pytest
+          python -m pytest python/tests -q
+  wheel:
+    # The wheel toolchain is GCC 10.2 (manylinux2014), not the GCC 13 above:
+    # build it on every push so a tag never discovers a compile error, and run
+    # pytest on it — the fixed-grid == at-thetas comparison there is the
+    # library's bitwise gate on the compiler that actually ships.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build manylinux2014 wheel in container
+        run: |
+          docker run --rm -v "$PWD":/io -w /io \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_FOS_PARAMETERIZATION=0.0.0 \
+            quay.io/pypa/manylinux2014_x86_64 ./ci/build-wheel.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify wheel in clean venv
+        run: |
+          python -m venv /tmp/verify-wheel
+          /tmp/verify-wheel/bin/pip install wheelhouse/*.whl pytest numpy
+          env -u FOS_PARAM_LIB /tmp/verify-wheel/bin/python -m pytest python/tests -q

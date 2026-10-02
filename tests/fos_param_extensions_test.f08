@@ -22,7 +22,7 @@ program fos_param_extensions_test
     use mathematical_and_physical_constants_mod, only: PI_C
     use fos_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
             cache_neck_s, cache_star_convexity_optimum_s, cache_shape_s, &
-            cache_rho_z_grid_s, cache_radius_grid_s, cache_recompute_count_f, &
+            cache_rho_z_grid_s, cache_radius_grid_s, &
             compute_neck_standalone_s, compute_star_convexity_optimum_standalone_s, &
             compute_shape_standalone_s, &
             FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_NOT_STAR_CONVEX, &
@@ -72,7 +72,6 @@ program fos_param_extensions_test
     real(kind = rk)    :: z_shift_total, g_opt, ref_shift_total, ref_g_opt
     real(kind = rk)    :: z_shift, r_north, r_south, grid_shift
     real(kind = rk)    :: z(N_POINTS), rho(N_POINTS), drho_dz(N_POINTS)
-    integer(kind = ik) :: before(8)
     logical            :: found, ref_found
     character(len = 64) :: label
 
@@ -213,47 +212,25 @@ program fos_param_extensions_test
             'non-star-convex vector: g(s*) parity')
 
     !---------------------------------------------------------------------------
-    ! Minimality: the optimum reads the STORED resolve, and nothing else
+    ! No state: the optimum does not depend on what was called before it
     !---------------------------------------------------------------------------
-    write(*, '(A)') '=== Minimality of the optimum ==='
+    write(*, '(A)') '=== Optimum after other calls ==='
 
-    call cache_shape_s(cache, PARAMS7, z_shift, r_north, r_south, status)
-    call assert_int_eq(status, SHAPE_VALID, 'params7 shape valid')
-    do i = 1_ik, 8_ik
-        before(i) = count_f(i)
-    end do
-    call cache_star_convexity_optimum_s(cache, PARAMS7, z_shift_total, g_opt, status)
-    call assert_int_eq(status, SHAPE_VALID, 'optimum after shape valid')
-    do i = 1_ik, 8_ik
-        call assert_int_eq(count_f(i), before(i), &
-                'optimum after a successful shape recomputes nothing')
-    end do
-
-    ! A 101 rejection returns the engine to cold, so the optimum on the SAME
-    ! vector has to rebuild #1-#6 from scratch before it can report on it.
+    call cache_star_convexity_optimum_s(cache, params_star, ref_shift_total, ref_g_opt, status)
+    call assert_int_eq(status, SHAPE_VALID, 'optimum on the 101 vector valid')
     call cache_shape_s(cache, params_star, z_shift, r_north, r_south, status)
     call assert_int_eq(status, FOS_ERROR_NOT_STAR_CONVEX, 'rejected shape -> 101')
-    do i = 1_ik, 6_ik
-        before(i) = count_f(i)
-    end do
     call cache_star_convexity_optimum_s(cache, params_star, z_shift_total, g_opt, status)
     call assert_int_eq(status, SHAPE_VALID, 'optimum after a 101 rejection valid')
-    do i = 1_ik, 6_ik
-        call assert_int_eq(count_f(i), before(i) + 1_ik, &
-                'optimum after a 101 rejection recomputes cold')
-    end do
+    call assert_abs_close(z_shift_total, ref_shift_total, 0.0_rk, &
+            'optimum after a 101 rejection: same z_shift_total')
+    call assert_abs_close(g_opt, ref_g_opt, 0.0_rk, &
+            'optimum after a 101 rejection: same g(s*)')
 
     call cache_free_s(cache)
     call test_summary()
 
 contains
-
-    !> Recompute counter as an `ik` integer, for the assertion helpers.
-    function count_f(intermediate) result(n)
-        integer(kind = ik), intent(in) :: intermediate
-        integer(kind = ik) :: n
-        n = int(cache_recompute_count_f(cache, intermediate), ik)
-    end function count_f
 
     !> The tier-1 resolve at the cache's own resolution, for its verdict alone.
     subroutine probe_tier1_s(p, tier1_code)

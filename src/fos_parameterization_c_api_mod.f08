@@ -1,53 +1,36 @@
 !> C-interop layer for the FoS parameterization library (`fos_parameterization.h`).
 !!
-!! Two opaque handles, each a `c_loc` of a heap-allocated derived type:
-!!   - `fos_param_tables_create` -> `tables_t` (shared, immutable after create)
-!!   - `fos_param_cache_create*` -> `cache_t`  (THREAD-CONFINED, mutated by
-!!                                              every compute call)
+!! One opaque handle: `fos_param_cache_create` returns the `c_loc` of a
+!! heap-allocated `cache_t`. The cache is immutable after creation, so every
+!! compute takes the handle `const` and any number of threads may compute on
+!! one handle concurrently. Create and destroy must not race with any other
+!! call on the same handle.
 !!
-!! Every `_create` returns a null handle on failure. The cached computes return
-!! the status code directly; the flat tier-1 entries report through a trailing
+!! `fos_param_cache_create` returns a null handle on failure and reports the
+!! rejecting code through its nullable `status`. The cached computes return
+!! the status code directly; the one-shot entries report through a trailing
 !! nullable `int* status` (an absent `optional` dummy when C passes NULL). No
 !! entry point stops, allocates for the caller, or formats a message:
 !! diagnostics are the static strings behind `fos_param_status_message`.
 !!
-!! This layer mostly marshals: the parameter-count contract is checked once, in
-!! the Fortran tiers, and its codes pass through untouched. The checks that live
-!! HERE are the ones the Fortran layer cannot see or cannot order correctly: the
-!! NULL-handle guard, the negative-size guard on the C integer arguments, the
-!! allocation guard described next, and the stated-size check below.
+!! This layer marshals. The parameter-count, buffer-size and grid checks live
+!! in the Fortran tiers, in one order on every surface — 2 > 4 > 105 > the
+!! shape gates — and their codes pass through untouched. The checks that live
+!! HERE are the ones the Fortran layer cannot see: the NULL-handle guard, the
+!! negative-size guard on the C integer arguments, and the allocation guard
+!! described next.
 !!
-!! ## The stated size of a cached compute is judged HERE, before the tier
+!! ## Marshalling buffers are HEAP, not automatic
 !!
-!! A wrong buffer size is the CALLER's error and must outrank the shape's:
-!! passing a beak-invalid shape with the wrong `n_radii` has to report
-!! `FOS_ERROR_BUFFER_MISMATCH` (105), not `FOS_ERROR_BEAK_SINGULARITY` (103).
-!! The Fortran tier cannot deliver that order — it must resolve the shape before
-!! `cache%tables` is safe to read — so each cached wrapper with a size argument
-!! compares the stated extent against the handle's own (`tables%n_theta`,
-!! `tables%n_points`) before invoking the tier, and returns 105 with nothing
-!! written. The two codes that outrank a buffer mismatch keep doing so: a cache
-!! whose tables pointer is not associated, and a stated parameter count that is
-!! not the handle's own, both fall through to the tier, which reports
-!! `SHAPE_ERROR_CACHE_NOT_INITIALIZED` (2) and `SHAPE_ERROR_WRONG_PARAM_COUNT`
-!! (4) as before. Full precedence: 2 > 4 > 105 > the shape gates. The tier's
-!! identical size check stays where it is: pure-Fortran callers never pass
-!! through this layer.
-!!
-!! ## Marshalling buffers are HEAP, not automatic (divergence from beta-param)
-!!
-!! `beta_parameterization_c_api_mod` marshals through automatic arrays sized
-!! from the caller's stated size. This module deliberately does NOT. An
-!! automatic array is allocated on procedure entry, BEFORE the stated size ever
-!! reaches the Fortran tier that would reject it, so the precise caller error
-!! the size argument exists to catch — the wrong variable passed as `n_radii`
-!! or `n_z` — becomes a stack overflow instead of `FOS_ERROR_BUFFER_MISMATCH`
-!! (105), and no compiler flag mitigates it. Here every marshalling buffer is
+!! An automatic array is allocated on procedure entry, BEFORE the stated size
+!! ever reaches the Fortran tier that would reject it, so the precise caller
+!! error the size argument exists to catch — the wrong variable passed as
+!! `n_radii` or `n_z` — would become a stack overflow instead of
+!! `FOS_ERROR_BUFFER_MISMATCH` (105). Here every marshalling buffer is
 !! `allocatable` with an explicit `allocate(..., stat = ...)`, so an outsized
-!! request fails recoverably: 105 in the cached tier (the size argument is what
-!! is implicated) and `SHAPE_ERROR_INVALID_INIT` in the flat tier (no handle
+!! request fails recoverably: 105 in a cached call (the size argument is what
+!! is implicated) and `SHAPE_ERROR_INVALID_INIT` in a one-shot call (no handle
 !! extent exists to mismatch, so the rejection is about the C argument).
-!! Candidate backport to beta-param.
 !!
 !! ## A stated size must be the ACTUAL buffer extent
 !!
@@ -65,21 +48,21 @@ module fos_parameterization_c_api_mod
             c_null_ptr, c_null_char
     use precision_utilities_mod, only: ik, rk
     use fos_parameterization_mod, only: &
-            tables_t, tables_init_s, tables_free_s, &
-            cache_t, cache_init_s, cache_init_shared_s, cache_free_s, &
-            cache_shape_s, cache_rho_z_grid_s, cache_radius_grid_s, &
+            cache_t, cache_init_s, cache_free_s, cache_max_params_f, &
+            cache_shape_s, cache_rho_z_grid_s, cache_rho_z_grid_unchecked_s, &
+            cache_radius_grid_s, &
             cache_radius_and_derivative_s, cache_radius_and_derivative_at_thetas_s, &
             cache_neck_s, cache_star_convexity_optimum_s, &
             compute_radius_grid_standalone_s, &
             compute_radius_and_derivative_standalone_s, compute_shape_standalone_s, &
-            compute_rho_z_grid_standalone_s, compute_neck_standalone_s, &
+            compute_rho_z_grid_standalone_s, &
+            compute_rho_z_grid_unchecked_standalone_s, compute_neck_standalone_s, &
             compute_star_convexity_optimum_standalone_s, &
             compute_a2_s, compute_z_shift_s, compute_rho_at_z_s, &
             STATUS_MESSAGE_LEN, &
             SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
             SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID, &
             SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
-            SHAPE_ERROR_TABLES_NOT_INITIALIZED, &
             FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_NOT_STAR_CONVEX, FOS_ERROR_INVALID_C, &
             FOS_ERROR_BEAK_SINGULARITY, FOS_ERROR_CONVERGENCE, FOS_ERROR_BUFFER_MISMATCH
 
@@ -88,20 +71,21 @@ module fos_parameterization_c_api_mod
     private
 
     public :: fos_param_status_message
-    public :: fos_param_tables_create, fos_param_tables_destroy
-    public :: fos_param_cache_create, fos_param_cache_create_shared
+    public :: fos_param_cache_create
     public :: fos_param_cache_destroy
     public :: fos_param_cache_radius_grid
     public :: fos_param_cache_radius_and_derivative
     public :: fos_param_cache_radius_and_derivative_at_thetas
     public :: fos_param_cache_shape
     public :: fos_param_cache_rho_z_grid
+    public :: fos_param_cache_rho_z_grid_unchecked
     public :: fos_param_cache_neck
     public :: fos_param_cache_star_convexity_optimum
     public :: fos_param_radius_grid
     public :: fos_param_radius_and_derivative
     public :: fos_param_shape
     public :: fos_param_rho_z_grid
+    public :: fos_param_rho_z_grid_unchecked
     public :: fos_param_neck
     public :: fos_param_star_convexity_optimum
     public :: fos_param_z_shift
@@ -120,7 +104,7 @@ module fos_parameterization_c_api_mod
     !! The texts are the `status_message` texts: keep the two in sync (a C caller
     !! and a Fortran caller must not read different words for one code).
     integer(kind = ik), parameter :: MSG_LEN = STATUS_MESSAGE_LEN + 1_ik
-    integer(kind = ik), parameter :: N_MSG   = 14_ik
+    integer(kind = ik), parameter :: N_MSG   = 13_ik
 
     !> Codes in column order; column N_MSG is the unknown-code fallback and has
     !! no entry here.
@@ -128,7 +112,6 @@ module fos_parameterization_c_api_mod
             SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
             SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID, &
             SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
-            SHAPE_ERROR_TABLES_NOT_INITIALIZED, &
             FOS_ERROR_RHO_NEGATIVE, FOS_ERROR_NOT_STAR_CONVEX, &
             FOS_ERROR_INVALID_C, FOS_ERROR_BEAK_SINGULARITY, &
             FOS_ERROR_CONVERGENCE, FOS_ERROR_BUFFER_MISMATCH]
@@ -136,12 +119,11 @@ module fos_parameterization_c_api_mod
     character(kind = c_char, len = MSG_LEN), parameter :: MSG_TEXT(N_MSG) = &
             [character(kind = c_char, len = MSG_LEN) :: &
                     'valid' // c_null_char, &
-                    'too many parameters for this tier' // c_null_char, &
+                    'too many parameters' // c_null_char, &
                     'cache not initialized' // c_null_char, &
                     'invalid grid: n_points, theta count, or theta domain' // c_null_char, &
-                    'params length differs from n_params' // c_null_char, &
+                    'params length outside 1..max_params' // c_null_char, &
                     'invalid init arguments' // c_null_char, &
-                    'tables not initialized' // c_null_char, &
                     'rho <= 0 away from the poles' // c_null_char, &
                     'shape not star-convex from any origin' // c_null_char, &
                     'elongation c below the minimum' // c_null_char, &
@@ -163,53 +145,14 @@ contains
     !> Non-negative Fortran extent for a C size argument.
     !!
     !! A negative size is not an extent. Clamping it to zero turns it into a
-    !! length the Fortran tier can compare against its own and reject with 105,
-    !! rather than an invalid allocation here.
+    !! length the Fortran tier can compare against its own and reject — 105 for
+    !! an output size, 4 for a parameter count — rather than an invalid
+    !! allocation here.
     pure function extent_f(n) result(extent)
         integer(c_int), intent(in) :: n
         integer(kind = ik) :: extent
         extent = max(int(n, ik), 0_ik)
     end function extent_f
-
-    !> .true. when a stated buffer size differs from the handle's own extent.
-    !!
-    !! The stated size of a cached compute is judged HERE, before the tier runs,
-    !! so a wrong size outranks every shape gate: a beak-invalid shape passed
-    !! with the wrong `n_radii` must report the caller's own error (105), not the
-    !! shape's (103). The tier keeps its identical check for pure-Fortran
-    !! callers, which never come through this layer.
-    !!
-    !! Two cases defer to the tier rather than reporting here, so that the codes
-    !! outranking 105 keep their precedence: a cache whose tables pointer is not
-    !! associated — freed, or never initialized — has no extent to compare
-    !! against and must report SHAPE_ERROR_CACHE_NOT_INITIALIZED (2); and a
-    !! stated parameter count that is not the handle's own must report
-    !! SHAPE_ERROR_WRONG_PARAM_COUNT (4), which outranks a buffer mismatch in
-    !! every tier of this library. The full precedence is therefore
-    !! 2 > 4 > 105 > the shape gates.
-    !!
-    !! @param[in] cache      Cache behind the caller's handle
-    !! @param[in] n_params   Caller's stated parameter count, already clamped
-    !! @param[in] stated     Caller's stated buffer extent, already clamped
-    !! @param[in] u_grid     .true. for an n_points buffer, .false. for n_theta
-    !! @return               .true. iff the two extents differ
-    function size_mismatch_f(cache, n_params, stated, u_grid) result(mismatch)
-        type(cache_t), intent(in) :: cache
-        integer(kind = ik), intent(in) :: n_params
-        integer(kind = ik), intent(in) :: stated
-        logical, intent(in) :: u_grid
-        logical :: mismatch
-
-        mismatch = .false.
-        if (.not. associated(cache%tables)) return
-        if (n_params /= cache%n_params) return
-
-        if (u_grid) then
-            mismatch = stated /= cache%tables%n_points
-        else
-            mismatch = stated /= cache%tables%n_theta
-        end if
-    end function size_mismatch_f
 
     !===========================================================================
     ! DIAGNOSTICS
@@ -234,117 +177,60 @@ contains
     end function fos_param_status_message
 
     !===========================================================================
-    ! TABLES LIFECYCLE
-    !===========================================================================
-
-    !> Build the shared immutable level. Null handle on failure.
-    function fos_param_tables_create(n_points, thetas, n_theta) result(handle) &
-            bind(c, name = 'fos_param_tables_create')
-        integer(c_int), value, intent(in) :: n_points, n_theta
-        real(c_double), intent(in) :: thetas(n_theta)
-        type(c_ptr) :: handle
-
-        type(tables_t), pointer :: p
-        integer(kind = ik) :: st
-        integer :: alloc_stat
-        real(kind = rk), allocatable :: thetas_f(:)
-
-        handle = c_null_ptr
-        if (n_theta < 1_c_int) return
-
-        allocate(thetas_f(extent_f(n_theta)), stat = alloc_stat)
-        if (alloc_stat /= 0) return
-        thetas_f = real(thetas, rk)
-
-        allocate(p, stat = alloc_stat)
-        if (alloc_stat /= 0) return
-        call tables_init_s(p, int(n_points, ik), thetas_f, st)
-        if (st == SHAPE_VALID) then
-            handle = c_loc(p)
-        else
-            call tables_free_s(p)
-            deallocate(p)
-        end if
-    end function fos_param_tables_create
-
-    !> Release a tables handle. NULL-safe.
-    subroutine fos_param_tables_destroy(handle) &
-            bind(c, name = 'fos_param_tables_destroy')
-        type(c_ptr), value, intent(in) :: handle
-        type(tables_t), pointer :: p
-        if (.not. c_associated(handle)) return
-        call c_f_pointer(handle, p)
-        call tables_free_s(p)
-        deallocate(p)
-    end subroutine fos_param_tables_destroy
-
-    !===========================================================================
     ! CACHE LIFECYCLE
     !===========================================================================
 
-    !> Create a cache owning private tables. Null on failure.
+    !> Create a read-only cache. Null on failure; `status` (nullable) receives
+    !! the rejecting code, or 0 on success.
     !!
-    !! `n_theta` must be at least 1, the same floor `fos_param_tables_create`
-    !! applies: a cache with no theta nodes can serve no R(theta) output, and
-    !! the two create paths must not disagree about what a usable handle is.
-    function fos_param_cache_create(n_params, n_points, thetas, n_theta) &
+    !! The codes are the Fortran tier's, in its order: `max_params < 1` -> 5,
+    !! `max_params` above the limit -> 1, then the grid -> 3. A negative
+    !! `n_theta` is clamped to an empty theta set and so reports 3, as does a
+    !! theta buffer the heap cannot satisfy. Failure to allocate the handle
+    !! object itself reports 5.
+    function fos_param_cache_create(max_params, n_points, thetas, n_theta, status) &
             result(handle) bind(c, name = 'fos_param_cache_create')
-        integer(c_int), value, intent(in) :: n_params, n_points, n_theta
+        integer(c_int), value, intent(in) :: max_params, n_points, n_theta
         real(c_double), intent(in) :: thetas(n_theta)
+        integer(c_int), intent(out), optional :: status   ! NULL-able from C
         type(c_ptr) :: handle
 
         type(cache_t), pointer :: p
+        type(cache_t) :: probe
         integer(kind = ik) :: st
         integer :: alloc_stat
         real(kind = rk), allocatable :: thetas_f(:)
+        real(kind = rk) :: no_thetas(0)
 
         handle = c_null_ptr
-        if (n_theta < 1_c_int) return
 
         allocate(thetas_f(extent_f(n_theta)), stat = alloc_stat)
-        if (alloc_stat /= 0) return
+        if (alloc_stat /= 0) then
+            ! The sizes outrank the buffer: on an empty set the tier judges
+            ! max_params and n_points first and allocates nothing (5, 1, else 3).
+            call cache_init_s(probe, int(max_params, ik), int(n_points, ik), &
+                    no_thetas, st)
+            if (present(status)) status = int(st, c_int)
+            return
+        end if
         thetas_f = real(thetas, rk)
 
         allocate(p, stat = alloc_stat)
-        if (alloc_stat /= 0) return
-        call cache_init_s(p, int(n_params, ik), int(n_points, ik), thetas_f, st)
+        if (alloc_stat /= 0) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+
+        call cache_init_s(p, int(max_params, ik), int(n_points, ik), thetas_f, st)
         if (st == SHAPE_VALID) then
             handle = c_loc(p)
         else
-            call cache_free_s(p)   ! a failed init may still own tables
             deallocate(p)
         end if
+        if (present(status)) status = int(st, c_int)
     end function fos_param_cache_create
 
-    !> Create a cache bound to caller-owned shared tables, which must outlive it.
-    !! Null on failure.
-    function fos_param_cache_create_shared(tables, n_params) result(handle) &
-            bind(c, name = 'fos_param_cache_create_shared')
-        type(c_ptr), value, intent(in) :: tables
-        integer(c_int), value, intent(in) :: n_params
-        type(c_ptr) :: handle
-
-        type(cache_t),  pointer :: p
-        type(tables_t), pointer :: tp
-        integer(kind = ik) :: st
-        integer :: alloc_stat
-
-        handle = c_null_ptr
-        if (.not. c_associated(tables)) return
-
-        call c_f_pointer(tables, tp)
-        allocate(p, stat = alloc_stat)
-        if (alloc_stat /= 0) return
-        call cache_init_shared_s(p, tp, int(n_params, ik), st)
-        if (st == SHAPE_VALID) then
-            handle = c_loc(p)
-        else
-            call cache_free_s(p)
-            deallocate(p)
-        end if
-    end function fos_param_cache_create_shared
-
-    !> Release a cache. NULL-safe. Shared tables are left to their owner.
+    !> Release a cache. NULL-safe.
     subroutine fos_param_cache_destroy(handle) &
             bind(c, name = 'fos_param_cache_destroy')
         type(c_ptr), value, intent(in) :: handle
@@ -356,11 +242,13 @@ contains
     end subroutine fos_param_cache_destroy
 
     !===========================================================================
-    ! CACHED COMPUTES (tier 2)
+    ! CACHED COMPUTES
     !===========================================================================
     ! Marshalling buffers are heap allocatables sized from the caller's stated
     ! size, so an outsized size argument fails recoverably as 105 instead of
-    ! overflowing the stack on entry (see the module header).
+    ! overflowing the stack on entry (see the module header). A wrong stated
+    ! size is judged by the Fortran tier, which compares it against the cache's
+    ! own extent before the shape is looked at.
 
     !> R(theta) at the cache's own thetas. n_radii must equal the handle's n_theta.
     function fos_param_cache_radius_grid(cache, params, n_params, radii, n_radii) &
@@ -382,10 +270,6 @@ contains
             return
         end if
         call c_f_pointer(cache, p)
-        if (size_mismatch_f(p, extent_f(n_params), extent_f(n_radii), .false.)) then
-            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
-            return
-        end if
         allocate(params_f(extent_f(n_params)), radii_f(extent_f(n_radii)), &
                 stat = alloc_stat)
         if (alloc_stat /= 0) then
@@ -420,10 +304,6 @@ contains
             return
         end if
         call c_f_pointer(cache, p)
-        if (size_mismatch_f(p, extent_f(n_params), extent_f(n_radii), .false.)) then
-            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
-            return
-        end if
         allocate(params_f(extent_f(n_params)), radii_f(extent_f(n_radii)), &
                 dr_f(extent_f(n_radii)), stat = alloc_stat)
         if (alloc_stat /= 0) then
@@ -458,12 +338,19 @@ contains
             status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
             return
         end if
+        call c_f_pointer(cache, p)
+
         ! A negative n_thetas is not an extent. Clamping it would make the
-        ! stated and the expected extent both zero, so the tier's size check
-        ! would agree with itself and return FOS_VALID having written nothing;
-        ! rejecting it here keeps the header's "negative sizes report 105" true.
+        ! stated and the expected extent both zero, so the tier would see an
+        ! empty theta set (3) instead of a wrong size; rejecting it here keeps
+        ! the header's "negative sizes report 105" true. The parameter count is
+        ! judged first, as everywhere: 4 outranks 105.
         if (n_thetas < 0_c_int) then
-            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
+            if (extent_f(n_params) < 1_ik .or. extent_f(n_params) > cache_max_params_f(p)) then
+                status = int(SHAPE_ERROR_WRONG_PARAM_COUNT, c_int)
+            else
+                status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
+            end if
             return
         end if
         allocate(params_f(extent_f(n_params)), thetas_f(extent_f(n_thetas)), &
@@ -473,7 +360,6 @@ contains
             status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
             return
         end if
-        call c_f_pointer(cache, p)
         params_f = real(params, rk)
         thetas_f = real(thetas, rk)
         call cache_radius_and_derivative_at_thetas_s(p, params_f, thetas_f, &
@@ -544,10 +430,6 @@ contains
             return
         end if
         call c_f_pointer(cache, p)
-        if (size_mismatch_f(p, extent_f(n_params), extent_f(n_z), .true.)) then
-            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
-            return
-        end if
         allocate(params_f(extent_f(n_params)), z_f(extent_f(n_z)), &
                 rho_f(extent_f(n_z)), drho_f(extent_f(n_z)), stat = alloc_stat)
         if (alloc_stat /= 0) then
@@ -562,6 +444,48 @@ contains
         z_shift = real(z_shift_f, c_double)
         status = int(st, c_int)
     end function fos_param_cache_rho_z_grid
+
+    !> Cylindrical rho(z) without the rho-positivity gate: never returns 100, and
+    !! rho = drho_dz = 0 in the void of a separated shape. n_z must equal the
+    !! handle's n_points.
+    function fos_param_cache_rho_z_grid_unchecked(cache, params, n_params, z, rho, drho_dz, &
+            n_z, z_shift) result(status) bind(c, name = 'fos_param_cache_rho_z_grid_unchecked')
+        type(c_ptr), value, intent(in) :: cache
+        integer(c_int), value, intent(in) :: n_params, n_z
+        real(c_double), intent(in)  :: params(n_params)
+        real(c_double), intent(out) :: z(n_z), rho(n_z), drho_dz(n_z)
+        real(c_double), intent(out) :: z_shift
+        integer(c_int) :: status
+
+        type(cache_t), pointer :: p
+        integer(kind = ik) :: st
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:), z_f(:), rho_f(:), drho_f(:)
+        real(kind = rk) :: z_shift_f
+
+        z       = 0.0_c_double
+        rho     = 0.0_c_double
+        drho_dz = 0.0_c_double
+        z_shift = 0.0_c_double
+        if (.not. c_associated(cache)) then
+            status = int(SHAPE_ERROR_CACHE_NOT_INITIALIZED, c_int)
+            return
+        end if
+        call c_f_pointer(cache, p)
+        allocate(params_f(extent_f(n_params)), z_f(extent_f(n_z)), &
+                rho_f(extent_f(n_z)), drho_f(extent_f(n_z)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(FOS_ERROR_BUFFER_MISMATCH, c_int)
+            return
+        end if
+        params_f = real(params, rk)
+        call cache_rho_z_grid_unchecked_s(p, params_f, z_f, rho_f, drho_f, z_shift_f, st)
+        z       = real(z_f, c_double)
+        rho     = real(rho_f, c_double)
+        drho_dz = real(drho_f, c_double)
+        z_shift = real(z_shift_f, c_double)
+        status = int(st, c_int)
+    end function fos_param_cache_rho_z_grid_unchecked
 
     !> Neck in the COM frame; `found` is 0 or 1.
     function fos_param_cache_neck(cache, params, n_params, z_neck, rho_neck, found) &
@@ -637,10 +561,10 @@ contains
     end function fos_param_cache_star_convexity_optimum
 
     !===========================================================================
-    ! FLAT TIER-1 COMPUTES — trailing nullable status
+    ! ONE-SHOT COMPUTES — trailing nullable status
     !===========================================================================
     ! Same heap rule as the cached tier. An unsatisfiable n_points / n_thetas is
-    ! SHAPE_ERROR_INVALID_INIT here: the flat tier has no handle whose extent
+    ! SHAPE_ERROR_INVALID_INIT here: a one-shot call has no handle whose extent
     ! the request could mismatch, so the rejection is about the C argument.
 
     !> One-shot R(theta) at caller thetas; builds and discards its own tables.
@@ -781,6 +705,46 @@ contains
         z_shift = real(z_shift_f, c_double)
         if (present(status)) status = int(st, c_int)
     end subroutine fos_param_rho_z_grid
+
+    !> One-shot cylindrical rho(z) without the rho-positivity gate; buffers are
+    !! n_points long.
+    subroutine fos_param_rho_z_grid_unchecked(params, n_params, n_points, z, rho, drho_dz, &
+            z_shift, status) bind(c, name = 'fos_param_rho_z_grid_unchecked')
+        integer(c_int), value, intent(in) :: n_params, n_points
+        real(c_double), intent(in)  :: params(n_params)
+        real(c_double), intent(out) :: z(n_points), rho(n_points), drho_dz(n_points)
+        real(c_double), intent(out) :: z_shift
+        integer(c_int), intent(out), optional :: status
+
+        integer(kind = ik) :: st
+        integer :: alloc_stat
+        real(kind = rk), allocatable :: params_f(:), z_f(:), rho_f(:), drho_f(:)
+        real(kind = rk) :: z_shift_f
+
+        z       = 0.0_c_double
+        rho     = 0.0_c_double
+        drho_dz = 0.0_c_double
+        z_shift = 0.0_c_double
+        if (n_params < 0_c_int .or. n_points < 0_c_int) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        allocate(params_f(extent_f(n_params)), z_f(extent_f(n_points)), &
+                rho_f(extent_f(n_points)), drho_f(extent_f(n_points)), &
+                stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            if (present(status)) status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+            return
+        end if
+        params_f = real(params, rk)
+        call compute_rho_z_grid_unchecked_standalone_s(params_f, int(n_points, ik), z_f, &
+                rho_f, drho_f, z_shift_f, st)
+        z       = real(z_f, c_double)
+        rho     = real(rho_f, c_double)
+        drho_dz = real(drho_f, c_double)
+        z_shift = real(z_shift_f, c_double)
+        if (present(status)) status = int(st, c_int)
+    end subroutine fos_param_rho_z_grid_unchecked
 
     !> One-shot neck in the COM frame; `found` is 0 or 1.
     subroutine fos_param_neck(params, n_params, n_points, z_neck, rho_neck, &

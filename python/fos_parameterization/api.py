@@ -1,12 +1,15 @@
-"""High-level API: Status, result objects, Cache, flat tier-1 functions.
+"""High-level API: Status, result objects, Cache, one-shot functions.
 
-Two tiers, matching the C API. The module-level functions build, use and
-discard their own tables per call; :class:`Cache` keeps the per-shape working
-state, so a sweep over many shapes only recomputes what the changed parameters
-invalidated.
+Two tiers, matching the C API. The module-level functions are one-shot: they
+build, use and discard their own tables per call. :class:`Cache` is the
+read-only cache: build it once, then request any number of shapes against it.
+It holds only what depends on the resolution, never anything derived from a
+shape parameter, so no call influences a later one. Both tiers return the same
+status and bitwise-identical outputs.
 
-A cache is THREAD-CONFINED: every compute call mutates it, so give each thread
-its own.
+A :class:`Cache` is immutable after construction and may be shared between
+threads: ctypes releases the GIL during a call, and the library computes on a
+cache concurrently. :meth:`Cache.close` must not race with a compute.
 
 Shape-validation failures come back as result objects carrying a
 :class:`Status` with every numeric output zero-filled; :class:`FosParamError`
@@ -33,8 +36,7 @@ from typing import Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 
-from ._cdefs import (CACHE_MAX_PARAMS, MAX_PARAMS, N_POINTS_FLOOR, c_dbl_p,
-                     configure)
+from ._cdefs import MAX_PARAMS, N_POINTS_FLOOR, c_dbl_p, configure
 from ._libloader import load_library
 
 _lib: Optional[ctypes.CDLL] = None
@@ -49,14 +51,26 @@ def _get_lib() -> ctypes.CDLL:
 
 
 class FosParamError(RuntimeError):
-    """Raised for usage errors: failed create, closed handle, non-1-D input."""
+    """Raised for usage errors: failed create, closed handle, non-1-D input.
+
+    Attributes
+    ----------
+    status : Status or None
+        The library's status code when the error came from a rejected cache
+        construction; ``None`` for errors raised on the Python side.
+    """
+
+    def __init__(self, message: str, status: "Optional[Status]" = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class Status(IntEnum):
     """Status codes of the C API (``FOS_*`` in the header).
 
-    0-6 are the shared shape-parameterization contract codes, identical in
-    every library of the family; 100+ are FoS's own, append-only after 2.0.0.
+    0-5 are the shared shape-parameterization contract codes, identical in
+    every library of the family (6 is retired and never reused); 100+ are
+    FoS's own, append-only after 2.0.0.
     """
 
     valid = 0
@@ -65,7 +79,6 @@ class Status(IntEnum):
     invalid_grid = 3
     wrong_param_count = 4
     invalid_init = 5
-    tables_not_initialized = 6
     rho_negative = 100
     not_star_convex = 101
     invalid_c = 102
@@ -266,7 +279,7 @@ def _ptr(arr: npt.NDArray[np.float64]) -> ctypes.POINTER(ctypes.c_double):  # ty
     return arr.ctypes.data_as(c_dbl_p)
 
 
-# --- flat tier-1 functions -------------------------------------------------
+# --- one-shot functions ----------------------------------------------------
 
 def radius_grid(params: npt.ArrayLike, thetas: npt.ArrayLike,
                 n_points: int) -> RadiusGridResult:
@@ -360,7 +373,10 @@ def rho_z_grid(params: npt.ArrayLike, n_points: int) -> RhoZGridResult:
 
     Star-convexity and the beak gate do NOT apply here, so a shape the
     R(theta) conversion rejects still yields a profile — this is the plotting
-    path.
+    path. ``Status.rho_negative`` means a SAMPLED interior node has rho <= 0:
+    a gap narrower than the node spacing passes, so this is a
+    resolution-dependent check, not a connectivity verdict. Use
+    :func:`rho_z_grid_unchecked` to draw a separated shape.
 
     Parameters
     ----------
@@ -383,6 +399,44 @@ def rho_z_grid(params: npt.ArrayLike, n_points: int) -> RhoZGridResult:
     z_shift_out = ctypes.c_double(0.0)
     status = ctypes.c_int32(0)
     _get_lib().fos_param_rho_z_grid(
+        _ptr(p), p.size, int(n_points), _ptr(z), _ptr(rho), _ptr(drho_dz),
+        ctypes.byref(z_shift_out), ctypes.byref(status))
+    return RhoZGridResult(z=z, rho=rho, drho_dz=drho_dz,
+                          z_shift=z_shift_out.value, status=Status(status.value))
+
+
+def rho_z_grid_unchecked(params: npt.ArrayLike, n_points: int) -> RhoZGridResult:
+    """Cylindrical profile rho(z) without the rho-positivity gate.
+
+    Never returns ``Status.rho_negative``. ``rho`` and ``drho_dz`` are 0 at the
+    two tips and at every node where ``f <= 0``, which for a separated shape is
+    the void between the fragments. For a shape :func:`rho_z_grid` accepts, the
+    two return the same bits.
+
+    ``z_shift`` is the closed-form intrinsic shift. For a separated shape it is
+    NOT the centre of mass of the fragments.
+
+    Parameters
+    ----------
+    params : array_like
+        ``[c, a3, a4, ...]``, 1 .. ``MAX_PARAMS`` entries.
+    n_points : int
+        Number of profile nodes, at least ``N_POINTS_FLOOR``.
+
+    Returns
+    -------
+    RhoZGridResult
+        ``n_points``-long z, rho and drho/dz, the intrinsic shift, and the
+        status; all buffers zero-filled on failure.
+    """
+    p = _as_1d(params, "params")
+    n = max(int(n_points), 0)
+    z = np.zeros(n, dtype=np.float64)
+    rho = np.zeros(n, dtype=np.float64)
+    drho_dz = np.zeros(n, dtype=np.float64)
+    z_shift_out = ctypes.c_double(0.0)
+    status = ctypes.c_int32(0)
+    _get_lib().fos_param_rho_z_grid_unchecked(
         _ptr(p), p.size, int(n_points), _ptr(z), _ptr(rho), _ptr(drho_dz),
         ctypes.byref(z_shift_out), ctypes.byref(status))
     return RhoZGridResult(z=z, rho=rho, drho_dz=drho_dz,
@@ -518,20 +572,23 @@ def rho_at_z(params: npt.ArrayLike, z: float,
 # --- cached tier -----------------------------------------------------------
 
 class Cache:
-    """Per-shape working state over a fixed resolution and theta set.
+    """Read-only cache over a fixed resolution and primary theta set.
 
-    Create once, evaluate many shapes: only the intermediates invalidated by
-    the changed parameters are recomputed. THREAD-CONFINED — every compute
-    call mutates the cache, so give each thread its own.
+    Build once, evaluate any number of shapes. The cache holds only what
+    depends on the resolution; nothing derived from a shape parameter is
+    stored, so no call influences a later one. Immutable after construction
+    and safe to share between threads; :meth:`close` must not race with a
+    compute.
 
     The handle is released by :meth:`close`, by leaving a ``with`` block, or at
     garbage collection.
 
     Parameters
     ----------
-    n_params : int
-        Exact length every later ``params`` array must have,
-        1 .. ``CACHE_MAX_PARAMS``. A different length comes back as
+    max_params : int
+        Longest ``params`` array the cache accepts, 1 .. ``MAX_PARAMS``. Each
+        call may pass any length from 1 to ``max_params``; missing trailing
+        parameters are zero. A longer array comes back as
         ``Status.wrong_param_count``.
     n_points : int
         u-grid resolution, at least ``N_POINTS_FLOOR``.
@@ -539,28 +596,39 @@ class Cache:
         Primary evaluation angles in radians, at least one, all inside
         ``[0, pi]``. See :func:`theta_grid`.
 
+    Attributes
+    ----------
+    max_params, n_points, n_thetas : int
+        The construction arguments.
+
     Raises
     ------
     FosParamError
-        If the library refuses the arguments and returns no handle.
+        If the library refuses the arguments. Its ``status`` attribute carries
+        the rejecting code: ``invalid_init`` (``max_params < 1``),
+        ``too_many_params`` (``max_params > MAX_PARAMS``) or ``invalid_grid``.
     """
 
-    def __init__(self, n_params: int, n_points: int,
+    def __init__(self, max_params: int, n_points: int,
                  thetas: npt.ArrayLike) -> None:
         lib = _get_lib()
         t = _as_1d(thetas, "thetas")
+        status = ctypes.c_int32(0)
         handle = lib.fos_param_cache_create(
-            int(n_params), int(n_points), _ptr(t), t.size)
+            int(max_params), int(n_points), _ptr(t), t.size, ctypes.byref(status))
         if not handle:
+            code = Status(status.value)
             raise FosParamError(
-                f"Cache creation failed (n_params={n_params}, "
-                f"n_points={n_points}, n_thetas={t.size}): need "
-                f"1 <= n_params <= {CACHE_MAX_PARAMS}, "
-                f"n_points >= {N_POINTS_FLOOR}, at least one theta in [0, pi]")
+                f"Cache creation failed (max_params={max_params}, "
+                f"n_points={n_points}, n_thetas={t.size}): "
+                f"{status_message(code)} [{code.name}]; need "
+                f"1 <= max_params <= {MAX_PARAMS}, "
+                f"n_points >= {N_POINTS_FLOOR}, at least one theta in [0, pi]",
+                status=code)
         self._handle: Optional[ctypes.c_void_p] = ctypes.c_void_p(handle)
         # Bound here so __del__ never needs module globals during shutdown.
         self._destroy = lib.fos_param_cache_destroy
-        self.n_params = int(n_params)
+        self.max_params = int(max_params)
         self.n_points = int(n_points)
         self.n_thetas = int(t.size)
 
@@ -611,13 +679,15 @@ class Cache:
             thetas: npt.ArrayLike) -> RadiusDerivativeResult:
         """R and dR/dtheta at caller-supplied thetas.
 
-        Uncached evaluation against the cache's resolved shape: the thetas need
-        not be the cache's own, but must lie inside ``[0, pi]``.
+        The thetas need not be the cache's own, but there must be at least one
+        and all must lie inside ``[0, pi]``. Pass the concatenation of several
+        grids to evaluate them in one call. Given the cache's own thetas this
+        returns the same bits as :meth:`radius_and_derivative`.
 
         Parameters
         ----------
         params : array_like
-            Exactly ``n_params`` entries.
+            1 .. ``max_params`` entries.
         thetas : array_like
             Evaluation angles in radians.
 
@@ -653,7 +723,9 @@ class Cache:
         """Cylindrical profile rho(z) on the cache's u-grid, in the COM frame.
 
         Neither the beak gate nor star-convexity applies, so this path renders
-        shapes :meth:`radius_grid` rejects.
+        shapes :meth:`radius_grid` rejects. ``Status.rho_negative`` is a
+        sampled check, not a connectivity verdict; see
+        :meth:`rho_z_grid_unchecked`.
         """
         handle = self._require_handle()
         p = _as_1d(params, "params")
@@ -662,6 +734,24 @@ class Cache:
         drho_dz = np.zeros(self.n_points, dtype=np.float64)
         z_shift_out = ctypes.c_double(0.0)
         status = _get_lib().fos_param_cache_rho_z_grid(
+            handle, _ptr(p), p.size, _ptr(z), _ptr(rho), _ptr(drho_dz),
+            z.size, ctypes.byref(z_shift_out))
+        return RhoZGridResult(z=z, rho=rho, drho_dz=drho_dz,
+                              z_shift=z_shift_out.value, status=Status(status))
+
+    def rho_z_grid_unchecked(self, params: npt.ArrayLike) -> RhoZGridResult:
+        """Cylindrical profile without the rho-positivity gate.
+
+        Never returns ``Status.rho_negative``: ``rho`` and ``drho_dz`` are 0 in
+        the void of a separated shape. See :func:`rho_z_grid_unchecked`.
+        """
+        handle = self._require_handle()
+        p = _as_1d(params, "params")
+        z = np.zeros(self.n_points, dtype=np.float64)
+        rho = np.zeros(self.n_points, dtype=np.float64)
+        drho_dz = np.zeros(self.n_points, dtype=np.float64)
+        z_shift_out = ctypes.c_double(0.0)
+        status = _get_lib().fos_param_cache_rho_z_grid_unchecked(
             handle, _ptr(p), p.size, _ptr(z), _ptr(rho), _ptr(drho_dz),
             z.size, ctypes.byref(z_shift_out))
         return RhoZGridResult(z=z, rho=rho, drho_dz=drho_dz,
@@ -698,7 +788,7 @@ __all__ = [
     "RadiusDerivativeResult", "RadiusGridResult", "RhoZGridResult",
     "StarConvexityResult", "Status",
     "a2", "neck", "radius_and_derivative", "radius_grid", "rho_at_z",
-    "rho_z_grid", "shape", "star_convexity_optimum", "status_message",
-    "theta_grid", "z_shift",
-    "CACHE_MAX_PARAMS", "MAX_PARAMS", "N_POINTS_FLOOR",
+    "rho_z_grid", "rho_z_grid_unchecked", "shape", "star_convexity_optimum",
+    "status_message", "theta_grid", "z_shift",
+    "MAX_PARAMS", "N_POINTS_FLOOR",
 ]
